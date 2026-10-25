@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import json
 import logging
+from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
 import secrets
 import shutil
@@ -18,6 +20,14 @@ ASSETS = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css',
           '/app-v2.js': 'app-v2.js', '/v2.css': 'v2.css'}
 
 
+def find_node():
+    for candidate in (os.environ.get('ALBION_NODE'), shutil.which('node'),
+                      Path.home()/'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe'):
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return None
+
+
 class Runtime:
     def __init__(self, source_root, data_root):
         self.source_root, self.data_root = Path(source_root), Path(data_root)
@@ -29,6 +39,7 @@ class Runtime:
         self.revision = None
         self.pending = None
         self.rejected = None
+        self.syntax_checked = True
         self.stopped = threading.Event()
         self.apply_changes()
 
@@ -42,18 +53,25 @@ class Runtime:
         digest.update(ui.digest())
         return digest.hexdigest(), ui.hexdigest(), code, assets
 
+    def status(self, revision):
+        value = {'enabled': True, 'status': '자동 반영 사용 중', 'revision': revision[:12]}
+        if not self.syntax_checked:
+            value['note'] = 'Node가 없어 화면 코드 구문 검사는 생략'
+        return value
+
     def validate_assets(self, assets):
-        node = shutil.which('node')
-        bundled = Path.home()/'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe'
-        if not node and bundled.exists():
-            node = str(bundled)
+        node = find_node()
+        # Node is optional: without it the dashboard must still start, otherwise
+        # the game watcher can never bring up capture on a PC without Node.
+        self.syntax_checked = bool(node)
         if not node:
-            raise RuntimeError('화면 구문 검사용 Node를 찾을 수 없습니다.')
-        for script in {assets['/app.js'], assets['/app-v2.js']}:
-            result = subprocess.run([node, '--check', '-'], input=script, capture_output=True, timeout=15,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            if result.returncode:
-                raise ValueError('화면 코드 구문 오류 · 기존 버전을 유지합니다.')
+            logging.warning('Node not found; browser script syntax check skipped')
+        else:
+            for script in {assets['/app.js'], assets['/app-v2.js']}:
+                result = subprocess.run([node, '--check', '-'], input=script, capture_output=True, timeout=15,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                if result.returncode:
+                    raise ValueError('화면 코드 구문 오류 · 기존 버전을 유지합니다.')
         html = assets['/'].decode('utf-8')
         for element in ('connection', 'settings', 'item', 'city', 'overview'):
             if f'id="{element}"' not in html:
@@ -76,7 +94,7 @@ class Runtime:
             with self.lock:
                 candidate = module.Store(self.data_root)
                 candidate.ui_revision = ui_revision
-                candidate.auto_update = {'enabled': True, 'status': '자동 반영 사용 중', 'revision': revision[:12]}
+                candidate.auto_update = self.status(revision)
                 json.dumps(candidate.state(), allow_nan=False)
                 base = module.handler_class(candidate, self.token)
                 runtime = self
@@ -124,7 +142,7 @@ class Runtime:
             self.pending = None
             self.rejected = None
             with self.lock:
-                self.store.auto_update = {'enabled': True, 'status': '자동 반영 사용 중', 'revision': self.revision[:12]}
+                self.store.auto_update = self.status(self.revision)
             return False
         if current[0] != self.pending:
             self.pending = current[0]
@@ -138,22 +156,31 @@ class Runtime:
             except Exception:
                 logging.exception('Reading local update files failed; keeping current version')
 
+    def mail_once(self):
+        # The report is built under the lock, but SMTP (up to tens of seconds)
+        # runs outside it so capture uploads are never held back by a slow mail server.
+        with self.lock:
+            store, module = self.store, self.module
+            local = store.clock().astimezone(ZoneInfo(store.cfg['timezone']))
+            if local.strftime('%H:%M') not in store.cfg['email']['times']:
+                return False
+            slot = local.strftime('%Y-%m-%d %H:%M')
+            if store.db.execute('SELECT 1 FROM mail_receipts WHERE slot=?',(slot,)).fetchone():
+                return False
+            message = module.build_report(store, slot)
+            settings = dict(store.cfg['email'])
+        if message is None:
+            return False
+        module.send_report(settings, message)
+        with self.lock, self.store.db:
+            self.store.db.execute('INSERT OR IGNORE INTO mail_receipts VALUES(?,?)',(slot,module.now_iso()))
+        return True
+
     def mail(self):
-        # A single mail worker survives revisions; the lock prevents duplicate
-        # dispatch or DB replacement during a scheduled send.
+        # A single mail worker survives revisions.
         while not self.stopped.wait(20):
             try:
-                with self.lock:
-                    store = self.store
-                    local = store.clock().astimezone(ZoneInfo(store.cfg['timezone']))
-                    if local.strftime('%H:%M') not in store.cfg['email']['times']:
-                        continue
-                    slot = local.strftime('%Y-%m-%d %H:%M')
-                    if store.db.execute('SELECT 1 FROM mail_receipts WHERE slot=?',(slot,)).fetchone():
-                        continue
-                    if self.module.email_report(store, slot):
-                        with store.db:
-                            store.db.execute('INSERT INTO mail_receipts VALUES(?,?)',(slot,self.module.now_iso()))
+                self.mail_once()
             except Exception:
                 logging.exception('Scheduled email failed')
 
@@ -161,8 +188,8 @@ class Runtime:
 def run(source_root, data_root, port=None):
     data_root = Path(data_root)
     (data_root/'data').mkdir(exist_ok=True, parents=True)
-    logging.basicConfig(filename=data_root/'data/server.log', level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(message)s', encoding='utf-8')
+    handler = RotatingFileHandler(data_root/'data/server.log', maxBytes=5_000_000, backupCount=3, encoding='utf-8')
+    logging.basicConfig(handlers=[handler], level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     runtime = Runtime(source_root, data_root)
     server = ThreadingHTTPServer(('127.0.0.1', port or runtime.store.cfg['port']), runtime.handle)
     server.daemon_threads = True

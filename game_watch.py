@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 GAME = 'albion-online.exe'
@@ -83,19 +84,38 @@ class WindowsPlatform:
         finally:
             self.k.CloseHandle(handle)
 
-    def start_capture(self):
+    def launch(self, *switches):
         # Automatic mode never installs software, opens a browser, or restarts
         # an existing receiver. It starts only missing local components.
         # A file avoids inherited stdout pipes keeping the launcher wait open
         # after a GUI child has successfully started.
         with (self.root/'data/game-launcher.log').open('ab') as output:
             result = subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass',
-                '-File',str(self.root/'start.ps1'),'-NoBrowser','-Automatic'],
+                '-File',str(self.root/'start.ps1'),'-NoBrowser','-Automatic',*switches],
                 cwd=self.root,stdout=output,stderr=subprocess.STDOUT,timeout=40,
-                creationflags=subprocess.CREATE_NO_WINDOW)
+                creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         if result.returncode:
-            raise RuntimeError('Local capture launcher failed; see game-watch.log')
+            raise RuntimeError('Local capture launcher failed; see game-launcher.log')
+
+    def start_capture(self):
+        self.launch()
         return self.capture_running() is True
+
+    def receiver_ready(self):
+        # The capture client keeps posting to a dead port silently, so the
+        # receiver itself must be checked while the game is running.
+        try:
+            port = int(json.loads((self.root/'config.json').read_text(encoding='utf-8-sig'))['port'])
+            # No proxy: a system proxy must never see or answer the local health check.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f'http://127.0.0.1:{port}/api/health',timeout=2) as response:
+                return json.load(response).get('app') == 'AlbionLocal'
+        except Exception:
+            return False
+
+    def start_receiver(self):
+        self.launch('-DashboardOnly')
+        return self.receiver_ready()
 
     def stop_capture(self):
         pid = self.capture_pid()
@@ -121,6 +141,8 @@ class Controller:
         self.absent_since = None
         self.next_start = 0
         self.failures = 0
+        self.receiver_misses = 0
+        self.next_receiver = 0
         self.last_status = None
 
     def status(self, text, game, capture):
@@ -152,7 +174,7 @@ class Controller:
             self.absent_since = None
             if capture is True:
                 self.failures = 0
-                return self.status('게임 실행 중 · 자동 수집 중',True,True)
+                return self.check_receiver(now)
             if capture is None:
                 return self.status('수집기 상태 확인 불가 · 중복 실행 보류',True,None)
             if 'albiondata-client.exe' in names:
@@ -170,6 +192,7 @@ class Controller:
                 self.failures += 1
                 self.next_start = self.clock()+min(300,30*2**min(self.failures-1,4))
                 return self.status('수집기 시작 실패 · 잠시 후 재시도',True,False)
+        self.receiver_misses = 0
         if self.absent_since is None:
             self.absent_since = now
         if capture is True and now-self.absent_since >= 10:
@@ -177,6 +200,24 @@ class Controller:
                 return self.status('게임 종료 · 수집기 종료 확인 필요',False,True)
             return self.status('게임 종료 · 수집기 자동 종료',False,False)
         return self.status('게임 실행 대기' if capture is not True else '게임 종료 확인 중',False,capture)
+
+    def check_receiver(self, now):
+        if self.platform.receiver_ready():
+            self.receiver_misses = 0
+            return self.status('게임 실행 중 · 자동 수집 중',True,True)
+        # Three misses (~9 s) so a briefly busy receiver is never started twice.
+        self.receiver_misses += 1
+        if self.receiver_misses < 3 or now < self.next_receiver:
+            return self.status('분석 프로그램 응답 없음 · 확인 중',True,True)
+        try:
+            if not self.platform.start_receiver():
+                raise RuntimeError('Receiver did not answer after restart')
+            self.receiver_misses = 0
+            return self.status('분석 프로그램 다시 시작 · 자동 수집 중',True,True)
+        except Exception:
+            logging.exception('Receiver restart failed')
+            self.next_receiver = self.clock()+60
+            return self.status('분석 프로그램 다시 시작 실패 · 잠시 후 재시도',True,True)
 
 
 def main():

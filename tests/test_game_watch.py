@@ -13,8 +13,9 @@ class FakePlatform:
     def __init__(self):
         self.names = set()
         self.running = False
-        self.starts = self.stops = 0
+        self.starts = self.stops = self.receiver_starts = 0
         self.success = True
+        self.receiver = True
     def processes(self): return self.names
     def capture_running(self): return self.running
     def start_capture(self):
@@ -25,6 +26,11 @@ class FakePlatform:
         self.stops += 1
         self.running = False
         return True
+    def receiver_ready(self): return self.receiver
+    def start_receiver(self):
+        self.receiver_starts += 1
+        self.receiver = self.success
+        return self.success
 
 
 class GameWatchTests(unittest.TestCase):
@@ -119,6 +125,35 @@ class GameWatchTests(unittest.TestCase):
         self.assertTrue(state['game_running'])
         self.assertTrue(state['capture_running'])
         self.assertNotIn('player',state)
+
+    def test_dead_receiver_is_restarted_while_game_runs(self):
+        self.platform.names={GAME};self.step()
+        self.platform.receiver=False
+        self.step(3);self.step(3)
+        self.assertEqual(self.platform.receiver_starts,0)
+        self.step(3)
+        self.assertEqual(self.platform.receiver_starts,1)
+        self.assertTrue(self.platform.receiver)
+        self.step(3)
+        self.assertEqual((self.platform.receiver_starts,self.platform.starts),(1,1))
+
+    def test_failed_receiver_restart_waits_before_retrying(self):
+        self.platform.names={GAME};self.step()
+        self.platform.receiver=False;self.platform.success=False
+        self.step(3);self.step(3)
+        with self.assertLogs(level='ERROR'): self.step(3)
+        self.step(30)
+        self.assertEqual(self.platform.receiver_starts,1)
+        with self.assertLogs(level='ERROR'): self.step(30)
+        self.assertEqual(self.platform.receiver_starts,2)
+
+    def test_receiver_left_alone_when_game_closed_or_manually_stopped(self):
+        self.platform.receiver=False
+        self.step();self.step(3);self.step(3);self.step(3)
+        (self.root/'data/game-watch-paused').write_text('manual')
+        self.platform.names={GAME}
+        for _ in range(4): self.step(3)
+        self.assertEqual(self.platform.receiver_starts,0)
 
     def test_launcher_uses_file_output_not_gui_inherited_pipes(self):
         platform=WindowsPlatform.__new__(WindowsPlatform)

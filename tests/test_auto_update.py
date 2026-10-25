@@ -1,5 +1,6 @@
 """Isolated automatic-update tests; never restart the production process."""
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -8,8 +9,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
-from auto_update import Runtime
+from zoneinfo import ZoneInfo
+
+from auto_update import Runtime, find_node
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,9 +37,9 @@ class AutomaticUpdateTests(unittest.TestCase):
         token = self.runtime.token
         self.runtime.store.ingest('marketorders.ingest', {'Orders':[self.order(1)]})
         p = self.root/'market.py'
-        p.write_text(p.read_text(encoding='utf-8').replace('20261025.7','20261025.7-test'),encoding='utf-8')
+        p.write_text(p.read_text(encoding='utf-8').replace('20261025.8','20261025.8-test'),encoding='utf-8')
         self.assertTrue(self.runtime.apply_changes())
-        self.assertEqual(self.runtime.store.state()['build'],'20261025.7-test')
+        self.assertEqual(self.runtime.store.state()['build'],'20261025.8-test')
         self.assertEqual(self.runtime.token,token)
         self.assertEqual(self.runtime.store.state()['packets'],1)
         self.assertEqual((self.root/'config.json').read_bytes(),before_config)
@@ -47,8 +51,9 @@ class AutomaticUpdateTests(unittest.TestCase):
             self.assertFalse(self.runtime.apply_changes())
         self.assertIs(self.runtime.store,store)
         self.assertEqual(self.runtime.revision,revision)
-        self.assertEqual(self.runtime.store.state()['build'],'20261025.7')
+        self.assertEqual(self.runtime.store.state()['build'],'20261025.8')
 
+    @unittest.skipUnless(find_node(), 'Node syntax check unavailable')
     def test_broken_frontend_not_served_and_next_good_update_recovers(self):
         original = self.runtime.assets['/app.js']
         (self.root/'web/app.js').write_text('const broken = ;',encoding='utf-8')
@@ -80,6 +85,33 @@ class AutomaticUpdateTests(unittest.TestCase):
         p.write_bytes(original)
         self.assertFalse(self.runtime.watch_once())
         self.assertEqual(self.runtime.store.auto_update['status'],'자동 반영 사용 중')
+
+    def test_missing_node_does_not_block_startup(self):
+        self.runtime.store.db.close()
+        with patch('auto_update.find_node', return_value=None), self.assertLogs(level='WARNING'):
+            self.runtime = Runtime(self.root, self.root)
+        self.assertIsNotNone(self.runtime.store)
+        self.assertIn('Node', self.runtime.store.auto_update['note'])
+
+    def test_scheduled_mail_is_sent_without_holding_the_request_lock(self):
+        store = self.runtime.store
+        local = store.clock().astimezone(ZoneInfo(store.cfg['timezone']))
+        store.cfg['email'] = dict(store.cfg['email'], enabled=True, to='a@example.com', **{'from': 'b@example.com'},
+                                  smtp_host='smtp.example.com', times=[local.strftime('%H:%M')])
+        free = []
+        def lock_is_free():
+            if not self.runtime.lock.acquire(timeout=1):
+                return False
+            self.runtime.lock.release()
+            return True
+        def send(settings, message):
+            # Probe from another thread: the RLock is re-entrant for this one.
+            probe = threading.Thread(target=lambda: free.append(lock_is_free()))
+            probe.start(); probe.join()
+        with patch.dict(os.environ, {store.cfg['email']['password_env']: 'secret'}), patch.object(self.runtime.module, 'send_report', send):
+            self.assertTrue(self.runtime.mail_once())
+            self.assertFalse(self.runtime.mail_once())
+        self.assertEqual(free, [True])
 
     def order(self, number):
         return {'Id':number,'ItemTypeId':'T7_RELIC','LocationId':'1002','QualityLevel':1,

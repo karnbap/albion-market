@@ -5,14 +5,16 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
+from collections import Counter
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from market import Store, handler_class, parse_time, describe_depth, DEPTH_DEFAULTS, capture_status
+from market import Store, handler_class, parse_time, describe_depth, DEPTH_DEFAULTS, capture_status, CANDIDATES_PER_ITEM
 
 ROOT = Path(__file__).resolve().parents[1]
 UTC = timezone.utc
@@ -296,15 +298,77 @@ class MarketTests(unittest.TestCase):
         self.capture(other, other2)
         self.assertTrue(self.store.book('T7_RELIC','1002','buy')['fresh'])
         self.assertTrue(self.store.book('T7_RELIC','3008','sell')['fresh'])
-        self.assertEqual(self.store.state()['candidates'], [])
-        # A sale that would hit the destination bid also requires another model.
+        resting = lambda: [r for r in self.store.state()['candidates'] if r['mode'] in ('best', 'depth')]
+        self.assertEqual(resting(), [])
+        # A sale that would hit the destination bid is the instant model, not a queue.
         self.store.reset_book('T7_RELIC', '1002')
         self.capture(self.order(4, 100, 100, 'request'), self.order(5, 140, 100), self.order(14,100,1,'request'), self.order(15,140,1))
         bid = self.order(6, 200, 100, 'request')
         bid['LocationId'] = '3008'
         self.capture(bid, dict(bid,Id=16), other, other2)
         self.assertTrue(self.store.book('T7_RELIC','3008','sell')['fresh'])
-        self.assertFalse(any(r['sell_city'] == '3008' for r in self.store.state()['candidates']))
+        self.assertFalse(any(r['sell_city'] == '3008' for r in resting()))
+        self.assertTrue(any(r['sell_city'] == '3008' and r['mode'] == 'instant' for r in self.store.state()['candidates']))
+
+    def market(self, city, base, asks=(), bids=(), item='T7_RELIC'):
+        # Two orders per side: a single order is a selected-order click, not a list.
+        rows = [dict(self.order(base+i, price, 10, side), LocationId=city, ItemTypeId=item)
+                for i, (price, side) in enumerate([(p, 'offer') for p in asks for _ in range(2)] + [(p, 'request') for p in bids for _ in range(2)])]
+        self.capture(*rows)
+
+    def test_instant_route_pays_sales_tax_only(self):
+        self.market('1002', 10, asks=[100])
+        self.market('3008', 20, bids=[130])
+        row = next(r for r in self.store.state()['candidates'] if r['mode'] == 'instant')
+        self.assertEqual((row['buy_city'], row['sell_city'], row['buy_price'], row['sell_price']), ('1002', '3008', 100, 130))
+        self.assertAlmostEqual(row['net_per_unit'], round(130 * (1 - .08) - 100, 2))
+        self.assertEqual((row['buy_available'], row['sell_available']), (20, 20))
+        self.assertEqual(row['status'], '바로 매입 · 바로 판매')
+
+    def test_instant_listing_only_above_destination_bid(self):
+        self.market('1002', 10, asks=[100])
+        self.market('3008', 20, asks=[140], bids=[130])
+        row = next(r for r in self.store.state()['candidates'] if r['mode'] == 'instant_list')
+        self.assertEqual(row['sell_price'], 139)
+        self.assertAlmostEqual(row['net_per_unit'], round(139 * (1 - .08 - .025) - 100, 2))
+        self.store.reset_book('T7_RELIC', '3008')
+        self.market('3008', 40, asks=[131], bids=[130])
+        self.assertFalse(any(r['mode'] == 'instant_list' for r in self.store.state()['candidates']))
+
+    def test_candidates_trimmed_per_item_so_later_items_stay_visible(self):
+        for item, base in (('T7_RELIC', 1000), ('T8_RUNE', 5000)):
+            for k, city in enumerate(['1002', '2004', '3005', '3008', '4002', '7', '5003']):
+                self.market(city, base + 10*k, asks=[100+k], bids=[200+k], item=item)
+        counts = Counter(r['item'] for r in self.store.state()['candidates'])
+        self.assertEqual(counts, {'T7_RELIC': CANDIDATES_PER_ITEM, 'T8_RUNE': CANDIDATES_PER_ITEM})
+
+    def test_city_board_routes_best_quotes_and_markets_to_reopen(self):
+        self.market('1002', 10, asks=[100], bids=[90])
+        self.market('3008', 20, asks=[140], bids=[130])
+        board = {c['city']: c for c in self.store.state()['city_board']}
+        route = board['1002']['routes'][0]
+        self.assertEqual((route['item'], route['sell_city'], route['mode']), ('T7_RELIC', '3008', 'best'))
+        self.assertEqual(route['alternative']['mode'], 'instant_list')
+        self.assertNotIn('수수료 설정 미확인', route['warnings'])
+        self.assertEqual(board['3008']['sell_here'][0], {'item': 'T7_RELIC', 'price': 130, 'amount': 20, 'compared': 2, 'lead': 40})
+        self.assertEqual(board['1002']['buy_here'][0]['price'], 100)
+        self.assertEqual(board['1002']['fresh_items'], 1)
+        self.assertEqual({m['item']: m['reason'] for m in board['1002']['missing']}, {'T8_SOUL': '미조회', 'T8_RELIC': '미조회', 'T8_RUNE': '미조회'})
+        self.assertEqual(board['3008']['routes'], [])
+        self.now += timedelta(minutes=16)
+        board = {c['city']: c for c in self.store.state()['city_board']}
+        self.assertEqual((board['1002']['routes'], board['1002']['buy_here']), ([], []))
+        self.assertEqual(board['1002']['missing'][0], {'item': 'T7_RELIC', 'reason': '지난 자료'})
+
+    def test_game_watch_heartbeat_marks_watcher_active(self):
+        self.assertFalse(self.store.state()['game_watch']['active'])
+        path = self.root/'data/game-watch-state.json'
+        path.write_text(json.dumps({'checked_at': time.time(), 'game_running': False, 'capture_running': False, 'status': '게임 실행 대기'}), encoding='utf-8')
+        watch = self.store.state()['game_watch']
+        self.assertTrue(watch['active'])
+        self.assertFalse(watch['game_running'])
+        path.write_text(json.dumps({'checked_at': time.time() - 120, 'game_running': False}), encoding='utf-8')
+        self.assertFalse(self.store.state()['game_watch']['active'])
 
     def test_single_order_without_market_list_is_not_a_trade_candidate(self):
         self.capture(self.order(1,100,100,'request'),self.order(2,200,100))
@@ -484,6 +548,13 @@ class MarketTests(unittest.TestCase):
             result.exception.close()
             with urllib.request.urlopen(url + "/api/state") as r:
                 self.assertEqual(json.load(r)["packets"], 1)
+            with self.assertLogs(level="INFO") as logs:
+                urllib.request.urlopen(url + "/api/health").close()
+                with self.assertRaises(urllib.error.HTTPError) as result:
+                    urllib.request.urlopen(url + "/missing")
+                result.exception.close()
+            self.assertFalse(any("/api/health" in line for line in logs.output))
+            self.assertTrue(any("/missing" in line for line in logs.output))
         finally:
             server.shutdown()
             server.server_close()

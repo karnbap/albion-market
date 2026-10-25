@@ -23,12 +23,21 @@ def main():
     vendor = ROOT / "vendor"
     vendor.mkdir(exist_ok=True)
     target = vendor / "albiondata-client.exe"
-    if not target.exists():
-        blob = fetch(URL)
-        binary = gzip.decompress(blob)
+    try:
+        installed = json.loads((vendor / "provenance.json").read_text(encoding="utf-8")).get("release")
+    except (OSError, ValueError):
+        installed = None
+    # Changing RELEASE must replace the old client, not keep it because a file exists.
+    if not target.exists() or installed != RELEASE:
+        binary = gzip.decompress(fetch(URL))
         if not binary.startswith(b"MZ"):
             raise ValueError("Expected Windows executable")
-        target.write_bytes(binary)
+        partial = target.with_suffix(".download")
+        partial.write_bytes(binary)
+        try:
+            partial.replace(target)
+        except PermissionError:
+            raise SystemExit("The capture client is running. Close it with stop.ps1, then run setup.py again.")
     cfg_path = ROOT / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     text = fetch(ITEMS).decode("utf-8-sig")
