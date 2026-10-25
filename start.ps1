@@ -1,6 +1,8 @@
 ﻿param([switch]$DashboardOnly, [switch]$NoBrowser, [switch]$Automatic)
 $ErrorActionPreference = 'Stop'
 $albionRoot = $PSScriptRoot
+# A fresh clone has no data folder yet; redirected logs and PID files need it.
+New-Item -ItemType Directory -Force -Path (Join-Path $albionRoot 'data') | Out-Null
 $albionPythonOnPath = Get-Command python.exe -ErrorAction SilentlyContinue
 $albionPythonCandidates = @($env:ALBION_PYTHON, 'C:\Python314\python.exe', (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'), $albionPythonOnPath.Source)
 $albionPython = $albionPythonCandidates | Where-Object {$_ -and (Test-Path -LiteralPath $_)} | Select-Object -First 1
@@ -22,12 +24,17 @@ if ($albionRunning -and -not $albionHealth.auto_update.enabled -and -not $Automa
     if (-not $albionHealth.auto_update.enabled) { throw 'Automatic update setup did not complete. Check data\server-stderr.log.' }
 }
 if (-not $albionRunning) {
+    $albionPidPath = Join-Path $albionRoot 'data\server.pid'
+    $albionPreviousPid = if (Test-Path -LiteralPath $albionPidPath) { (Get-Content -LiteralPath $albionPidPath -Raw).Trim() } else { $null }
     $albionProcess = Start-Process -FilePath $albionPython -ArgumentList @('"' + (Join-Path $albionRoot 'market.py') + '"') -WorkingDirectory $albionRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $albionRoot 'data\server-stdout.log') -RedirectStandardError (Join-Path $albionRoot 'data\server-stderr.log')
-    Set-Content -LiteralPath (Join-Path $albionRoot 'data\server.pid') -Value $albionProcess.Id
-    for ($albionAttempt=0; $albionAttempt -lt 30; $albionAttempt++) {
+    Set-Content -LiteralPath $albionPidPath -Value $albionProcess.Id
+    for ($albionAttempt=0; $albionAttempt -lt 75; $albionAttempt++) {
         Start-Sleep -Milliseconds 200
         try { $albionHealth = Invoke-RestMethod -Uri "$albionAddress/api/health" -TimeoutSec 1; if ($albionHealth.app -eq 'AlbionLocal') { $albionRunning=$true; break } } catch { }
     }
+    # A duplicate start that lost the port to a still-running receiver exits at once;
+    # keep that receiver's PID so stop.ps1 can still find it.
+    if ($albionProcess.HasExited -and $albionPreviousPid) { Set-Content -LiteralPath $albionPidPath -Value $albionPreviousPid }
     if (-not $albionRunning) { throw 'Receiver did not start. Check data\server-stderr.log.' }
 }
 if (-not $NoBrowser) { Start-Process $albionAddress }

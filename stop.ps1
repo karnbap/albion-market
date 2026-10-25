@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $albionRoot = $PSScriptRoot
+New-Item -ItemType Directory -Force -Path (Join-Path $albionRoot 'data') | Out-Null
 # Keep a manual stop effective until the next game session.
 Set-Content -LiteralPath (Join-Path $albionRoot 'data\game-watch-paused') -Value 'Manual stop; resume after game exits.'
 $albionTargets = @(@{File='capture.pid'; Expected=(Join-Path $albionRoot 'vendor\albiondata-client.exe')}, @{File='server.pid'; Expected='market.py'})
