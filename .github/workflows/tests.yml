@@ -1,0 +1,24 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements.txt
+      - run: Copy-Item config.example.json config.json
+      - run: python -m unittest discover -s tests -v
+      - run: node --check web/app.js
+      - name: Check matching browser scripts
+        shell: python
+        run: |
+          from pathlib import Path
+          assert Path('web/app.js').read_bytes() == Path('web/app-v2.js').read_bytes()

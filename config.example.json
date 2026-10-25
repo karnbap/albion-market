@@ -1,0 +1,36 @@
+{
+  "server": "europe",
+  "timezone": "Europe/Paris",
+  "port": 18765,
+  "fresh_minutes": 15,
+  "page_gap_seconds": 120,
+  "sales_tax": 0.08,
+  "setup_fee": 0.025,
+  "fees_confirmed": false,
+  "minimum_margin": 0.03,
+  "near_high_fraction": 0.95,
+  "transport_per_unit": 0.0,
+  "transport_confirmed": false,
+  "items": {
+    "T7_RELIC": "T7 유물",
+    "T8_SOUL": "T8 영혼",
+    "T8_RELIC": "T8 유물",
+    "T8_RUNE": "T8 룬"
+  },
+  "item_numeric_ids": {
+    "2031": "T7_RELIC",
+    "2037": "T8_RUNE",
+    "2038": "T8_SOUL",
+    "2039": "T8_RELIC"
+  },
+  "email": {
+    "enabled": false,
+    "to": "",
+    "from": "",
+    "smtp_host": "",
+    "smtp_port": 587,
+    "username": "",
+    "password_env": "ALBION_SMTP_PASSWORD",
+    "times": []
+  }
+}

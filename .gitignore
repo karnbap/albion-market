@@ -1,0 +1,20 @@
+# Local settings and gameplay records
+/config.json
+/data/
+/vendor/
+.env
+.env.*
+*.sqlite*
+*.db
+*.log
+*.pid
+*.csv
+*.zip
+*.exe
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Local screenshots, QA copies, backups and generated reports
+/docs/*
+!/docs/TEAM_HANDOFF.md

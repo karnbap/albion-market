@@ -1,0 +1,76 @@
+# Albion Market · 알비온 시장 기록
+
+알비온 **Europe** 서버에서 직접 조회한 네 품목(T7 유물, T8 영혼, T8 유물, T8 룬)의 호가·잔량과 시장 이력을 로컬에 저장하는 Windows 도구입니다. 시간대는 Europe/Paris입니다.
+
+게임 이동·클릭·주문을 자동 실행하지 않습니다. 휴대폰·아이패드 게임 자료는 직접 수집하지 않습니다.
+
+## 시작하기
+
+필요 환경: Windows 10/11, Python 3.11 이상, Node.js 22 이상(PATH 등록, 화면 코드 검증용), Npcap. 최초 설치는 직접 진행합니다.
+
+```powershell
+git clone https://github.com/karnbap/albion-market.git
+cd albion-market
+python -m pip install -r requirements.txt
+Copy-Item config.example.json config.json
+python setup.py
+```
+
+`setup.py`는 공식 Albion Data Client를 `vendor/`에 다운로드하고 품목 숫자 ID를 갱신합니다. Npcap은 [공식 사이트](https://npcap.com/#download)에서 별도 설치합니다. WinPcap API-compatible Mode를 선택합니다.
+
+분석 화면만 시작:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -DashboardOnly
+```
+
+게임을 켤 때 수집도 함께 실행하고, 종료 후 수집만 중단하도록 등록:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\enable-game-watch.ps1
+```
+
+화면은 `http://127.0.0.1:18765/`입니다. Windows 로그인 시 감시 프로그램이 시작됩니다. 수집은 게임이 실행 중일 때만 동작하며, 분석 화면과 기록은 게임 종료 후 유지됩니다. 수동 수집은 `start.ps1`, 수동 종료는 `stop.ps1`을 사용합니다.
+
+## 사용 방법
+
+1. 유럽 서버에 접속하고 구역을 이동해 도시를 인식시킵니다.
+2. 게임 시장에서 품목별 판매·구매 요청서 목록과 필요한 페이지를 엽니다. 분석 화면의 수동 조회 버튼은 필수가 아닙니다.
+3. 시장 이력은 24시간·7일·4주를 각각 조회합니다.
+4. 판매 완료 거래 메일을 열면 지원되는 알림의 도시·품목·단가·수량을 별도 저장합니다. 같은 메일을 다시 열어도 중복 집계하지 않습니다.
+5. 실제 게임 화면과 수신 가격·수량을 대조합니다. 암호화·게임 프로토콜 변경·조회 누락 때문에 수신되지 않을 수 있습니다.
+
+## 가격과 통계 해석
+
+- 호가는 **조회 당시 일부 주문의 잔량**입니다. 전체 주문이나 현재 최저·최고를 항상 보장하지 않습니다. 단일 주문 수신은 최고/최저 미확인으로 표시합니다.
+- 소량·대량·물량 벽과 가까운 가격대의 물량 기준 가격을 따로 표시합니다.
+- 오래된 자료는 보관하되 현재 매매 후보에서 제외합니다.
+- 시장 이력은 시간 구간의 평균가와 총량입니다. 개별 최고 체결가·가격별 정확한 체결량으로 해석하지 않습니다.
+- 내 판매 메일은 시장 통계와 별도인 누적 근거입니다. **체결 시각이 확인되지 않으므로 처음 읽은 시각을 거래 시각으로 쓰지 않습니다.** 요일·24시간·7일 시장 거래량에 더하지 않습니다.
+- 메일 수집기에서 제공하는 세후 금액은 고정 세율 계산이라 실제 입금액으로 사용하지 않습니다.
+- 매매 후보는 수수료·세금·운송비 가정을 사용한 검토 자료입니다. 재고·기존 주문을 모르므로 매입 수량을 추천하지 않습니다.
+
+## 설정과 저장
+
+`config.json`은 개인 설정이며 Git에서 제외됩니다. 예시 세율·수수료는 게임 계정에서 확인하고 확인 항목을 체크해야 합니다. `data/market.sqlite3`에는 호가·이력·내 판매 메일이 저장됩니다. `vendor/`에는 다운로드한 수집기가 있습니다. 이 폴더들은 공유하지 않습니다.
+
+일반 자료는 `-i http://127.0.0.1:18765/ingest/europe`, 개인 판매 알림은 `-p http://127.0.0.1:18765/private/europe`로만 전달합니다. private 경로로 중복 전달되는 일반 호가 사본은 무시합니다.
+
+화면은 5초마다 갱신합니다. 분석 코드와 웹 파일의 로컬 변경은 검증 후 자동 반영합니다. **GitHub 변경을 자동 내려받는 기능은 아닙니다.** 협업 변경은 검토 후 `git pull`로 받아야 합니다. 실행·감시 스크립트 변경은 다음 실행 시 적용합니다.
+
+분석 보고서를 SMTP로 보내는 선택 기능은 기본 꺼짐입니다. 수신자·발송 시간·계정은 로컬 설정으로 지정하고, 비밀번호는 `ALBION_SMTP_PASSWORD` 환경변수에 둡니다. 게임 내 거래 메일 수집과 SMTP 보고서는 별개입니다.
+
+## 개발·검증
+
+```powershell
+python -m unittest discover -s tests -v
+node --check web/app.js
+```
+
+단위 검사는 임시 DB를 사용하며 게임·운영 DB를 조작하지 않습니다. 기존 운영 DB가 있는 경우 `python debug_market.py`로 읽기 전용 복제 점검을 실행할 수 있습니다. 생성되는 보고서는 로컬에만 남습니다.
+
+협업 범위·주의점·남은 검증은 [팀 인수인계](docs/TEAM_HANDOFF.md)를 참고하세요. 변경은 작업 브랜치와 Pull Request로 검토하는 방식을 권장합니다.
+
+## 외부 구성요소
+
+[Albion Online Data Project](https://github.com/ao-data/albiondata-client)의 공식 클라이언트를 별도 다운로드해 사용합니다. 이 저장소는 해당 프로젝트의 공식 서비스가 아니며 외부 실행 파일·Npcap을 재배포하지 않습니다. 외부 구성요소의 라이선스는 각 프로젝트를 따릅니다.

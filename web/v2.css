@@ -1,0 +1,20 @@
+html,body,.table-wrap{overflow-anchor:none;scroll-behavior:auto}
+button.city-card{text-align:left;white-space:normal;font-weight:400;line-height:1.65;width:100%;color:var(--text)}
+button.city-card:focus-visible,.table-wrap:focus-visible{outline:2px solid var(--gold);outline-offset:3px}
+.reference-mini{color:var(--green);font-size:11px;margin-top:9px}
+.depth-toolbar{display:flex;align-items:center;gap:22px;margin:28px 0 0}
+.depth-toolbar label{min-width:170px}.depth-toolbar p{font-size:12px;margin:15px 0 0}
+.book-summary{padding:14px 16px;border:1px solid var(--line);border-radius:5px;background:#122027;margin:12px 0 18px;min-height:190px}
+.book-summary p{margin:6px 0;font-size:13px}.book-summary p strong{color:var(--gold);font-size:18px;font-weight:500}
+.book-summary small{margin-top:5px;font-size:11px}.stale-summary{border-style:dashed}
+#sell .wall td,#buy .wall td{background:#3c3221;color:#f7d997;border-bottom-color:#6b5732}
+#sell .large td,#buy .large td{background:#193b34;color:#a7dfbf}
+#sell .small-lot td,#buy .small-lot td{color:#9dadb4;background:#172127}
+.wall-badge{border-color:#b5904a;background:#5a421d;color:#ffe1a5}
+.small-badge{border-color:#46575e;color:#afbec3;font-size:9px}
+.stale-row td{opacity:.66}.conditional td{background:#28271f}
+#sell table,#buy table{min-width:480px}#candidates table{min-width:850px}
+.table-wrap{overscroll-behavior:contain;scrollbar-gutter:stable}
+#saved{display:inline-block;max-width:85%;vertical-align:middle;min-height:24px}
+.city-card h3{font-weight:600}.help{overflow-wrap:anywhere}
+@media(max-width:760px){.depth-toolbar{display:block}.depth-toolbar label{max-width:220px}.book-summary{min-height:0}#saved{max-width:100%;display:block;margin:10px 0 0}}
