@@ -501,6 +501,45 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(state['pick_history'][0]['picks'][0]['units'], first[0]['units'])
         self.assertIn('timing', first[0])
 
+    def hourly_profile(self, rate, city='3008'):
+        # 28 days of 1-hour buckets; rate(local_start) gives units sold in that hour.
+        zone = ZoneInfo('Europe/Paris')
+        rows = []
+        for back in range(1, 28 * 24):
+            end = self.now.replace(minute=0) - timedelta(hours=back - 1)
+            start = (end - timedelta(hours=1)).astimezone(zone)
+            amount = rate(start)
+            rows.append({"ItemAmount": amount, "SilverAmount": amount * 100 * 10000,
+                         "Timestamp": int(end.timestamp()) * 10000000 + 621355968000000000})
+        self.store.ingest('markethistories.ingest', {"AlbionId": 2031, "LocationId": city, "QualityLevel": 1, "Timescale": 0, "Histories": rows})
+
+    def test_demand_outlook_uses_weekday_or_weekend_hours_and_flags_quiet_stretch(self):
+        # Saturday 14:00 Paris now. Weekend afternoons 14-19h sell 1/h, other weekend hours 10/h, weekdays 50/h.
+        self.hourly_profile(lambda t: 50 if t.weekday() < 5 else 1 if 14 <= t.hour < 20 else 10)
+        o = self.store.demand_outlook({}, 'T7_RELIC', '3008')
+        self.assertTrue(o['weekend'])
+        self.assertEqual((o['next6'], o['next24']), (6, 186))
+        self.assertTrue(o['low_window'])
+        self.assertEqual(o['quiet_hours'], [14, 15, 16, 17, 18, 19])
+        self.assertIsNone(self.store.demand_outlook({}, 'T7_RELIC', '1002'))
+
+    def test_waiting_trades_are_capped_by_coming_demand_and_split_from_instant(self):
+        self.hourly_profile(lambda t: 1)
+        self.market('1002', 10, asks=[100, 101])
+        self.market('3008', 20, asks=[200], bids=[130])
+        groups = self.store.state()['now_groups']
+        self.assertEqual([p['kind'] for p in groups['instant']], ['instant'])
+        listing = groups['wait'][0]
+        self.assertEqual((listing['kind'], listing['units']), ('instant_list', 24))
+        self.assertEqual(listing['outlook']['next24'], 24)
+
+    def test_quiet_hours_warn_waiting_trades(self):
+        self.hourly_profile(lambda t: 1 if 14 <= t.hour < 20 else 10)
+        self.market('1002', 10, asks=[100, 101])
+        self.market('3008', 20, asks=[200])
+        pick = self.store.state()['now_groups']['wait'][0]
+        self.assertTrue(any('수요가 적은 시간대' in w for w in pick['warnings']))
+
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
         path = self.root/'data/game-watch-state.json'
