@@ -540,6 +540,115 @@ class MarketTests(unittest.TestCase):
         pick = self.store.state()['now_groups']['wait'][0]
         self.assertTrue(any('수요가 적은 시간대' in w for w in pick['warnings']))
 
+    def test_shrinking_order_is_recorded_as_a_fill_but_repricing_is_not(self):
+        self.capture(self.order(1, 100, 10), self.order(2, 101, 10))
+        self.now += timedelta(minutes=5)
+        self.capture(self.order(1, 100, 6), self.order(2, 103, 4))
+        fills = [tuple(r) for r in self.store.db.execute("SELECT side,order_id,price,amount FROM order_fills")]
+        self.assertEqual(fills, [('sell', '1', 100, 4)])
+
+    def stat(self, side, when, best, city='1002'):
+        self.store.db.execute("INSERT OR REPLACE INTO book_stats VALUES(?,?,?,?,?,?,?)", ('T7_RELIC', city, side, when.isoformat(), best, 50, 3))
+
+    def test_market_study_estimates_instant_buy_share_undercuts_and_weekday_weekend_trade(self):
+        tuesday = datetime(2026, 10, 20, 9, tzinfo=UTC)
+        for h in range(3):
+            end = tuesday + timedelta(hours=h + 1)
+            self.save_history(end=end, amount=10, avg=105)  # bid 100, ask averages 109 within the hour
+            for minute in (0, 10, 20, 30, 40, 50):
+                at = end - timedelta(hours=1) + timedelta(minutes=minute)
+                self.stat('buy', at, 100)
+                self.stat('sell', at, 110 if minute < 30 else 108)
+        saturday = datetime(2026, 10, 24, 9, tzinfo=UTC)
+        self.stat('sell', saturday, 140)
+        self.save_history(end=saturday + timedelta(hours=1), amount=20, avg=150)
+        study = self.store.market_study('T7_RELIC', '1002', {})
+        self.assertAlmostEqual(study['instant_buy_share'], (105 - 100) / (109 - 100))
+        self.assertEqual(study['share_samples'], 3)
+        # 18 readings 10 minutes apart: watched 170 minutes, the ask dropped once inside each hour.
+        self.assertEqual(study['undercuts'], 3)
+        self.assertAlmostEqual(study['undercut_hours'], 170 / 60 / 3)
+        self.assertEqual((study['weekday']['price'], study['weekend']['price']), (105, 150))
+        a = study['plan_a']
+        self.assertEqual((a['buy'], a['sell'], a['basis']), (101, 139, '호가 기록'))
+        self.assertAlmostEqual(a['margin'], 139 * (1 - .08 - .025) - 101 * 1.025)
+
+    def test_own_order_links_to_scanned_order_and_tracks_fills_and_queue(self):
+        mine = self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 120, 'amount': 30})
+        self.capture(self.order(1, 100, 5), self.order(2, 120, 30), self.order(3, 120, 30))
+        self.now += timedelta(minutes=5)
+        self.capture(self.order(1, 100, 5), self.order(2, 120, 25), self.order(3, 120, 30))
+        state = self.store.state()
+        row = next(r for r in state['my_orders'] if r['id'] == mine)
+        self.assertEqual((row['order_id'], row['remaining'], row['filled'], row['ahead'], row['is_best']), ('2', 25, 5, 5, False))
+        self.store.close_my_order(mine)
+        self.assertEqual(self.store.state()['my_orders'], [])
+        for bad in ({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 0, 'amount': 1},
+                    {'item': 'T7_RELIC', 'city': '1002', 'side': 'up', 'price': 1, 'amount': 1}):
+            with self.assertRaises(ValueError): self.store.add_my_order(bad)
+
+    def test_own_open_sell_orders_cut_waiting_quantity_and_warn_on_undercutting_myself(self):
+        self.hourly_profile(lambda t: 1)
+        self.market('1002', 10, asks=[100, 101])
+        self.market('3008', 20, asks=[200], bids=[130])
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '3008', 'side': 'sell', 'price': 250, 'amount': 10})
+        pick = self.store.state()['now_groups']['wait'][0]
+        self.assertEqual((pick['kind'], pick['units']), ('instant_list', 14))
+        self.assertTrue(any('내 기존 매도 주문 10개가 250에 남아 있음' in w and '뒤로 밀림' in w for w in pick['warnings']))
+
+    def test_buyout_skips_my_own_listings(self):
+        self.market('1002', 10, asks=[100, 150])  # two orders of 10 at each price
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 100, 'amount': 10})
+        best = self.store.state()['buyouts'][0]['best']
+        self.assertEqual((best['units'], best['cost']), (10, 1000))
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 100, 'amount': 10})
+        self.assertEqual(self.store.state()['buyouts'], [])
+
+    def client_log(self, *lines):
+        """Append lines in the capture client's log format (ANSI colours included, as on stdout)."""
+        path = self.root/'vendor/albiondata-client.log'
+        path.parent.mkdir(exist_ok=True)
+        with path.open('a', encoding='utf-8') as handle:
+            for seconds, text in lines:
+                stamp = (self.now - timedelta(seconds=seconds)).astimezone(timezone(timedelta(hours=1))).isoformat(timespec='seconds')
+                handle.write(f'\x1b[37mDEBU\x1b[0m[{stamp}] {text}\n')
+
+    def test_my_orders_list_from_client_log_registers_updates_and_closes_own_orders(self):
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 120, 'amount': 30})
+        self.client_log((2, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        result = self.capture(self.order(7, 120, 25), self.order(8, 300, 4))
+        self.assertEqual(result['accepted'], 2)
+        rows = {r['order_id']: r for r in self.store.state()['my_orders']}
+        self.assertEqual((rows['7']['source'], rows['7']['amount'], rows['7']['remaining'], rows['7']['filled']), ('manual', 30, 25, 5))
+        self.assertEqual((rows['8']['source'], rows['8']['amount'], rows['8']['remaining']), ('auto', 4, 4))
+        # The "my orders" answer is not a market page: the order book stays empty.
+        self.assertEqual(self.store.book('T7_RELIC', '1002', 'sell')['levels'], [])
+        # A normal market search afterwards is a market page again.
+        self.now += timedelta(minutes=1)
+        self.client_log((1, 'OperationRequest: [81]opAuctionGetOffers - 253:81'))
+        self.capture(self.order(1, 100, 5), self.order(7, 120, 20))
+        self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
+        self.assertEqual(next(r for r in self.store.state()['my_orders'] if r['order_id'] == '7')['remaining'], 20)
+        # Order 8 sold out: missing from the next "my orders" list of that city and side.
+        self.now += timedelta(minutes=1)
+        self.client_log((1, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        self.capture(self.order(7, 120, 20))
+        self.assertEqual([r['order_id'] for r in self.store.state()['my_orders']], ['7'])
+        debug = self.store.state()['client_debug']
+        self.assertTrue(debug['enabled'])
+        self.assertEqual(debug['lines'][0]['op'], 92)
+
+    def test_stale_my_orders_request_does_not_claim_market_pages(self):
+        self.client_log((300, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        self.capture(self.order(1, 100, 5), self.order(2, 120, 3))
+        self.assertEqual(self.store.state()['my_orders'], [])
+        self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
+
+    def test_capture_debug_operations_match_start_script(self):
+        from market import CAPTURE_DEBUG_OPERATIONS
+        script = (ROOT/'start.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn(f"'-debug', '-operations', '{CAPTURE_DEBUG_OPERATIONS}'", script)
+
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
         path = self.root/'data/game-watch-state.json'
