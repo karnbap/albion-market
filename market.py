@@ -37,7 +37,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261026.5"
+BUILD = "20261026.6"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -48,6 +48,9 @@ FEES_UNCONFIRMED, TRANSPORT_UNCONFIRMED = "수수료 설정 미확인", "운송�
 CANDIDATES_PER_ITEM = 15
 # How much of an expected profit a plan keeps when ranked: an instant round trip settles now,
 # every waiting order can be undercut or never fill.
+# Which "지금 하세요" column a plan belongs to: settles at once, or waits for orders to fill.
+INSTANT_KINDS = ("instant",)
+WAITING_KINDS = ("instant_list", "best", "buyout")
 CERTAINTY = {"instant": (1.0, "바로 체결 · 확실성 높음"), "instant_list": (0.7, "매도 주문 대기 · 확실성 보통"),
              "buyout": (0.5, "되팔기 대기 · 확실성 보통"), "best": (0.4, "매수·매도 주문 모두 대기 · 확실성 낮음")}
 # Routes into these cities cross hostile zones; the cargo can be lost on the way.
@@ -972,6 +975,43 @@ class Store:
                             "reasons": reasons, "seen": book["seen"]})
         return sorted(out, key=lambda r: -r["best"]["profit"])
 
+    def demand_outlook(self, cache, item, city):
+        """Expected units sold here over the next 6 and 24 hours, from the last 28 days of
+        hourly sales split into weekdays and weekends by local hour. Waiting trades are capped
+        by it, and a coming stretch well below the usual pace (e.g. weekday night) is flagged
+        so orders are not piled up into hours with few buyers. None without enough history."""
+        key = ("outlook", item, city)
+        if key in cache:
+            return cache[key]
+        zone = ZoneInfo(self.cfg["timezone"])
+        now = self.clock()
+        totals = {}
+        for r in self.db.execute("SELECT stamp,amount FROM history WHERE item=? AND city=? AND hours=1 AND stamp>? AND stamp<=?",
+                                 (item, city, (now - timedelta(days=28)).isoformat(), now.isoformat())):
+            start = (parse_time(r["stamp"]) - timedelta(hours=1)).astimezone(zone)
+            for k in ((start.weekday() >= 5, start.hour), (None, start.hour)):
+                t = totals.setdefault(k, [0, 0])
+                t[0] += r["amount"]; t[1] += 1
+        rates = []
+        for step in range(24):
+            moment = (now + timedelta(hours=step)).astimezone(zone)
+            exact, general = totals.get((moment.weekday() >= 5, moment.hour)), totals.get((None, moment.hour))
+            # Two observations of this weekday/weekend hour, else any day at this hour.
+            sample = exact if exact and exact[1] >= 2 else general
+            rates.append((moment, sample[0] / sample[1] if sample else None))
+        known = [r for _, r in rates if r is not None]
+        if len(known) < 12:
+            cache[key] = None
+            return None
+        usual = sum(known) / len(known)
+        filled = [(m, r if r is not None else usual) for m, r in rates]
+        next6, next24 = sum(r for _, r in filled[:6]), sum(r for _, r in filled)
+        quiet = [m.hour for m, r in filled if usual and r < usual * 0.5]
+        cache[key] = result = {"next6": next6, "next24": next24, "usual6": usual * 6,
+                               "low_window": bool(usual) and next6 < usual * 6 * 0.6,
+                               "weekend": filled[0][0].weekday() >= 5, "quiet_hours": quiet}
+        return result
+
     def plan_route(self, c, books, cache):
         """Turn one candidate into a concrete order: how many units, at which prices,
         for how much silver. Instant trades walk both order books level by level;
@@ -1000,14 +1040,15 @@ class Store:
                 asks[i][1] -= q; bids[j][1] -= q
                 i += asks[i][1] == 0; j += bids[j][1] == 0
         elif mode == "instant_list":
-            if not sell_guide["caution_above"]:
+            cap = self.waiting_cap(cache, item, dest, sell_guide["caution_above"])
+            if not cap:
                 return None
             price = c["sell_price"]
             for ask, amount in asks:
                 net = price * (1 - cfg["sales_tax"] - cfg["setup_fee"]) - ask - transport
-                if net <= 0 or net / ask < cfg["minimum_margin"] or units >= sell_guide["caution_above"]:
+                if net <= 0 or net / ask < cfg["minimum_margin"] or units >= cap:
                     break
-                q = min(amount, sell_guide["caution_above"] - units, int((budget - cost) // ask))
+                q = min(amount, cap - units, int((budget - cost) // ask))
                 if q <= 0:
                     break
                 units, cost, revenue = units + q, cost + ask * q, revenue + price * (1 - cfg["sales_tax"] - cfg["setup_fee"]) * q
@@ -1015,7 +1056,8 @@ class Store:
         elif mode == "best":
             buy_guide = self.volume_guide(cache, item, source)
             # A buy order competes with every other bid for the source's sellers; count on a quarter day.
-            units = min((buy_guide["caution_above"] or 0) // 4, (sell_guide["caution_above"] or 0) // 4,
+            units = min(self.waiting_cap(cache, item, source, buy_guide["caution_above"]) // 4,
+                        self.waiting_cap(cache, item, dest, sell_guide["caution_above"]) // 4,
                         int(budget // (c["buy_price"] * (1 + cfg["setup_fee"]))))
             cost = c["buy_price"] * (1 + cfg["setup_fee"]) * units
             revenue = cost + c["net_per_unit"] * units + transport * units
@@ -1038,10 +1080,19 @@ class Store:
                 "sell_high": c["sell_price"], "sell_low": sell_low, "certainty": certainty, "score": profit * weight,
                 "sell_per_day": sell_guide["per_day"], "warnings": warnings}
 
+    def waiting_cap(self, cache, item, city, caution):
+        """Units a waiting trade may hold in this market: one day at the slowest recent pace,
+        and no more than the hourly profile expects to sell over the next 24 hours."""
+        outlook = self.demand_outlook(cache, item, city)
+        if not caution:
+            return 0
+        return min(caution, int(outlook["next24"])) if outlook else caution
+
     def recommendations(self, books, candidates, buyouts, cache):
-        """The three best things to do now, each with quantities and prices. Two picks never
-        buy from the same sell list or sell the same item in the same city: they would
-        empty each other's supply or compete for the same buyers."""
+        """The three best trades now in each of two styles: settle at once (buy from sell
+        orders, sell into buy orders) or wait for orders to fill. Within a style two picks never
+        buy from the same sell list or sell the same item in the same city: they would empty
+        each other's supply or compete for the same buyers."""
         plans = [plan for c in candidates if c["mode"] != "depth" for plan in [self.plan_route(c, books, cache)] if plan]
         for b in buyouts:
             best = b["best"]
@@ -1059,20 +1110,32 @@ class Store:
         for plan in plans:
             # Listing and buyout plans sell over the coming day, so today's usual pace matters;
             # an instant trade settles now and only gets the information.
+            plan["group"] = "instant" if plan["kind"] in INSTANT_KINDS else "wait"
             plan["timing"] = timing = self.timing(cache, plan["item"], plan["sell_city"], books)
-            if plan["kind"] != "instant" and timing["sales_weekday"] is not None:
-                plan["score"] *= min(1.2, max(0.8, timing["sales_weekday"]))
-        picks, buying, selling = [], set(), set()
-        for plan in sorted(plans, key=lambda p: -p["score"]):
-            source, dest = (plan["item"], plan["buy_city"]), (plan["item"], plan["sell_city"])
-            if source in buying or dest in selling:
+            plan["outlook"] = outlook = self.demand_outlook(cache, plan["item"], plan["sell_city"])
+            if plan["group"] == "instant":
                 continue
-            buying.add(source)
-            selling.add(dest)
-            picks.append(plan)
-            if len(picks) == 3:
-                break
-        return picks
+            if timing["sales_weekday"] is not None:
+                plan["score"] *= min(1.2, max(0.8, timing["sales_weekday"]))
+            if outlook and outlook["low_window"]:
+                plan["score"] *= max(0.6, outlook["next6"] / outlook["usual6"]) if outlook["usual6"] else 0.6
+                plan["warnings"].append(f"앞으로 6시간은 {'주말' if outlook['weekend'] else '평일'} 수요가 적은 시간대 · 예상 판매 {outlook['next6']:,.0f}개(평소 {outlook['usual6']:,.0f}개) · 주문을 한꺼번에 쌓지 마세요")
+            if outlook and plan["units"] > outlook["next24"]:
+                plan["warnings"].append(f"앞으로 24시간 예상 판매 {outlook['next24']:,.0f}개보다 많이 삼 · 나눠서 올리세요")
+        groups = {}
+        for group in ("instant", "wait"):
+            picks, buying, selling = [], set(), set()
+            for plan in sorted((p for p in plans if p["group"] == group), key=lambda p: -p["score"]):
+                source, dest = (plan["item"], plan["buy_city"]), (plan["item"], plan["sell_city"])
+                if source in buying or dest in selling:
+                    continue
+                buying.add(source)
+                selling.add(dest)
+                picks.append(plan)
+                if len(picks) == 3:
+                    break
+            groups[group] = picks
+        return groups
 
     def log_picks(self, picks):
         """Keep each new set of top picks, so earlier advice stays readable after the
@@ -1103,7 +1166,8 @@ class Store:
             buyouts = self.buyouts(books, cache)
             for card in board:
                 card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
-            now = self.recommendations(books, every, buyouts, cache)
+            now_groups = self.recommendations(books, every, buyouts, cache)
+            now = now_groups["instant"] + now_groups["wait"]
             if now:
                 self.log_picks(now)
             history = self.pick_history()
@@ -1129,7 +1193,7 @@ class Store:
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
-                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "pick_history": history, "mail_diagnostics": self.mail_diagnostics(),
+                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(),
                 "book_patterns": self.book_patterns(item, city), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
