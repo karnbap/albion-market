@@ -14,6 +14,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from auto_update import Runtime, find_node
+from market import BUILD
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,9 +38,9 @@ class AutomaticUpdateTests(unittest.TestCase):
         token = self.runtime.token
         self.runtime.store.ingest('marketorders.ingest', {'Orders':[self.order(1)]})
         p = self.root/'market.py'
-        p.write_text(p.read_text(encoding='utf-8').replace('20261025.8','20261025.8-test'),encoding='utf-8')
+        p.write_text(p.read_text(encoding='utf-8').replace(BUILD,BUILD+'-test'),encoding='utf-8')
         self.assertTrue(self.runtime.apply_changes())
-        self.assertEqual(self.runtime.store.state()['build'],'20261025.8-test')
+        self.assertEqual(self.runtime.store.state()['build'],BUILD+'-test')
         self.assertEqual(self.runtime.token,token)
         self.assertEqual(self.runtime.store.state()['packets'],1)
         self.assertEqual((self.root/'config.json').read_bytes(),before_config)
@@ -51,7 +52,7 @@ class AutomaticUpdateTests(unittest.TestCase):
             self.assertFalse(self.runtime.apply_changes())
         self.assertIs(self.runtime.store,store)
         self.assertEqual(self.runtime.revision,revision)
-        self.assertEqual(self.runtime.store.state()['build'],'20261025.8')
+        self.assertEqual(self.runtime.store.state()['build'],BUILD)
 
     @unittest.skipUnless(find_node(), 'Node syntax check unavailable')
     def test_broken_frontend_not_served_and_next_good_update_recovers(self):
