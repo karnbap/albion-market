@@ -31,7 +31,7 @@ PORTALS = {"1301": "1002", "2301": "2004", "3301": "3008", "4301": "4002", "301"
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quantity_min": 500,
                   "wall_multiple": 3.0, "depth_price_band": 0.20}
-BUILD = "20261025.8"
+BUILD = "20261026.1"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -40,6 +40,18 @@ COMMON_NOTES = ["주문 목록 일부 · 전체 깊이 미확인", "내 재고·
                 "바로 매입·판매 가격은 조회 뒤 다른 사람이 먼저 거래하면 바뀜", "주문 매입·판매는 체결 대기"]
 FEES_UNCONFIRMED, TRANSPORT_UNCONFIRMED = "수수료 설정 미확인", "운송비 설정 미확인"
 CANDIDATES_PER_ITEM = 15
+BUYOUT_LEVELS = 30
+BUYOUT_NOTES = ["본 매도 목록 범위 안에서만 계산", "조회 뒤 다른 사람이 먼저 사거나 더 싸게 올릴 수 있음",
+                "다시 올릴 때 설정 수수료와 판매세 반영 · 판매를 보장하지 않음"]
+
+
+def volume_risk(units, guide):
+    """Reselling risk of holding `units`, judged by the market's slowest recent daily pace."""
+    if guide["per_day"] is None:
+        return "unknown"
+    if units > guide["danger_above"]:
+        return "danger"
+    return "caution" if units > guide["caution_above"] else "ok"
 
 
 def describe_depth(levels, side, cfg):
@@ -573,20 +585,46 @@ class Store:
             'cross_day_buckets':crossing_buckets, 'cross_day_amount':crossing_amount,
             'note':f'최근 28일 · 요일은 1시간 자료 우선, 겹치지 않고 같은 프랑스 날짜 안에 드는 6시간 자료 추가. 시간대는 1시간 자료만 사용. 자정을 걸친 6시간 구간 {crossing_buckets}개({crossing_amount:,}개 판매)는 요일별 배분 불가로 제외. 관측 없음은 판매량 0이 아님. 서머타임은 실제 경과 시간 기준.'}
 
-    def candidates(self, books):
+    def summary(self, cache, item, city, days):
+        # One state() call reuses each window summary across every consumer.
+        key = (item, city, days)
+        if key not in cache:
+            cache[key] = self.history_summary(item, city, days)
+        return cache[key]
+
+    def volume_guide(self, cache, item, city):
+        """Units this market sold per day over the last 24 h, 7 d and 28 d. The slowest pace
+        is the basis: buying more than one day of it to resell here is a caution, more than
+        three days a risk, because unsold stock waits while other sellers undercut."""
+        key = ("guide", item, city)
+        if key not in cache:
+            windows = []
+            for days in (1, 7, 28):
+                h = self.summary(cache, item, city, days)
+                # A rate from a few observed hours is noise; never extrapolate below these.
+                enough = h["amount"] is not None and h["covered_hours"] >= (6 if days == 1 else 24)
+                windows.append({"days": days, "amount": h["amount"], "covered_hours": h["covered_hours"], "coverage": h["coverage"],
+                                "per_day": h["amount"] / h["covered_hours"] * 24 if enough else None})
+            per_day = min((w["per_day"] for w in windows if w["per_day"] is not None), default=None)
+            cache[key] = {"windows": windows, "per_day": per_day,
+                          "caution_above": math.floor(per_day) if per_day is not None else None,
+                          "danger_above": math.floor(per_day * 3) if per_day is not None else None}
+        return cache[key]
+
+    def candidates(self, books, cache=None):
         """Every viable scenario, item order first. state() trims per item for display."""
         cfg = self.cfg
         out = []
-        histories = {}
+        cache = {} if cache is None else cache
         for item in cfg["items"]:
             rows = []
             for source in CITIES:
                 for dest in CITIES:
-                    rows.extend(self.route_scenarios(item, source, dest, books[item], histories))
+                    rows.extend(self.route_scenarios(item, source, dest, books[item], cache))
             out.extend(sorted(rows, key=lambda r: (r["mode"] == "depth", -r["roi"])))
         return out
 
-    def route_scenarios(self, item, source, dest, books, histories):
+    def route_scenarios(self, item, source, dest, books, cache):
         cfg = self.cfg
         src, dst = books[source], books[dest]
         transport = cfg["transport_per_unit"] if source != dest else 0
@@ -623,10 +661,7 @@ class Store:
             roi = net / cost if cost else 0
             if net <= 0 or roi < cfg["minimum_margin"]:
                 continue
-            # The 7-day destination summary is the same for every source city; build it once.
-            if (item, dest) not in histories:
-                histories[item, dest] = self.history_summary(item, dest, 7)
-            h = histories[item, dest]
+            h = self.summary(cache, item, dest, 7)
             instant_buy, instant_sell = mode in ("instant", "instant_list"), mode == "instant"
             buy_ref = entry_book["fresh_levels"][0] if instant_buy else src["buy"]["analysis_depth"]["reference"]
             sell_ref = exit_book["fresh_levels"][0] if instant_sell else dst["sell"]["analysis_depth"]["reference"]
@@ -732,14 +767,71 @@ class Store:
                           "fresh_items": len(self.cfg["items"]) - len(missing), "newest_seen": max(seen, default=None)})
         return board
 
+    def buyouts(self, books, cache):
+        """Buying the cheapest sell orders lifts the floor to the next observed price. For each
+        fresh sell list: silver and units per step, and what relisting the bought units one
+        silver under the new floor would return. Targets are always prices actually seen."""
+        cfg = self.cfg
+        keep = 1 - cfg["sales_tax"] - cfg["setup_fee"]
+        out = []
+        for item in cfg["items"]:
+            for city in CITIES:
+                book = books[item][city]["sell"]
+                levels = book["fresh_levels"]
+                if not book["fresh"] or len(levels) < 2:
+                    continue
+                steps, units, cost = [], 0, 0
+                for bought, level in zip(levels, levels[1:BUYOUT_LEVELS + 1]):
+                    units += bought["amount"]
+                    cost += bought["price"] * bought["amount"]
+                    profit = units * (level["price"] - 1) * keep - cost
+                    steps.append({"units": units, "cost": cost, "average_cost": cost / units, "floor": level["price"],
+                                  "lift": level["price"] / levels[0]["price"] - 1, "relist": level["price"] - 1,
+                                  "profit": round(profit, 2), "roi": profit / cost,
+                                  "next_amount": level["amount"], "next_wall": bool(level.get("wall"))})
+                # Dense lists never pay after fees; skip their history lookups.
+                if not any(s["profit"] > 0 and s["roi"] >= cfg["minimum_margin"] for s in steps):
+                    continue
+                guide = self.volume_guide(cache, item, city)
+                for step in steps:
+                    step["risk"] = volume_risk(step["units"], guide)
+                # The most profit among buyouts this market can absorb within three days of its slowest pace.
+                viable = [s for s in steps if s["profit"] > 0 and s["roi"] >= cfg["minimum_margin"] and s["risk"] != "danger"]
+                if not viable:
+                    continue
+                best = max(viable, key=lambda s: s["profit"])
+                h = self.summary(cache, item, city, 7)
+                reasons = []
+                if best["risk"] == "caution":
+                    reasons.append(f"하루 판매량 {guide['per_day']:,.0f}개보다 많이 삼 · 다 팔려면 약 {best['units'] / guide['per_day']:.1f}일")
+                if best["risk"] == "unknown":
+                    reasons.append("24시간·7일·28일 판매 이력 부족 · 다 팔린다는 근거 없음")
+                if h["highest_bucket_average"] is not None and best["relist"] > h["highest_bucket_average"]:
+                    reasons.append("다시 올릴 가격이 7일 최고 구간 평균가보다 높음 · 이 가격에 팔린 근거 없음")
+                if h["stale"]:
+                    reasons.append("판매 이력의 최신 구간이 오래됨 · 다시 조회 필요")
+                if book.get("mixed_freshness"):
+                    reasons.append("최신·이전 호가 혼재 · 실제로는 더 많이 사야 할 수 있음")
+                if not cfg["fees_confirmed"]:
+                    reasons.append(FEES_UNCONFIRMED)
+                out.append({"item": item, "city": city, "floor_now": levels[0]["price"], "best": best, "steps": steps[:8],
+                            "visible_units": sum(r["amount"] for r in levels), "visible_levels": len(levels),
+                            "history_average": h["weighted_average"], "history_high": h["highest_bucket_average"],
+                            "reasons": reasons, "seen": book["seen"]})
+        return sorted(out, key=lambda r: -r["best"]["profit"])
+
     def state(self, item=None, city=None):
         with self.lock:
             item = item if item in self.cfg["items"] else next(iter(self.cfg["items"]))
             city = city if city in CITIES else "1002"
             books = {i: {c: {s: self.book(i, c, s) for s in ("sell", "buy")} for c in CITIES} for i in self.cfg["items"]}
             sales = self.personal_sales(item, city)
-            every = self.candidates(books)
+            cache = {}
+            every = self.candidates(books, cache)
             board = self.city_board(books, every)
+            buyouts = self.buyouts(books, cache)
+            for card in board:
+                card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
             # Trim per item so a busy first item cannot push the others off the list.
             candidates, shown = [], defaultdict(int)
             for candidate in every:
@@ -751,14 +843,18 @@ class Store:
                 candidate["personal_sale_evidence"] = evidence
                 if evidence:
                     candidate["reasons"].append(f"내 판매 메일 누적 최고 {evidence['highest_price']:,} / {evidence['highest_price_amount']:,}개 · 체결 시각 미확인, 현재 체결 보장 아님")
+            # Buying-quantity guides for every market a displayed number depends on.
+            routes = [*candidates, *(r for card in board for r in (*card["routes"], *(x["alternative"] for x in card["routes"] if "alternative" in x)))]
+            guides = {f"{i}/{c}": self.volume_guide(cache, i, c) for i, c in
+                      {(item, city), *((r["item"], r["sell_city"]) for r in routes), *((b["item"], b["city"]) for b in buyouts)}}
             last = self.db.execute("SELECT received,topic FROM packets ORDER BY id DESC LIMIT 1").fetchone()
             count = self.db.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
             return {"build": BUILD, "personal_sales": sales, "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "server": "Europe (게임도 유럽 서버인지 확인)",
                 "timezone": self.cfg["timezone"], "items": self.cfg["items"], "cities": CITIES,
                 "selected_item": item, "selected_city": city, "books": books,
-                "history": [self.history_summary(item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
+                "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
-                "candidate_notes": COMMON_NOTES, "packets": count, "last_packet": dict(last) if last else None,
+                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *DEPTH_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}

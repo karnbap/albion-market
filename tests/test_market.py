@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from market import Store, handler_class, parse_time, describe_depth, DEPTH_DEFAULTS, capture_status, CANDIDATES_PER_ITEM
+from market import Store, handler_class, parse_time, describe_depth, DEPTH_DEFAULTS, capture_status, CANDIDATES_PER_ITEM, volume_risk
 
 ROOT = Path(__file__).resolve().parents[1]
 UTC = timezone.utc
@@ -359,6 +359,54 @@ class MarketTests(unittest.TestCase):
         board = {c['city']: c for c in self.store.state()['city_board']}
         self.assertEqual((board['1002']['routes'], board['1002']['buy_here']), ([], []))
         self.assertEqual(board['1002']['missing'][0], {'item': 'T7_RELIC', 'reason': '지난 자료'})
+
+    def six_hour_history(self, *amounts, avg=120, city='1002'):
+        for k, amount in enumerate(amounts):
+            payload = self.history(hours=6, end=self.now - timedelta(hours=6*k), amount=amount, avg=avg)
+            payload['LocationId'] = city
+            self.store.ingest('markethistories.ingest', payload)
+
+    def test_volume_guide_uses_slowest_recent_daily_pace(self):
+        self.six_hour_history(30, 30, 30, 30)
+        guide = self.store.volume_guide({}, 'T7_RELIC', '1002')
+        self.assertEqual([w['per_day'] for w in guide['windows']], [None, 120, 120])
+        for h in range(6):
+            self.save_history(end=self.now - timedelta(hours=h), amount=2)
+        guide = self.store.volume_guide({}, 'T7_RELIC', '1002')
+        self.assertEqual(guide['windows'][0]['per_day'], 48)
+        self.assertEqual((guide['per_day'], guide['caution_above'], guide['danger_above']), (48, 48, 144))
+        self.assertEqual([volume_risk(n, guide) for n in (48, 49, 145)], ['ok', 'caution', 'danger'])
+        self.assertEqual(volume_risk(1, self.store.volume_guide({}, 'T8_RUNE', '1002')), 'unknown')
+
+    def test_buyout_lifts_floor_to_next_seen_price_and_relists_under_it(self):
+        self.market('1002', 10, asks=[100, 101, 150, 160])
+        self.six_hour_history(25, 25, 25, 25)
+        state = self.store.state()
+        row = state['buyouts'][0]
+        best = row['best']
+        self.assertEqual((row['item'], row['city'], row['floor_now']), ('T7_RELIC', '1002', 100))
+        self.assertEqual((best['units'], best['cost'], best['floor'], best['relist'], best['risk']), (60, 7020, 160, 159, 'ok'))
+        self.assertAlmostEqual(best['profit'], round(60 * 159 * (1 - .08 - .025) - 7020, 2))
+        self.assertAlmostEqual(best['lift'], .6)
+        self.assertEqual([s['units'] for s in row['steps']], [20, 40, 60])
+        self.assertTrue(any('7일 최고 구간 평균가보다 높음' in r for r in row['reasons']))
+        self.assertIn('T7_RELIC/1002', state['volume_guides'])
+        self.assertEqual(next(c for c in state['city_board'] if c['city'] == '1002')['buyout']['best']['units'], 60)
+
+    def test_buyout_never_exceeds_three_days_of_slowest_sales(self):
+        self.market('1002', 10, asks=[100, 130, 131, 200])
+        self.six_hour_history(3, 3, 2, 2)
+        best = self.store.state()['buyouts'][0]['best']
+        self.assertEqual((best['units'], best['risk']), (20, 'caution'))
+        self.assertTrue(any('다 팔려면 약 2.0일' in r for r in self.store.state()['buyouts'][0]['reasons']))
+
+    def test_buyout_without_history_is_flagged_and_stale_list_ignored(self):
+        self.market('1002', 10, asks=[100, 150])
+        row = self.store.state()['buyouts'][0]
+        self.assertEqual(row['best']['risk'], 'unknown')
+        self.assertIn('24시간·7일·28일 판매 이력 부족 · 다 팔린다는 근거 없음', row['reasons'])
+        self.now += timedelta(minutes=16)
+        self.assertEqual(self.store.state()['buyouts'], [])
 
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
