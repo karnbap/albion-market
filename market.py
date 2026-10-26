@@ -690,7 +690,7 @@ class Store:
 
     def claim_my_order_list(self):
         """True when this market upload answers the in-game "my orders" list: the client logged
-        a GetMyOpenOffers/Requests request after the last normal market request. The client
+        a GetMyOpenAuctions (94) request after the last normal market request. The client
         uploads that answer like any market page, so without the log it cannot be told apart.
         The fork never does: it sends the list on marketorders.mine (ingest_my_orders)."""
         self.read_client_log()
