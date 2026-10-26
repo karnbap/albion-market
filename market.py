@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -31,7 +32,9 @@ PORTALS = {"1301": "1002", "2301": "2004", "3301": "3008", "4301": "4002", "301"
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quantity_min": 500,
                   "wall_multiple": 3.0, "depth_price_band": 0.20}
-BUILD = "20261026.1"
+# Silver one recommended trade may spend; keeps the top picks within a player's means.
+SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000}
+BUILD = "20261026.2"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -40,6 +43,12 @@ COMMON_NOTES = ["주문 목록 일부 · 전체 깊이 미확인", "내 재고·
                 "바로 매입·판매 가격은 조회 뒤 다른 사람이 먼저 거래하면 바뀜", "주문 매입·판매는 체결 대기"]
 FEES_UNCONFIRMED, TRANSPORT_UNCONFIRMED = "수수료 설정 미확인", "운송비 설정 미확인"
 CANDIDATES_PER_ITEM = 15
+# How much of an expected profit a plan keeps when ranked: an instant round trip settles now,
+# every waiting order can be undercut or never fill.
+CERTAINTY = {"instant": (1.0, "바로 체결 · 확실성 높음"), "instant_list": (0.7, "매도 주문 대기 · 확실성 보통"),
+             "buyout": (0.5, "되팔기 대기 · 확실성 보통"), "best": (0.4, "매수·매도 주문 모두 대기 · 확실성 낮음")}
+# Routes into these cities cross hostile zones; the cargo can be lost on the way.
+DANGEROUS_ROUTES = {"3005": "Caerleon 이동은 레드존 통과 · 운반 중 약탈 위험", "5003": "Brecilien은 안개 지역 경유 · 운반 중 약탈 위험"}
 BUYOUT_LEVELS = 30
 BUYOUT_NOTES = ["본 매도 목록 범위 안에서만 계산", "조회 뒤 다른 사람이 먼저 사거나 더 싸게 올릴 수 있음",
                 "다시 올릴 때 설정 수수료와 판매세 반영 · 판매를 보장하지 않음"]
@@ -150,6 +159,24 @@ def capture_status(root):
         kernel.CloseHandle(handle)
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def client_mail_log(root):
+    """Mail-related lines from the capture client's own log (vendor/albiondata-client.log).
+    It says whether the mailbox list was cached and whether uploads were refused."""
+    for path in (Path(root)/"vendor/albiondata-client.log", Path(root)/"data/capture-stdout.log"):
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 262_144))
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        lines = [ANSI.sub("", line).strip() for line in text.splitlines()]
+        return {"file": path.name, "lines": [l[:240] for l in lines if re.search(r"mail|bad response|notification", l, re.I)][-8:]}
+    return {"file": None, "lines": []}
+
+
 def watch_status(root):
     """Game watcher heartbeat (rewritten every 3 s). Missing or old means it is not running,
     so nothing will start capture when the game launches."""
@@ -166,7 +193,7 @@ class Store:
     def __init__(self, directory=ROOT, clock=None):
         self.root = Path(directory)
         self.cfg = json.loads((self.root / "config.json").read_text(encoding="utf-8-sig"))
-        for key, value in DEPTH_DEFAULTS.items():
+        for key, value in SETTING_DEFAULTS.items():
             self.cfg.setdefault(key, value)
         ZoneInfo(self.cfg["timezone"])
         self.clock = clock or (lambda: datetime.now(UTC))
@@ -196,6 +223,9 @@ class Store:
         CREATE INDEX IF NOT EXISTS session_lookup ON sessions(item,city,side,id);
         CREATE INDEX IF NOT EXISTS history_lookup ON history(item,city,stamp);
         CREATE INDEX IF NOT EXISTS packet_topic_received ON packets(topic,received);
+        CREATE TABLE IF NOT EXISTS mail_events(id INTEGER PRIMARY KEY, received TEXT NOT NULL, kind TEXT,
+          item TEXT, location TEXT, outcome TEXT NOT NULL, detail TEXT);
+        CREATE TABLE IF NOT EXISTS private_topics(topic TEXT PRIMARY KEY, count INTEGER NOT NULL, last TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS observed_pages(session INTEGER NOT NULL REFERENCES sessions(id),
           ids TEXT NOT NULL, seen TEXT NOT NULL, PRIMARY KEY(session,ids));
         """)
@@ -207,7 +237,7 @@ class Store:
     def save_config(self, values):
         with self.lock:
             cfg = dict(self.cfg)
-            for k in ("timezone", "sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *DEPTH_DEFAULTS):
+            for k in ("timezone", "sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS):
                 if k in values:
                     cfg[k] = values[k]
             ZoneInfo(cfg["timezone"])
@@ -228,6 +258,10 @@ class Store:
                 if not math.isfinite(value) or not value.is_integer() or value < 1 or value > 10**9:
                     raise ValueError(key + " must be a positive integer")
                 cfg[key] = int(value)
+            budget = float(cfg["trade_budget"])
+            if not math.isfinite(budget) or not budget.is_integer() or not 1 <= budget <= 10**12:
+                raise ValueError("trade_budget must be a positive integer")
+            cfg["trade_budget"] = int(budget)
             for key in ("wall_multiple", "depth_price_band"):
                 cfg[key] = float(cfg[key])
             if cfg["large_quantity_min"] <= cfg["small_quantity_max"] or cfg["wall_quantity_min"] < cfg["large_quantity_min"]:
@@ -353,7 +387,43 @@ class Store:
                 self.db.execute("INSERT INTO packets(received,topic,sha256,payload) VALUES(?,?,?,?)", (received, topic, hashlib.sha256(encoded.encode()).hexdigest(), encoded))
         return {"accepted": count, "received_at": received}
 
+    def note_private(self, topic):
+        """Counts every private upload so the page can tell whether the capture
+        client's private (-p) channel reaches this receiver at all."""
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO private_topics VALUES(?,1,?) ON CONFLICT(topic) DO UPDATE SET count=count+1,last=excluded.last",
+                            (str(topic)[:64], self.clock().isoformat()))
+
     def ingest_sale(self, payload):
+        # Every mail the client sends is logged with its outcome, so a mail that was
+        # opened in game but never stored can be traced to the step that dropped it.
+        row = payload.get("Notification") if isinstance(payload, dict) else None
+        row = row if isinstance(row, dict) else {}
+        kind = payload.get("NotificationType") if isinstance(payload, dict) else None
+        try:
+            result = self.store_sale(payload)
+        except ValueError as exc:
+            self.note_mail(kind, row, "rejected", str(exc))
+            raise
+        outcome = "saved" if result.get("accepted") else "conflict" if result.get("conflict") else "duplicate" if result.get("duplicate") else "ignored"
+        self.note_mail(kind, row, outcome, result.get("reason"))
+        return result
+
+    def note_mail(self, kind, row, outcome, detail):
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO mail_events(received,kind,item,location,outcome,detail) VALUES(?,?,?,?,?,?)",
+                            (self.clock().isoformat(), str(kind)[:64] if kind is not None else None, str(row.get("ItemTypeId", ""))[:64],
+                             str(row.get("LocationId", ""))[:64], outcome, (detail or "")[:200]))
+            self.db.execute("DELETE FROM mail_events WHERE id <= (SELECT MAX(id) FROM mail_events) - 200")
+
+    def mail_diagnostics(self):
+        with self.lock:
+            events = [dict(r) for r in self.db.execute("SELECT received,kind,item,location,outcome,detail FROM mail_events ORDER BY id DESC LIMIT 12")]
+            counts = dict(self.db.execute("SELECT outcome,COUNT(*) FROM mail_events GROUP BY outcome").fetchall())
+            topics = [dict(r) for r in self.db.execute("SELECT topic,count,last FROM private_topics ORDER BY last DESC")]
+        return {"events": events, "counts": counts, "private_topics": topics, "client_log": client_mail_log(self.root)}
+
+    def store_sale(self, payload):
         """A completed sell-mail summary, not an execution timestamp or market volume.
         This topic already expresses UnitPriceSilver in silver, unlike live orders.
         Never use the client's hard-coded TotalAfterTaxes (3%) as actual proceeds.
@@ -361,13 +431,15 @@ class Store:
         if not isinstance(payload, dict):
             raise ValueError("JSON object required")
         if payload.get("NotificationType") != "SalesNotification":
-            return {"accepted": 0, "ignored": True, "reason": "completed sell mail only"}
+            return {"accepted": 0, "ignored": True, "reason": "판매 완료 메일이 아님 (" + str(payload.get("NotificationType")) + ")"}
         row = payload.get("Notification")
         if not isinstance(row, dict):
             raise ValueError("Notification object required")
         item, city = row.get("ItemTypeId"), location(row.get("LocationId", ""))
-        if item not in self.cfg["items"] or city not in CITIES:
-            return {"accepted": 0, "ignored": True, "reason": "untracked item or city"}
+        if item not in self.cfg["items"]:
+            return {"accepted": 0, "ignored": True, "reason": "추적하지 않는 품목 " + str(item)}
+        if city not in CITIES:
+            return {"accepted": 0, "ignored": True, "reason": "알 수 없는 도시 코드 " + str(row.get("LocationId"))}
         def positive_integer(key):
             value = row.get(key)
             if isinstance(value, bool) or not isinstance(value, (int, str)):
@@ -404,7 +476,7 @@ class Store:
             for key, group in markets.items():
                 group["highest_price_amount"] = sum(r["amount"] for r in rows if r["item"]+"/"+r["city"]==key and r["price"]==group["highest_price"])
             selected = [r for r in rows if r["item"]==item and r["city"]==city]
-            return {"by_market":markets,"selected":selected[:100],"selected_count":len(selected),"mail_count":len(rows),
+            return {"by_market":markets,"selected":selected[:100],"selected_count":len(selected),"mail_count":len(rows),"recent":rows[:30],
                 "conflicts":self.db.execute("SELECT COUNT(*) FROM personal_sales WHERE conflict=1").fetchone()[0],
                 "unknown_identity":sum(not r["identity_known"] for r in rows),
                 "note":"판매 완료 메일의 누적 기록 · 시각은 처음 읽은 때이며 체결 시각은 미확인. 시장 거래량·요일·시간대 집계에 더하지 않음. 같은 메일은 중복 집계하지 않음."}
@@ -785,7 +857,7 @@ class Store:
                     units += bought["amount"]
                     cost += bought["price"] * bought["amount"]
                     profit = units * (level["price"] - 1) * keep - cost
-                    steps.append({"units": units, "cost": cost, "average_cost": cost / units, "floor": level["price"],
+                    steps.append({"units": units, "cost": cost, "average_cost": cost / units, "floor": level["price"], "top_price": bought["price"],
                                   "lift": level["price"] / levels[0]["price"] - 1, "relist": level["price"] - 1,
                                   "profit": round(profit, 2), "roi": profit / cost,
                                   "next_amount": level["amount"], "next_wall": bool(level.get("wall"))})
@@ -796,7 +868,8 @@ class Store:
                 for step in steps:
                     step["risk"] = volume_risk(step["units"], guide)
                 # The most profit among buyouts this market can absorb within three days of its slowest pace.
-                viable = [s for s in steps if s["profit"] > 0 and s["roi"] >= cfg["minimum_margin"] and s["risk"] != "danger"]
+                viable = [s for s in steps if s["profit"] > 0 and s["roi"] >= cfg["minimum_margin"] and s["risk"] != "danger"
+                          and s["cost"] <= cfg["trade_budget"]]
                 if not viable:
                     continue
                 best = max(viable, key=lambda s: s["profit"])
@@ -820,6 +893,102 @@ class Store:
                             "reasons": reasons, "seen": book["seen"]})
         return sorted(out, key=lambda r: -r["best"]["profit"])
 
+    def plan_route(self, c, books, cache):
+        """Turn one candidate into a concrete order: how many units, at which prices,
+        for how much silver. Instant trades walk both order books level by level;
+        listing and order trades are capped by one day of the slowest recent sales."""
+        cfg = self.cfg
+        item, source, dest, mode = c["item"], c["buy_city"], c["sell_city"], c["mode"]
+        transport = cfg["transport_per_unit"] if source != dest else 0
+        asks = [[l["price"], l["amount"]] for l in books[item][source]["sell"]["fresh_levels"]]
+        sell_guide = self.volume_guide(cache, item, dest)
+        units = cost = revenue = 0
+        buy_high = sell_low = None
+        budget = cfg["trade_budget"]
+        if mode == "instant":
+            bids = [[l["price"], l["amount"]] for l in books[item][dest]["buy"]["fresh_levels"]]
+            i = j = 0
+            while i < len(asks) and j < len(bids):
+                (ask, left_ask), (bid, left_bid) = asks[i], bids[j]
+                net = bid * (1 - cfg["sales_tax"]) - ask - transport
+                if net <= 0 or net / ask < cfg["minimum_margin"]:
+                    break
+                q = min(left_ask, left_bid, int((budget - cost) // ask))
+                if q <= 0:
+                    break
+                units, cost, revenue = units + q, cost + ask * q, revenue + bid * (1 - cfg["sales_tax"]) * q
+                buy_high, sell_low = ask, bid
+                asks[i][1] -= q; bids[j][1] -= q
+                i += asks[i][1] == 0; j += bids[j][1] == 0
+        elif mode == "instant_list":
+            if not sell_guide["caution_above"]:
+                return None
+            price = c["sell_price"]
+            for ask, amount in asks:
+                net = price * (1 - cfg["sales_tax"] - cfg["setup_fee"]) - ask - transport
+                if net <= 0 or net / ask < cfg["minimum_margin"] or units >= sell_guide["caution_above"]:
+                    break
+                q = min(amount, sell_guide["caution_above"] - units, int((budget - cost) // ask))
+                if q <= 0:
+                    break
+                units, cost, revenue = units + q, cost + ask * q, revenue + price * (1 - cfg["sales_tax"] - cfg["setup_fee"]) * q
+                buy_high, sell_low = ask, price
+        elif mode == "best":
+            buy_guide = self.volume_guide(cache, item, source)
+            # A buy order competes with every other bid for the source's sellers; count on a quarter day.
+            units = min((buy_guide["caution_above"] or 0) // 4, (sell_guide["caution_above"] or 0) // 4,
+                        int(budget // (c["buy_price"] * (1 + cfg["setup_fee"]))))
+            cost = c["buy_price"] * (1 + cfg["setup_fee"]) * units
+            revenue = cost + c["net_per_unit"] * units + transport * units
+            buy_high, sell_low = c["buy_price"], c["sell_price"]
+        else:
+            return None
+        if units <= 0:
+            return None
+        profit = revenue - cost - transport * units
+        weight, certainty = CERTAINTY[mode]
+        warnings = [r for r in c["reasons"] if r not in (FEES_UNCONFIRMED, TRANSPORT_UNCONFIRMED)]
+        if any("최고 구간 평균가보다 높음" in r for r in warnings):
+            weight *= 0.5
+        for city in {source, dest} & DANGEROUS_ROUTES.keys():
+            if source != dest:
+                warnings.append(DANGEROUS_ROUTES[city])
+                weight *= 0.8
+        return {"kind": mode, "item": item, "buy_city": source, "sell_city": dest, "units": units, "cost": round(cost),
+                "profit": round(profit), "roi": profit / cost, "buy_low": c["buy_price"], "buy_high": buy_high,
+                "sell_high": c["sell_price"], "sell_low": sell_low, "certainty": certainty, "score": profit * weight,
+                "sell_per_day": sell_guide["per_day"], "warnings": warnings}
+
+    def recommendations(self, books, candidates, buyouts, cache):
+        """The three best things to do now, each with quantities and prices. Two picks never
+        buy from the same sell list or sell the same item in the same city: they would
+        empty each other's supply or compete for the same buyers."""
+        plans = [plan for c in candidates if c["mode"] != "depth" for plan in [self.plan_route(c, books, cache)] if plan]
+        for b in buyouts:
+            best = b["best"]
+            # Relisting needs buyers; without any sales history this is a guess, not a pick.
+            if best["risk"] == "unknown":
+                continue
+            weight, certainty = CERTAINTY["buyout"]
+            if any("최고 구간 평균가보다 높음" in r for r in b["reasons"]):
+                weight *= 0.5
+            plans.append({"kind": "buyout", "item": b["item"], "buy_city": b["city"], "sell_city": b["city"], "units": best["units"],
+                          "cost": round(best["cost"]), "profit": round(best["profit"]), "roi": best["roi"], "buy_low": b["floor_now"],
+                          "buy_high": best["top_price"], "sell_high": best["relist"], "sell_low": best["relist"], "certainty": certainty,
+                          "score": best["profit"] * weight, "sell_per_day": self.volume_guide(cache, b["item"], b["city"])["per_day"],
+                          "floor_after": best["floor"], "warnings": [r for r in b["reasons"] if r != FEES_UNCONFIRMED]})
+        picks, buying, selling = [], set(), set()
+        for plan in sorted(plans, key=lambda p: -p["score"]):
+            source, dest = (plan["item"], plan["buy_city"]), (plan["item"], plan["sell_city"])
+            if source in buying or dest in selling:
+                continue
+            buying.add(source)
+            selling.add(dest)
+            picks.append(plan)
+            if len(picks) == 3:
+                break
+        return picks
+
     def state(self, item=None, city=None):
         with self.lock:
             item = item if item in self.cfg["items"] else next(iter(self.cfg["items"]))
@@ -832,6 +1001,7 @@ class Store:
             buyouts = self.buyouts(books, cache)
             for card in board:
                 card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
+            now = self.recommendations(books, every, buyouts, cache)
             # Trim per item so a busy first item cannot push the others off the list.
             candidates, shown = [], defaultdict(int)
             for candidate in every:
@@ -854,8 +1024,8 @@ class Store:
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
-                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
-                "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *DEPTH_DEFAULTS)},
+                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "mail_diagnostics": self.mail_diagnostics(), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
 
@@ -982,8 +1152,10 @@ def handler_class(store, token):
                 size = int(self.headers.get("Content-Length", 0))
                 if not 0 < size <= 4_000_000:
                     return self.respond({"error": "Invalid body size"}, 413)
-                payload = json.loads(self.rfile.read(size))
                 path = urlparse(self.path).path
+                if path.startswith("/private/europe/"):
+                    store.note_private(path.rsplit("/", 1)[-1])
+                payload = json.loads(self.rfile.read(size))
                 if path.startswith("/private/europe/"):
                     # Private uploaders also receive public orders. Ignore those here
                     # so the two destinations never double-ingest order snapshots.

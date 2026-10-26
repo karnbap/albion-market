@@ -8,7 +8,7 @@ let state,token,selectedItem=savedView.item||'',selectedCity=savedView.city||'10
 let formVersion=0,saving=false,saveQueued=false,saveTimer,scrollTimer,restorePending=true;
 let draft=storage.get('settingsDraft',null);
 const percentKeys=['sales_tax','setup_fee','minimum_margin','near_high_fraction','depth_price_band'];
-const numberKeys=['fresh_minutes','transport_per_unit','small_quantity_max','large_quantity_min','wall_quantity_min','wall_multiple'];
+const numberKeys=['trade_budget','fresh_minutes','transport_per_unit','small_quantity_max','large_quantity_min','wall_quantity_min','wall_multiple'];
 const boolKeys=['fees_confirmed','transport_confirmed'];
 const fragmentCache=new Map(),innerScroll=storage.get('tableScroll',{});
 const formatters=new Map();
@@ -21,7 +21,7 @@ const shortGuide=g=>!g||g.per_day==null?'파는 곳 판매량 미확인':`파는
 const settingsWarnings=()=>[!state.settings.fees_confirmed&&'수수료 설정 미확인',!state.settings.transport_confirmed&&'운송비 설정 미확인'].filter(Boolean);
 const empty=text=>`<div class="empty">${esc(text)}</div>`;
 function table(headers,rows,key){return `<div class="table-wrap" data-scroll-key="${esc(key)}" tabindex="0" aria-label="${esc(key)} 표 스크롤"><table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`}
-function rememberView(){storage.set('view',{item:selectedItem,city:selectedCity,period:$('period').value,bookFilter:$('book-filter').value,settingsOpen:$('settings-panel').open,scrollY:window.scrollY})}
+function rememberView(){storage.set('view',{item:selectedItem,city:selectedCity,period:$('period').value,bookFilter:$('book-filter').value,scrollY:window.scrollY})}
 function updateHtml(id,html){
  if(fragmentCache.get(id)===html)return;
  const root=$(id);
@@ -34,7 +34,7 @@ function updateHtml(id,html){
 }
 function preserveViewport(work){
  const oldY=window.scrollY;
- const anchor=[...document.querySelectorAll('main > section, main > details, .toolbar')].find(el=>{const r=el.getBoundingClientRect();return r.top<=64&&r.bottom>64});
+ const anchor=[...document.querySelectorAll('main > section:not([hidden]), .tabs, .tab-panel:not([hidden]) > section, .tab-panel:not([hidden]) > .toolbar')].find(el=>{const r=el.getBoundingClientRect();return r.top<=64&&r.bottom>64});
  const oldTop=anchor?.getBoundingClientRect().top;
  work();
  if(!restorePending){const delta=anchor?anchor.getBoundingClientRect().top-oldTop:0;window.scrollTo({top:Math.max(0,oldY+delta),left:window.scrollX,behavior:'instant'})}
@@ -46,7 +46,7 @@ async function refresh(){
   const r=await fetch(`/api/state?item=${encodeURIComponent(selectedItem)}&city=${encodeURIComponent(selectedCity)}`);if(!r.ok)throw Error(r.status);
   const next=await r.json();token=next.token;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261026.1';
+  const legacy=next.build!=='20261026.2';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -57,7 +57,7 @@ async function refresh(){
    selectedItem=state.selected_item;selectedCity=state.selected_city;$('item').value=selectedItem;$('city').value=selectedCity;
    $('period').value=['0','1','2'].includes(savedView.period)?savedView.period:'0';
    $('book-filter').value=['all','small','large','meaningful'].includes(savedView.bookFilter)?savedView.bookFilter:'all';
-   $('settings-panel').open=Boolean(savedView.settingsOpen);fillSettings();ready=true;
+   fillSettings();ready=true;
   }
   preserveViewport(()=>{
    const packetAge=state.last_packet?.received?Math.max(0,(Date.now()-Date.parse(state.last_packet.received))/60000):null;
@@ -85,10 +85,44 @@ function personalMark(item,city){const sale=state.personal_sales?.by_market?.[it
 function renderPersonal(){
  const sales=state.personal_sales;
  if(!sales){updateHtml('personal-sales',empty('거래 메일 기능을 적용하려면 분석 프로그램을 다시 실행해 주세요.'));return}
- const market=sales.by_market[selectedItem+'/'+selectedCity];
- $('personal-context').textContent=state.cities[selectedCity]+' · '+state.items[selectedItem];
+ $('personal-context').textContent=`전체 ${n(sales.mail_count)}개 메일`;
  const notices=(sales.conflicts?`<p class="warn">내용이 달라진 메일 ${n(sales.conflicts)}건은 합계에서 제외했습니다.</p>`:'')+(sales.unknown_identity?'<p class="help">캐릭터 식별 정보가 없는 메일이 있습니다. 여러 캐릭터 사용 시 중복 구분에 한계가 있습니다.</p>':'');
- updateHtml('personal-sales',market?`<div class="personal-metrics"><div><small>내 판매 메일 · 누적 최고 단가</small><b>${n(market.highest_price)}</b><span>이 단가의 수량 ${n(market.highest_price_amount)}개</span></div><div><small>확인한 판매 수량</small><b>${n(market.total_amount)}<span>개</span></b><span>중복 제외 ${n(market.mail_count)}개 메일</span></div></div>`+table(['메일 단가','판매 수량','처음 확인한 때'],sales.selected.map(r=>`<tr><td>${n(r.price)}</td><td>${n(r.amount)}개</td><td>${date(r.first_seen)}</td></tr>`),'personal-sales-detail')+`<p class="help">${n(sales.selected.length)} / ${n(sales.selected_count)}개 메일 표시 · ${esc(sales.note)}</p>`+notices:empty('이 도시·품목의 판매 완료 메일은 아직 없습니다. 수집기 연결 후 게임에서 해당 메일을 열면 여기에 쌓입니다.')+`<p class="help">${esc(sales.note)}</p>`+notices);
+ if(!sales.mail_count){updateHtml('personal-sales',empty('저장된 판매 완료 메일이 아직 없습니다. 아래 메일 수집 진단에서 원인을 확인해 주세요.')+`<p class="help">${esc(sales.note)}</p>`+notices);return}
+ const markets=Object.entries(sales.by_market).sort((a,b)=>b[1].mail_count-a[1].mail_count);
+ const summary=table(['품목 · 도시','메일','판매 수량','최고 단가 (그 단가 수량)','최근 메일'],markets.map(([key,m])=>{const [item,city]=key.split('/');return `<tr><td>${esc(state.items[item]||item)} · ${esc(state.cities[city]||city)}</td><td>${n(m.mail_count)}</td><td>${n(m.total_amount)}개</td><td>${n(m.highest_price)} (${n(m.highest_price_amount)}개)</td><td>${date(m.first_read)}</td></tr>`}),'personal-markets');
+ const recent=table(['처음 확인한 때','품목 · 도시','단가','수량'],(sales.recent||[]).map(r=>`<tr><td>${date(r.first_seen)}</td><td>${esc(state.items[r.item]||r.item)} · ${esc(state.cities[r.city]||r.city)}</td><td>${n(r.price)}</td><td>${n(r.amount)}개</td></tr>`),'personal-recent');
+ updateHtml('personal-sales',`<h3 class="sub-head">시장별 합계</h3>${summary}<h3 class="sub-head">최근 메일 ${n((sales.recent||[]).length)}개</h3>${recent}<p class="help">${esc(sales.note)}</p>`+notices);
+}
+function renderMailDiagnosis(){
+ const d=state.mail_diagnostics;
+ if(!d){updateHtml('mail-diagnosis',empty('진단 기능을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
+ const topics=Object.fromEntries(d.private_topics.map(t=>[t.topic,t])),mail=topics.marketnotifications,orders=topics['marketorders.ingest'];
+ const c=d.counts,outcome={saved:'저장',duplicate:'이미 저장한 메일',conflict:'내용 충돌',ignored:'무시',rejected:'형식 오류'};
+ let verdict;
+ if(!d.private_topics.length)verdict=['warn','수집기의 개인 자료 통로(메일 전용)로 들어온 자료가 한 번도 없습니다. 수집기가 이 프로그램이 아닌 다른 방법으로 켜졌거나 오래된 실행 설정일 수 있습니다. 게임을 끄고 10초 뒤 다시 켜서 자동 수집으로 시작해 주세요.'];
+ else if(!mail)verdict=['warn',`개인 자료 통로는 연결돼 있지만(시장 자료 ${n(orders?.count||0)}회) 판매 메일은 한 번도 오지 않았습니다. 수집기는 켜진 뒤 받은 우편함 목록으로만 메일을 읽습니다. 지역을 한 번 이동한 다음 우편함을 닫았다 다시 열고 판매 완료 메일을 열어 주세요. 아래 수집기 기록에 ‘Mail Info is not valid’가 보이면 이 경우입니다.`];
+ else if(!c.saved)verdict=['warn','판매 메일은 들어왔지만 저장된 것이 없습니다. 아래 기록의 무시 이유를 확인해 주세요.'];
+ else verdict=['ok',`판매 메일이 정상적으로 들어오고 있습니다 · 저장 ${n(c.saved)}건`];
+ const events=d.events.length?table(['받은 때','종류','품목','도시 코드','결과','이유'],d.events.map(e=>`<tr><td>${date(e.received)}</td><td>${esc(e.kind||'—')}</td><td>${esc(state.items[e.item]||e.item||'—')}</td><td>${esc(e.location||'—')}</td><td>${esc(outcome[e.outcome]||e.outcome)}</td><td>${esc(e.detail||'')}</td></tr>`),'mail-events'):'';
+ const log=d.client_log.lines.length?`<pre class="client-log">${d.client_log.lines.map(esc).join('\n')}</pre>`:`<p class="help">${d.client_log.file?'수집기 기록에 메일 관련 줄이 없습니다.':'수집기 기록 파일을 찾지 못했습니다.'}</p>`;
+ updateHtml('mail-diagnosis',`<p class="${verdict[0]==='ok'?'positive':'warn'} diagnosis">${esc(verdict[1])}</p><div class="diag-grid"><div><small>개인 통로 · 메일</small><b>${mail?n(mail.count)+'회':'없음'}</b><span>${mail?'마지막 '+date(mail.last):''}</span></div><div><small>개인 통로 · 시장 자료</small><b>${orders?n(orders.count)+'회':'없음'}</b><span>${orders?'마지막 '+date(orders.last):''}</span></div><div><small>메일 처리 결과</small><b>${Object.entries(c).map(([k,v])=>`${outcome[k]||k} ${n(v)}`).join(' · ')||'없음'}</b></div></div>${events}<h3 class="sub-head">수집기 기록 (메일 관련 최근 줄)</h3>${log}<p class="help">수집기는 판매 주문 완료 메일만 보냅니다. 구매 주문 완료·만료 메일은 보내지 않습니다.</p>`);
+}
+function renderNow(){
+ const picks=state.now;
+ if(!picks){updateHtml('now',empty('추천을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
+ const fresh=Object.values(state.books).flatMap(c=>Object.values(c)).filter(p=>p.sell.fresh||p.buy.fresh).length,total=Object.keys(state.items).length*Object.keys(state.cities).length;
+ $('now-context').textContent=`최근 ${n(state.settings.fresh_minutes)}분 안에 연 시장 ${n(fresh)}/${n(total)}곳 · 한 거래 최대 ${n(state.settings.trade_budget)} 실버`;
+ const hidden=settingsWarnings();
+ $('now-note').textContent=(hidden.length?hidden.join(' · ')+' — 설정 탭에서 게임 값과 맞춰 주세요. ':'')+'예상 이익은 본 호가와 최근 판매량으로 계산한 값이며 체결을 보장하지 않습니다.';
+ const range=(a,b)=>a===b||b==null?n(a):`${n(a)}~${n(b)}`;
+ const city=c=>esc(state.cities[c]);
+ const steps=p=>{const item=esc(state.items[p.item]),q=n(p.units)+'개';switch(p.kind){
+  case 'instant':return [`${city(p.buy_city)} 매도 요청서에서 ${item} ${q} 바로 구매 · ${range(p.buy_low,p.buy_high)}`,`${city(p.sell_city)}로 운반`,`${city(p.sell_city)} 매수 요청서에 바로 판매 · ${range(p.sell_high,p.sell_low)}`];
+  case 'instant_list':return [`${city(p.buy_city)} 매도 요청서에서 ${item} ${q} 바로 구매 · ${range(p.buy_low,p.buy_high)}`,`${city(p.sell_city)}로 운반`,`${city(p.sell_city)}에 ${n(p.sell_high)}로 매도 주문 등록 · 하루 약 ${n(p.sell_per_day)}개 팔림`];
+  case 'best':return [`${city(p.buy_city)}에 ${item} 매수 주문 ${q} · ${n(p.buy_low)}`,`체결되면 ${city(p.sell_city)}로 운반`,`${city(p.sell_city)}에 ${n(p.sell_high)}로 매도 주문`];
+  default:return [`${city(p.buy_city)} 매도 요청서의 ${item} ${q} 싹쓸이 · ${range(p.buy_low,p.buy_high)}`,`최저가가 ${n(p.floor_after)}로 오름`,`${n(p.sell_high)}로 다시 매도 주문 · 하루 약 ${n(p.sell_per_day)}개 팔림`]}};
+ const title=p=>p.kind==='buyout'?`${city(p.buy_city)} ${esc(state.items[p.item])} 매물 싹쓸이`:`${esc(state.items[p.item])} · ${city(p.buy_city)} → ${city(p.sell_city)}`;
+ updateHtml('now',picks.length?picks.map((p,i)=>`<li class="now-card ${p.kind}"><div class="now-rank">${i+1}</div><div class="now-body"><div class="now-title"><b>${title(p)}</b><span class="pill ${p.kind==='instant'?'instant-badge':''}">${esc(p.certainty)}</span></div><ol class="now-steps">${steps(p).map(x=>`<li>${x}</li>`).join('')}</ol>${p.warnings.length?`<p class="board-warn">${p.warnings.map(esc).join(' · ')}</p>`:''}</div><div class="now-money"><strong class="positive">+${n(p.profit)}</strong><small>투자 ${n(p.cost)} · ${n(p.roi*100,1)}%</small></div></li>`).join(''):`<li class="now-empty">${empty(fresh?'지금 이익이 남는 거래가 없습니다. 다른 도시 시장도 열어 보면 더 찾을 수 있습니다.':'최근 연 시장이 없습니다. 게임에서 도시 시장의 매수·매도 목록을 열면 바로 계산합니다.')}</li>`);
 }
 function renderBoard(){
  const board=state.city_board;
@@ -127,7 +161,7 @@ function renderOverview(){
  updateHtml('all-items',items.map(item=>{const b=state.books[item][selectedCity];return `<article class="panel item-summary"><h3>${esc(state.items[item])}</h3><div class="extremes-pair">${extremeSummary(item,'buy')}${extremeSummary(item,'sell')}</div><div class="item-city-table"><table><thead><tr><th>도시</th><th>최고 매수</th><th>최저 매도</th></tr></thead><tbody>${Object.entries(state.cities).map(([city,name])=>{const pair=state.books[item][city];return `<tr><th scope="row">${esc(name)}</th>${['buy','sell'].map(side=>{const q=quote(pair[side]),best=state.city_extremes?.[item]?.[side]?.observations?.some(o=>o.city===city);return `<td class="quote-cell ${side} ${best?'best-'+side:''}">${n(q?.price)}<small>${n(q?.amount)}개</small><small class="quote-status">${pair[side].single_only?'미확인':q?.stale||pair[side].stale?'지난 자료':q?'유효 관측':'미조회'}</small></td>`}).join('')}</tr>`}).join('')}</tbody></table></div><h4 class="selected-city-label">${esc(state.cities[selectedCity])} 물량 상세</h4>${['buy','sell'].map(side=>{const book=b[side],d=book.fresh?book.analysis_depth:book.depth;return `<div class="item-side ${side}"><p>${quoteText(book,side)}</p><small>${d?.reference?.large?'대량 기준':'소량 제외 기준'} ${n(d?.reference?.price)} · ${n(d?.reference?.amount)}개</small><small>앞쪽 소량 ${n(d?.leading_small_levels)}호가 · ${n(d?.leading_small_amount)}개</small><div class="wall-list">${(d?.large_levels||[]).slice(0,3).map(r=>`<span class="pill ${r.wall?'wall-badge':''}">${r.wall?'벽':'대량'} ${n(r.price)} · ${n(r.amount)}개</span>`).join('')||'대량 관측 없음'}</div></div>`}).join('')}</article>`}).join(''));
 }
 function render(){
- renderBoard();renderBuyouts();renderOverview();renderPersonal();renderVolumeGuide();
+ renderNow();renderBoard();renderBuyouts();renderOverview();renderPersonal();renderMailDiagnosis();renderVolumeGuide();
  $('detail-context').textContent=state.cities[selectedCity]+' · '+state.items[selectedItem];
  const books=state.books[selectedItem];
  updateHtml('cities',Object.entries(state.cities).map(([id,name])=>{
@@ -182,13 +216,16 @@ async function saveSettings(){
 function chooseView(){selectedItem=$('item').value;selectedCity=$('city').value;viewVersion++;rememberView();refresh()}
 $('item').onchange=chooseView;$('city').onchange=chooseView;
 $('overview').onclick=e=>{const cell=e.target.closest('[data-item][data-city]');if(cell){$('item').value=cell.dataset.item;$('city').value=cell.dataset.city;chooseView()}};
-$('city-board').onclick=e=>{const button=e.target.closest('[data-city]');if(button){$('city').value=button.dataset.city;chooseView();$('order-section').scrollIntoView({block:'start'})}};
+const tabs=[...document.querySelectorAll('.tabs [data-tab]')];
+function showTab(name){if(!tabs.some(b=>b.dataset.tab===name))name='cities';for(const b of tabs){const on=b.dataset.tab===name;b.classList.toggle('active',on);b.setAttribute('aria-selected',String(on))}for(const panel of document.querySelectorAll('.tab-panel'))panel.hidden=panel.dataset.tab!==name;storage.set('tab',name)}
+document.querySelector('.tabs').onclick=e=>{const b=e.target.closest('[data-tab]');if(b)showTab(b.dataset.tab)};
+showTab(storage.get('tab','cities'));
+$('city-board').onclick=e=>{const button=e.target.closest('[data-city]');if(button){$('city').value=button.dataset.city;chooseView();showTab('market');document.querySelector('.tabs').scrollIntoView({block:'start'})}};
 $('cities').onclick=e=>{const card=e.target.closest('[data-city]');if(card){$('city').value=card.dataset.city;chooseView()}};
 $('period').onchange=()=>{rememberView();preserveViewport(renderHigh)};
 $('book-filter').onchange=()=>{rememberView();if(state)preserveViewport(()=>{renderBook('sell',state.books[selectedItem][selectedCity].sell);renderBook('buy',state.books[selectedItem][selectedCity].buy)})};
 $('settings').addEventListener('input',queueDraft);$('settings').addEventListener('change',queueDraft);
 $('settings').onsubmit=e=>{e.preventDefault();clearTimeout(saveTimer);saveSettings()};
-$('settings-panel').addEventListener('toggle',()=>{if(ready)rememberView()});
 window.addEventListener('scroll',()=>{if(!restorePending){clearTimeout(scrollTimer);scrollTimer=setTimeout(rememberView,120)}},{passive:true});
 window.addEventListener('pagehide',()=>{if(ready){rememberView();if(draft)storage.set('settingsDraft',readDraft())}});
 $('reset').onclick=async()=>{try{await post('/api/reset',{item:selectedItem,city:selectedCity});await refresh();$('last').textContent='새 조회 시작됨 · 게임에서 양쪽 주문 목록을 다시 열어 주세요.'}catch(e){$('last').textContent='새 조회 시작 실패: '+e.message}};

@@ -408,6 +408,46 @@ class MarketTests(unittest.TestCase):
         self.now += timedelta(minutes=16)
         self.assertEqual(self.store.state()['buyouts'], [])
 
+    def test_now_walks_both_books_for_an_instant_round_trip(self):
+        self.market('1002', 10, asks=[100, 104, 150])
+        self.market('3008', 20, bids=[130, 120, 101])
+        pick = self.store.state()['now'][0]
+        self.assertEqual((pick['kind'], pick['buy_city'], pick['sell_city']), ('instant', '1002', '3008'))
+        # 20@100 and 20@104 against bids 130 then 120; the 150 ask and 101 bid do not pay.
+        self.assertEqual((pick['units'], pick['buy_low'], pick['buy_high'], pick['sell_high'], pick['sell_low']), (40, 100, 104, 130, 120))
+        self.assertEqual(pick['cost'], 4080)
+        self.assertEqual(pick['profit'], round(20 * 130 * .92 + 20 * 120 * .92 - 4080))
+
+    def test_now_stays_within_the_trade_budget(self):
+        self.store.save_config({'trade_budget': 2500})
+        self.market('1002', 10, asks=[100, 104])
+        self.market('3008', 20, bids=[130, 129])
+        pick = self.store.state()['now'][0]
+        # 20 at 100, then only 4 more at 104 fit in 2,500 silver.
+        self.assertEqual((pick['units'], pick['cost']), (24, 2416))
+        for bad in (0, 1.5, float('inf')):
+            with self.assertRaises(ValueError): self.store.save_config({'trade_budget': bad})
+
+    def test_now_caps_listing_by_one_day_of_sales_and_never_reuses_a_sell_list(self):
+        self.market('1002', 10, asks=[100, 101])
+        self.market('3008', 20, asks=[200])
+        self.six_hour_history(3, 3, 2, 2, city='3008')
+        picks = self.store.state()['now']
+        self.assertEqual([(p['kind'], p['units']) for p in picks], [('instant_list', 10)])
+
+    def test_now_never_sends_two_picks_to_the_same_buyers(self):
+        self.market('1002', 10, asks=[100])
+        self.market('2004', 20, asks=[101])
+        self.market('3008', 30, bids=[130])
+        picks = self.store.state()['now']
+        self.assertEqual([(p['buy_city'], p['sell_city']) for p in picks], [('1002', '3008')])
+
+    def test_now_warns_on_red_zone_routes(self):
+        self.market('1002', 10, asks=[100])
+        self.market('3005', 20, bids=[130])
+        pick = self.store.state()['now'][0]
+        self.assertIn('Caerleon 이동은 레드존 통과 · 운반 중 약탈 위험', pick['warnings'])
+
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
         path = self.root/'data/game-watch-state.json'
@@ -596,6 +636,10 @@ class MarketTests(unittest.TestCase):
             result.exception.close()
             with urllib.request.urlopen(url + "/api/state") as r:
                 self.assertEqual(json.load(r)["packets"], 1)
+            private = urllib.request.Request(url + "/private/europe/marketorders.ingest", data=json.dumps({"Orders": []}).encode())
+            with urllib.request.urlopen(private) as r:
+                self.assertTrue(json.load(r)["ignored"])
+            self.assertEqual(self.store.mail_diagnostics()["private_topics"][0]["topic"], "marketorders.ingest")
             with self.assertLogs(level="INFO") as logs:
                 urllib.request.urlopen(url + "/api/health").close()
                 with self.assertRaises(urllib.error.HTTPError) as result:
