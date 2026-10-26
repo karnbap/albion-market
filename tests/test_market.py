@@ -573,6 +573,37 @@ class MarketTests(unittest.TestCase):
         self.assertEqual((a['buy'], a['sell'], a['basis']), (101, 139, '호가 기록'))
         self.assertAlmostEqual(a['margin'], 139 * (1 - .08 - .025) - 101 * 1.025)
 
+    def test_own_order_links_to_scanned_order_and_tracks_fills_and_queue(self):
+        mine = self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 120, 'amount': 30})
+        self.capture(self.order(1, 100, 5), self.order(2, 120, 30), self.order(3, 120, 30))
+        self.now += timedelta(minutes=5)
+        self.capture(self.order(1, 100, 5), self.order(2, 120, 25), self.order(3, 120, 30))
+        state = self.store.state()
+        row = next(r for r in state['my_orders'] if r['id'] == mine)
+        self.assertEqual((row['order_id'], row['remaining'], row['filled'], row['ahead'], row['is_best']), ('2', 25, 5, 5, False))
+        self.store.close_my_order(mine)
+        self.assertEqual(self.store.state()['my_orders'], [])
+        for bad in ({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 0, 'amount': 1},
+                    {'item': 'T7_RELIC', 'city': '1002', 'side': 'up', 'price': 1, 'amount': 1}):
+            with self.assertRaises(ValueError): self.store.add_my_order(bad)
+
+    def test_own_open_sell_orders_cut_waiting_quantity_and_warn_on_undercutting_myself(self):
+        self.hourly_profile(lambda t: 1)
+        self.market('1002', 10, asks=[100, 101])
+        self.market('3008', 20, asks=[200], bids=[130])
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '3008', 'side': 'sell', 'price': 250, 'amount': 10})
+        pick = self.store.state()['now_groups']['wait'][0]
+        self.assertEqual((pick['kind'], pick['units']), ('instant_list', 14))
+        self.assertTrue(any('내 기존 매도 주문 10개가 250에 남아 있음' in w and '뒤로 밀림' in w for w in pick['warnings']))
+
+    def test_buyout_skips_my_own_listings(self):
+        self.market('1002', 10, asks=[100, 150])  # two orders of 10 at each price
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 100, 'amount': 10})
+        best = self.store.state()['buyouts'][0]['best']
+        self.assertEqual((best['units'], best['cost']), (10, 1000))
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 100, 'amount': 10})
+        self.assertEqual(self.store.state()['buyouts'], [])
+
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
         path = self.root/'data/game-watch-state.json'

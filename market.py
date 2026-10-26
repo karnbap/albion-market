@@ -38,7 +38,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261026.7"
+BUILD = "20261026.8"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -231,6 +231,8 @@ class Store:
         CREATE INDEX IF NOT EXISTS history_lookup ON history(item,city,stamp);
         CREATE INDEX IF NOT EXISTS packet_topic_received ON packets(topic,received);
         CREATE INDEX IF NOT EXISTS order_lookup ON orders(order_id,seen);
+        CREATE TABLE IF NOT EXISTS my_orders(id INTEGER PRIMARY KEY, item TEXT NOT NULL, city TEXT NOT NULL, side TEXT NOT NULL,
+          price REAL NOT NULL, amount INTEGER NOT NULL, created TEXT NOT NULL, order_id TEXT, closed TEXT);
         CREATE TABLE IF NOT EXISTS order_fills(item TEXT NOT NULL, city TEXT NOT NULL, side TEXT NOT NULL, order_id TEXT NOT NULL,
           price REAL NOT NULL, amount INTEGER NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_events(id INTEGER PRIMARY KEY, received TEXT NOT NULL, kind TEXT,
@@ -381,6 +383,7 @@ class Store:
                         self.db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?) ON CONFLICT(session,order_id) DO UPDATE SET price=excluded.price,amount=excluded.amount,seen=excluded.seen,expires=excluded.expires", (sid, str(r["Id"]), price, amount, received, expiry))
                     if len(group) >= 2:
                         self.record_book_stats(key, sid, received)
+                self.link_my_orders()
                 kept = {"Orders": [r[0] for r in normalized]}
                 count = len(normalized)
             else:
@@ -545,6 +548,59 @@ class Store:
                                "sales_hour": factor(p["hourly"], local.hour), "sales_weekday": factor(p["weekdays"], local.weekday()),
                                "bid_vs_usual": versus("buy"), "ask_vs_usual": versus("sell")}
         return result
+
+    def add_my_order(self, values):
+        """Register one of the player's own orders. The capture client does not say who placed an
+        order, so the player enters price and quantity; the next scan of that market links it to
+        the matching order id, after which remaining units and fills are tracked automatically."""
+        item, city, side = values.get("item"), values.get("city"), values.get("side")
+        if item not in self.cfg["items"] or city not in CITIES or side not in ("sell", "buy"):
+            raise ValueError("Unknown item / city / side")
+        price, amount = float(values.get("price")), values.get("amount")
+        if not math.isfinite(price) or price <= 0 or isinstance(amount, bool) or not isinstance(amount, int) or not 0 < amount <= 10**9:
+            raise ValueError("Price must be positive and amount a positive integer")
+        with self.lock, self.db:
+            row = self.db.execute("INSERT INTO my_orders(item,city,side,price,amount,created) VALUES(?,?,?,?,?,?)",
+                                  (item, city, side, price, amount, self.clock().isoformat())).lastrowid
+            self.link_my_orders()
+        return row
+
+    def close_my_order(self, order):
+        with self.lock, self.db:
+            if not self.db.execute("UPDATE my_orders SET closed=? WHERE id=? AND closed IS NULL", (self.clock().isoformat(), int(order))).rowcount:
+                raise ValueError("Unknown or already closed order")
+
+    def link_my_orders(self):
+        """Match unlinked own orders to observed orders of the same market, side and price: an
+        exact quantity first, else one with fewer units left (already partly sold). An order id
+        is never linked twice."""
+        linked = {r[0] for r in self.db.execute("SELECT order_id FROM my_orders WHERE order_id IS NOT NULL")}
+        for mine in self.db.execute("SELECT * FROM my_orders WHERE order_id IS NULL AND closed IS NULL ORDER BY id").fetchall():
+            found = self.db.execute("""SELECT o.order_id, o.amount FROM orders o JOIN sessions s ON o.session=s.id
+                WHERE s.item=? AND s.city=? AND s.side=? AND o.price=? AND o.amount<=? AND o.amount>0
+                ORDER BY o.amount=? DESC, o.seen DESC""", (mine["item"], mine["city"], mine["side"], mine["price"], mine["amount"], mine["amount"])).fetchall()
+            match = next((r["order_id"] for r in found if r["order_id"] not in linked), None)
+            if match:
+                self.db.execute("UPDATE my_orders SET order_id=? WHERE id=?", (match, mine["id"]))
+                linked.add(match)
+
+    def my_orders(self, books):
+        """Open own orders with what the latest scans say: units left, units filled since,
+        units ahead of them in the queue, and whether they are the best price right now."""
+        rows = []
+        for mine in self.db.execute("SELECT * FROM my_orders WHERE closed IS NULL ORDER BY item,city,side,price"):
+            r = dict(mine)
+            latest = self.db.execute("SELECT amount,seen FROM orders WHERE order_id=? ORDER BY seen DESC LIMIT 1", (r["order_id"],)).fetchone() if r["order_id"] else None
+            r["remaining"] = latest["amount"] if latest else r["amount"]
+            r["seen"] = latest["seen"] if latest else None
+            r["filled"] = self.db.execute("SELECT COALESCE(SUM(amount),0) FROM order_fills WHERE order_id=?", (r["order_id"],)).fetchone()[0] if r["order_id"] else 0
+            levels = books[r["item"]][r["city"]][r["side"]]["levels"]
+            better = (lambda price: price < r["price"]) if r["side"] == "sell" else (lambda price: price > r["price"])
+            r["ahead"] = sum(l["amount"] for l in levels if better(l["price"]))
+            r["best"] = levels[0]["price"] if levels else None
+            r["is_best"] = bool(levels) and not r["ahead"]
+            rows.append(r)
+        return rows
 
     def note_private(self, topic):
         """Counts every private upload so the page can tell whether the capture
@@ -1019,6 +1075,13 @@ class Store:
                 levels = book["fresh_levels"]
                 if not book["fresh"] or len(levels) < 2:
                     continue
+                # Never "buy out" the player's own listings.
+                own = defaultdict(int)
+                for r in cache.get("mine", {}).get((item, city, "sell"), []):
+                    own[r["price"]] += r["remaining"]
+                levels = [dict(l, amount=l["amount"] - own[l["price"]]) for l in levels if l["amount"] > own[l["price"]]]
+                if len(levels) < 2:
+                    continue
                 steps, units, cost = [], 0, 0
                 for bought, level in zip(levels, levels[1:BUYOUT_LEVELS + 1]):
                     units += bought["amount"]
@@ -1141,7 +1204,7 @@ class Store:
         elif mode == "best":
             buy_guide = self.volume_guide(cache, item, source)
             # A buy order competes with every other bid for the source's sellers; count on a quarter day.
-            units = min(self.waiting_cap(cache, item, source, buy_guide["caution_above"]) // 4,
+            units = min(self.waiting_cap(cache, item, source, buy_guide["caution_above"], "buy") // 4,
                         self.waiting_cap(cache, item, dest, sell_guide["caution_above"]) // 4,
                         int(budget // (c["buy_price"] * (1 + cfg["setup_fee"]))))
             cost = c["buy_price"] * (1 + cfg["setup_fee"]) * units
@@ -1165,13 +1228,15 @@ class Store:
                 "sell_high": c["sell_price"], "sell_low": sell_low, "certainty": certainty, "score": profit * weight,
                 "sell_per_day": sell_guide["per_day"], "warnings": warnings}
 
-    def waiting_cap(self, cache, item, city, caution):
+    def waiting_cap(self, cache, item, city, caution, side="sell"):
         """Units a waiting trade may hold in this market: one day at the slowest recent pace,
-        and no more than the hourly profile expects to sell over the next 24 hours."""
+        and no more than the hourly profile expects to sell over the next 24 hours, minus what
+        the player's own open orders on that side already wait for."""
         outlook = self.demand_outlook(cache, item, city)
         if not caution:
             return 0
-        return min(caution, int(outlook["next24"])) if outlook else caution
+        cap = min(caution, int(outlook["next24"])) if outlook else caution
+        return max(0, cap - sum(r["remaining"] for r in cache.get("mine", {}).get((item, city, side), [])))
 
     def recommendations(self, books, candidates, buyouts, cache):
         """The three best trades now in each of two styles: settle at once (buy from sell
@@ -1205,6 +1270,19 @@ class Store:
             if outlook and outlook["low_window"]:
                 plan["score"] *= max(0.6, outlook["next6"] / outlook["usual6"]) if outlook["usual6"] else 0.6
                 plan["warnings"].append(f"앞으로 6시간은 {'주말' if outlook['weekend'] else '평일'} 수요가 적은 시간대 · 예상 판매 {outlook['next6']:,.0f}개(평소 {outlook['usual6']:,.0f}개) · 주문을 한꺼번에 쌓지 마세요")
+            for side, city, price, verb in (("sell", plan["sell_city"], plan["sell_high"], "매도"), ("buy", plan["buy_city"], plan["buy_low"], "매수")):
+                if plan["kind"] in ("instant_list", "buyout") and side == "buy":
+                    continue
+                mine = cache.get("mine", {}).get((plan["item"], city, side), [])
+                if not mine:
+                    continue
+                left = sum(r["remaining"] for r in mine)
+                edge = min(r["price"] for r in mine) if side == "sell" else max(r["price"] for r in mine)
+                worse = price < edge if side == "sell" else price > edge
+                plan["warnings"].append(f"내 기존 {verb} 주문 {left:,}개가 {edge:,.0f}에 남아 있음 · 그만큼 수량을 줄였음"
+                                        + (f" · {price:,.0f}에 새로 걸면 기존 주문이 뒤로 밀림" if worse else ""))
+                if worse:
+                    plan["score"] *= 0.7
             if outlook and plan["units"] > outlook["next24"]:
                 plan["warnings"].append(f"앞으로 24시간 예상 판매 {outlook['next24']:,.0f}개보다 많이 삼 · 나눠서 올리세요")
         groups = {}
@@ -1246,6 +1324,9 @@ class Store:
             books = {i: {c: {s: self.book(i, c, s) for s in ("sell", "buy")} for c in CITIES} for i in self.cfg["items"]}
             sales = self.personal_sales(item, city)
             cache = {}
+            mine_rows = self.my_orders(books)
+            for r in mine_rows:
+                cache.setdefault("mine", {}).setdefault((r["item"], r["city"], r["side"]), []).append(r)
             every = self.candidates(books, cache)
             board = self.city_board(books, every)
             buyouts = self.buyouts(books, cache)
@@ -1279,7 +1360,7 @@ class Store:
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(),
-                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
@@ -1423,6 +1504,12 @@ def handler_class(store, token):
                     if path == "/api/settings":
                         store.save_config(payload)
                         result = {"saved": True}
+                    elif path == "/api/my-orders":
+                        if payload.get("action") == "close":
+                            store.close_my_order(payload["id"])
+                            result = {"closed": True}
+                        else:
+                            result = {"added": store.add_my_order(payload)}
                     elif path == "/api/reset":
                         store.reset_book(payload["item"], payload["city"])
                         result = {"reset": True}
