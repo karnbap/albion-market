@@ -33,10 +33,11 @@ WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quantity_min": 500,
                   "wall_multiple": 3.0, "depth_price_band": 0.20}
 # Silver one recommended trade may spend; keeps the top picks within a player's means.
-# Caerleon is left out of trading by default: every route there crosses full-loot red zones,
-# and its price gaps are mostly that risk priced in, which would always top the rankings.
-SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005"]}
-BUILD = "20261026.3"
+# Caerleon and Brecilien are left out of trading by default: reaching them means crossing
+# full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
+# which would always top the rankings.
+SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
+BUILD = "20261026.4"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
