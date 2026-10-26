@@ -615,7 +615,7 @@ class MarketTests(unittest.TestCase):
 
     def test_my_orders_list_from_client_log_registers_updates_and_closes_own_orders(self):
         self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 120, 'amount': 30})
-        self.client_log((2, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        self.client_log((2, 'OperationRequest: [94]opAuctionGetMyOpenAuctions - 0:6 9:2 253:94'))
         result = self.capture(self.order(7, 120, 25), self.order(8, 300, 4))
         self.assertEqual(result['accepted'], 2)
         rows = {r['order_id']: r for r in self.store.state()['my_orders']}
@@ -631,15 +631,58 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(next(r for r in self.store.state()['my_orders'] if r['order_id'] == '7')['remaining'], 20)
         # Order 8 sold out: missing from the next "my orders" list of that city and side.
         self.now += timedelta(minutes=1)
-        self.client_log((1, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        self.client_log((1, 'OperationRequest: [94]opAuctionGetMyOpenAuctions - 0:6 9:2 253:94'))
         self.capture(self.order(7, 120, 20))
         self.assertEqual([r['order_id'] for r in self.store.state()['my_orders']], ['7'])
         debug = self.store.state()['client_debug']
         self.assertTrue(debug['enabled'])
-        self.assertEqual(debug['lines'][0]['op'], 92)
+        self.assertEqual(debug['lines'][0]['op'], 94)
+
+    def test_fork_my_orders_upload_registers_updates_and_closes_own_orders(self):
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 120, 'amount': 30})
+        stray = self.order(9, 50, 3, 'request')  # a buy order can never be in the sell list
+        result = self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(7, 120, 25), self.order(8, 300, 4), stray]})
+        self.assertEqual(result['accepted'], 2)
+        rows = {r['order_id']: r for r in self.store.state()['my_orders']}
+        self.assertEqual(set(rows), {'7', '8'})
+        self.assertEqual((rows['7']['source'], rows['7']['remaining'], rows['7']['filled']), ('manual', 25, 5))
+        self.assertEqual(rows['8']['source'], 'auto')
+        # Own orders are not a market page.
+        self.assertEqual(self.store.book('T7_RELIC', '1002', 'sell')['levels'], [])
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM packets WHERE topic='marketorders.ingest'").fetchone()[0], 0)
+        self.now += timedelta(minutes=1)
+        self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(7, 120, 20)]})
+        self.assertEqual([(r['order_id'], r['remaining']) for r in self.store.state()['my_orders']], [('7', 20)])
+        with self.assertRaises(ValueError):
+            self.store.ingest_my_orders({'Kind': 'mine', 'Orders': []})
+
+    def test_empty_fork_list_closes_that_market_and_side_only(self):
+        buy = self.order(20, 90, 5, 'request')
+        self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '1002', 'Orders': [buy]})
+        self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(21, 130, 2)]})
+        elsewhere = dict(self.order(22, 95, 1, 'request'), LocationId='3008')
+        self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '3008', 'Orders': [elsewhere]})
+        self.now += timedelta(minutes=1)
+        # Every buy order in Lymhurst filled: the game sends an empty buy list there.
+        self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '1002', 'Orders': []})
+        self.assertEqual(sorted(r['order_id'] for r in self.store.state()['my_orders']), ['21', '22'])
+
+    def test_full_fork_page_never_closes_orders_it_may_not_show(self):
+        self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(1, 500, 1)]})
+        page = [dict(self.order(100 + i, 130, 1), ItemTypeId='T4_BAG') for i in range(50)]
+        self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': page})
+        self.assertEqual([r['order_id'] for r in self.store.state()['my_orders']], ['1'])
+
+    def test_fork_log_never_turns_a_market_page_into_own_orders(self):
+        self.client_log((5, 'Starting Albion Data Client, version: 0.1.61-local.1'),
+                        (2, 'OperationRequest: [94]opAuctionGetMyOpenAuctions - 0:6 9:2 253:94'))
+        self.capture(self.order(1, 100, 5), self.order(2, 120, 3))
+        self.assertEqual(self.store.state()['my_orders'], [])
+        self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
+        self.assertTrue(self.store.state()['client_debug']['fork'])
 
     def test_stale_my_orders_request_does_not_claim_market_pages(self):
-        self.client_log((300, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        self.client_log((300, 'OperationRequest: [94]opAuctionGetMyOpenAuctions - 0:6 9:2 253:94'))
         self.capture(self.order(1, 100, 5), self.order(2, 120, 3))
         self.assertEqual(self.store.state()['my_orders'], [])
         self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
@@ -841,6 +884,14 @@ class MarketTests(unittest.TestCase):
             with urllib.request.urlopen(private) as r:
                 self.assertTrue(json.load(r)["ignored"])
             self.assertEqual(self.store.mail_diagnostics()["private_topics"][0]["topic"], "marketorders.ingest")
+            mine = urllib.request.Request(url + "/private/europe/marketorders.mine", data=json.dumps({"Kind": "sell", "Orders": [self.order(5, 130, 2)]}).encode())
+            with urllib.request.urlopen(mine) as r:
+                self.assertEqual(json.load(r)["accepted"], 1)
+            self.assertEqual([r["order_id"] for r in self.store.state()["my_orders"]], ["5"])
+            # The own-order topic is private only: the public path ignores it.
+            public_mine = urllib.request.Request(url + "/ingest/europe/marketorders.mine", data=json.dumps({"Kind": "sell", "Orders": [self.order(6, 130, 2)]}).encode())
+            with urllib.request.urlopen(public_mine) as r:
+                self.assertTrue(json.load(r)["ignored"])
             with self.assertLogs(level="INFO") as logs:
                 urllib.request.urlopen(url + "/api/health").close()
                 with self.assertRaises(urllib.error.HTTPError) as result:

@@ -38,7 +38,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261026.9"
+BUILD = "20261026.10"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -127,6 +127,11 @@ def location(value):
     return PORTALS.get(value, value)
 
 
+# The local fork of the capture client (README: 전용 수집기) runs instead of the official
+# one when start.ps1 finds it. It reads mails and the in-game "my orders" lists itself.
+CAPTURE_CLIENTS = ("vendor/albiondata-client-fork.exe", "vendor/albiondata-client.exe")
+
+
 def capture_status(root):
     """Check only the owned capture PID; running is not proof of new market data."""
     path = Path(root)/'data/capture.pid'
@@ -159,8 +164,8 @@ def capture_status(root):
         image = ctypes.create_unicode_buffer(32768); size = wintypes.DWORD(len(image))
         if not kernel.QueryFullProcessImageNameW(handle,0,image,ctypes.byref(size)):
             return {'running': None,'status':'수집기 경로 확인 불가'}
-        expected = os.path.normcase(str((Path(root)/'vendor/albiondata-client.exe').resolve()))
-        alive = code.value == 259 and os.path.normcase(image.value) == expected
+        expected = {os.path.normcase(str((Path(root)/p).resolve())) for p in CAPTURE_CLIENTS}
+        alive = code.value == 259 and os.path.normcase(image.value) in expected
         return {'running':alive,'status':'수집기 실행 중' if alive else '수집기 꺼짐'}
     finally:
         kernel.CloseHandle(handle)
@@ -170,14 +175,24 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # The official capture client never says which orders are the player's own, and in 0.1.61 it
 # drops opened sale mails when its mailbox list was never cached. Started with -debug and this
 # operation list (start.ps1) it writes those game messages to its own log, which the receiver
-# follows: 81/82 = market list requests, 92/93 = the in-game "my orders" sell / buy lists,
-# 174-176 = mailbox list, mail count and an opened mail.
-CAPTURE_DEBUG_OPERATIONS = "81,82,92,93,174,175,176"
+# follows: 81/82 = market list requests, 94 = the in-game "my orders" tab (asked twice, once
+# per sell / buy list), 174-176 = mailbox list, mail count and an opened mail. The live game
+# never sent 92/93 (named GetMyOpenOffers/Requests in the client) for that tab (2026-10-26).
+CAPTURE_DEBUG_OPERATIONS = "81,82,94,174,175,176"
 LOG_LINE = re.compile(r"^[A-Z]{4}\[(?P<ts>[^\]]+)\]\s*(?P<msg>.*)$")
 LOG_OPERATION = re.compile(r"Operation(?P<kind>Request|Response): \[(?P<op>\d+)\]")
-MY_ORDER_OPS = {92: "sell", 93: "buy"}
+MY_ORDER_OPS = {94}
 MARKET_LIST_OPS = {81, 82}
-RAW_LOG_OPS = {92, 93, 174, 175, 176}
+RAW_LOG_OPS = {94, 174, 175, 176}
+# One page of the "my orders" list; a full page may continue on the next one.
+MY_ORDERS_PAGE = 50
+# The fork's version carries this tag. It uploads the "my orders" lists on the private topic
+# marketorders.mine itself, so its log must never turn a market page into own orders.
+LOG_VERSION = re.compile(r"Starting Albion Data Client, version: (?P<version>\S+)")
+FORK_VERSION_TAG = "-local"
+# Mails other than a completed sale, as the fork names them. They are stored apart and never
+# enter sale statistics: a bought unit is a cost, and an expiry mail is not a completed sale.
+MAIL_KINDS = {"BuyNotification": "buy", "BuyExpiryNotification": "buy_expired", "ExpiryNotification": "sell_expired"}
 
 
 def client_mail_log(root):
@@ -238,6 +253,10 @@ class Store:
           first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, source_expires TEXT,
           identity_known INTEGER NOT NULL, conflict INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(identity,mail_id));
+        CREATE TABLE IF NOT EXISTS personal_mails(identity TEXT NOT NULL, mail_id TEXT NOT NULL, kind TEXT NOT NULL,
+          item TEXT NOT NULL, city TEXT NOT NULL, price INTEGER, amount INTEGER NOT NULL, order_amount INTEGER NOT NULL,
+          silver INTEGER NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+          identity_known INTEGER NOT NULL, conflict INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(identity,mail_id));
         CREATE INDEX IF NOT EXISTS session_lookup ON sessions(item,city,side,id);
         CREATE INDEX IF NOT EXISTS history_lookup ON history(item,city,stamp);
         CREATE INDEX IF NOT EXISTS packet_topic_received ON packets(topic,received);
@@ -258,12 +277,14 @@ class Store:
         CREATE TABLE IF NOT EXISTS observed_pages(session INTEGER NOT NULL REFERENCES sessions(id),
           ids TEXT NOT NULL, seen TEXT NOT NULL, PRIMARY KEY(session,ids));
         """)
-        columns = {r[1] for r in self.db.execute("PRAGMA table_info(my_orders)")}
-        for name, kind in (("remaining", "INTEGER"), ("checked", "TEXT"), ("source", "TEXT NOT NULL DEFAULT 'manual'")):
-            if name not in columns:
-                self.db.execute(f"ALTER TABLE my_orders ADD COLUMN {name} {kind}")
+        # mailed: when the game sent the mail (the fork reads it from the mailbox list).
+        for table, name, kind in (("my_orders", "remaining", "INTEGER"), ("my_orders", "checked", "TEXT"),
+                                  ("my_orders", "source", "TEXT NOT NULL DEFAULT 'manual'"),
+                                  ("personal_sales", "mailed", "TEXT"), ("personal_mails", "mailed", "TEXT")):
+            if name not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         self.db.commit()
-        self.log_state, self.pending_mine, self.log_debug_seen = {"ident": None, "offset": 0}, [], False
+        self.log_state, self.pending_mine, self.log_debug_seen, self.log_fork = {"ident": None, "offset": 0}, [], False, False
         last = self.db.execute("SELECT payload FROM packets WHERE topic='marketorders.ingest' ORDER BY id DESC LIMIT 1").fetchone()
         orders = json.loads(last[0]).get("Orders", []) if last else []
         self.active_market = (orders[0]["ItemTypeId"], location(orders[0]["LocationId"])) if orders else None
@@ -316,6 +337,26 @@ class Store:
             tmp.replace(target)
             self.cfg = cfg
 
+    def normalize_orders(self, rows):
+        """Tracked items, quality 1 without enchantment, known cities: (row, city, price, amount, expiry)."""
+        if not isinstance(rows, list):
+            raise ValueError("Orders array required")
+        normalized = []
+        for r in rows:
+            if not isinstance(r, dict) or r.get("ItemTypeId") not in self.cfg["items"]:
+                continue
+            if int(r.get("QualityLevel", 1)) != 1 or int(r.get("EnchantmentLevel", 0)) != 0:
+                continue
+            city = location(r.get("LocationId", ""))
+            if city not in CITIES or r.get("AuctionType") not in ("offer", "request"):
+                continue
+            price, amount = int(r["UnitPriceSilver"]) / 10_000, int(r["Amount"])
+            if price <= 0 or amount < 0 or not str(r.get("Id", "")):
+                raise ValueError("Invalid order price / quantity / id")
+            expiry = parse_time(r["Expires"]).isoformat()
+            normalized.append((r, city, price, amount, expiry))
+        return normalized
+
     def ingest(self, topic, payload):
         if topic == "marketnotifications":
             return self.ingest_sale(payload)
@@ -327,22 +368,7 @@ class Store:
         received = self.clock().isoformat()
         with self.lock, self.db:
             if topic == "marketorders.ingest":
-                rows = payload.get("Orders")
-                if not isinstance(rows, list):
-                    raise ValueError("Orders array required")
-                filtered = [r for r in rows if isinstance(r, dict) and r.get("ItemTypeId") in self.cfg["items"]]
-                normalized = []
-                for r in filtered:
-                    if int(r.get("QualityLevel", 1)) != 1 or int(r.get("EnchantmentLevel", 0)) != 0:
-                        continue
-                    city = location(r.get("LocationId", ""))
-                    if city not in CITIES or r.get("AuctionType") not in ("offer", "request"):
-                        continue
-                    price, amount = int(r["UnitPriceSilver"]) / 10_000, int(r["Amount"])
-                    if price <= 0 or amount < 0 or not str(r.get("Id", "")):
-                        raise ValueError("Invalid order price / quantity / id")
-                    expiry = parse_time(r["Expires"]).isoformat()
-                    normalized.append((r, city, price, amount, expiry))
+                normalized = self.normalize_orders(payload.get("Orders"))
                 # An answer to the in-game "my orders" list is the player's own orders, not a
                 # market page: it updates my_orders and never touches the order book.
                 mine = self.claim_my_order_list()
@@ -619,7 +645,7 @@ class Store:
         ident = (stat.st_dev, stat.st_ino)
         if ident != self.log_state["ident"] or stat.st_size < self.log_state["offset"]:
             self.log_state = {"ident": ident, "offset": max(0, stat.st_size - 8_000_000)}
-            self.pending_mine = []
+            self.pending_mine, self.log_fork = [], False
         start = self.log_state["offset"]
         if stat.st_size <= start:
             return
@@ -648,6 +674,9 @@ class Store:
             return
         logged = logged if logged.tzinfo else logged.astimezone()
         msg = match["msg"]
+        version = LOG_VERSION.search(msg)
+        if version:
+            self.log_fork, self.pending_mine = FORK_VERSION_TAG in version["version"], []
         op = LOG_OPERATION.search(msg)
         number = int(op["op"]) if op else None
         if op:
@@ -662,19 +691,24 @@ class Store:
     def claim_my_order_list(self):
         """True when this market upload answers the in-game "my orders" list: the client logged
         a GetMyOpenOffers/Requests request after the last normal market request. The client
-        uploads that answer like any market page, so without the log it cannot be told apart."""
+        uploads that answer like any market page, so without the log it cannot be told apart.
+        The fork never does: it sends the list on marketorders.mine (ingest_my_orders)."""
         self.read_client_log()
+        if self.log_fork:
+            self.pending_mine = []
+            return False
         now = self.clock()
         while self.pending_mine:
             if -10 <= (now - self.pending_mine.pop(0)).total_seconds() <= 120:
                 return True
         return False
 
-    def sync_my_orders(self, rows, received):
+    def sync_my_orders(self, rows, received, complete=None):
         """Every order in the in-game "my orders" list is the player's own. Known ones get units
         left and price refreshed, a matching hand-entered one is linked, the rest are registered
         automatically. A tracked order missing from a fresh list of that city and side is gone
-        (sold out, cancelled or expired) and closed."""
+        (sold out, cancelled or expired) and closed. complete names the (city, side) lists known
+        to be whole, empty ones included; by default every (city, side) seen in rows."""
         listed = defaultdict(set)
         for r, city, price, amount, _ in rows:
             side, oid = "sell" if r["AuctionType"] == "offer" else "buy", str(r["Id"])
@@ -688,15 +722,44 @@ class Store:
             else:
                 self.db.execute("INSERT INTO my_orders(item,city,side,price,amount,created,order_id,remaining,checked,source) VALUES(?,?,?,?,?,?,?,?,?,'auto')",
                                 (r["ItemTypeId"], city, side, price, amount, received, oid, amount, received))
-        for (city, side), ids in listed.items():
+        for city, side in (list(listed) if complete is None else complete):
+            ids = listed[(city, side)]
             for row in self.db.execute("SELECT id,order_id FROM my_orders WHERE closed IS NULL AND order_id IS NOT NULL AND city=? AND side=?", (city, side)).fetchall():
                 if row["order_id"] not in ids:
                     self.db.execute("UPDATE my_orders SET closed=? WHERE id=?", (received, row["id"]))
 
+    def ingest_my_orders(self, payload):
+        """One in-game "my orders" list (Kind sell or buy) from the fork's private topic
+        marketorders.mine. These are the player's own orders: they update my_orders and
+        never touch the order book or the public market feed.
+        The game lists only the orders of the market the player stands in (LocationId; the
+        orders themselves carry none) and at most one page of MY_ORDERS_PAGE. A shorter list is
+        the whole list, so a tracked order of that market and side missing from it, or every
+        one when the list is empty, is gone."""
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object required")
+        kind, rows = payload.get("Kind"), payload.get("Orders")
+        if kind not in ("sell", "buy"):
+            raise ValueError("Kind must be sell or buy")
+        auction = "offer" if kind == "sell" else "request"
+        city = location(payload.get("LocationId", ""))
+        received = self.clock().isoformat()
+        with self.lock, self.db:
+            normalized = [row for row in self.normalize_orders(rows) if row[0]["AuctionType"] == auction]
+            whole = city in CITIES and len(rows) < MY_ORDERS_PAGE
+            self.pending_mine = []
+            self.sync_my_orders(normalized, received, {(city, kind)} if whole else set())
+            if normalized:
+                encoded = json.dumps({"Kind": kind, "Orders": [r[0] for r in normalized]}, ensure_ascii=False, separators=(",", ":"))
+                self.db.execute("INSERT INTO packets(received,topic,sha256,payload) VALUES(?,?,?,?)", (received, "marketorders.mine", hashlib.sha256(encoded.encode()).hexdigest(), encoded))
+        return {"accepted": len(normalized), "received_at": received}
+
     def client_debug(self):
         lines = [dict(r) for r in self.db.execute("SELECT logged,op,text FROM client_lines ORDER BY logged DESC, id DESC LIMIT 15")]
         last = self.db.execute("SELECT MAX(checked) FROM my_orders").fetchone()[0]
-        return {"enabled": self.log_debug_seen, "operations": CAPTURE_DEBUG_OPERATIONS, "lines": lines, "last_my_orders": last}
+        direct = self.db.execute("SELECT last FROM private_topics WHERE topic='marketorders.mine'").fetchone()
+        return {"enabled": self.log_debug_seen, "fork": self.log_fork, "operations": CAPTURE_DEBUG_OPERATIONS, "lines": lines,
+                "last_my_orders": last, "last_direct": direct[0] if direct else None}
 
     def my_orders(self, books):
         """Open own orders with what the latest scans say: units left, units filled since,
@@ -763,8 +826,9 @@ class Store:
         """
         if not isinstance(payload, dict):
             raise ValueError("JSON object required")
-        if payload.get("NotificationType") != "SalesNotification":
-            return {"accepted": 0, "ignored": True, "reason": "판매 완료 메일이 아님 (" + str(payload.get("NotificationType")) + ")"}
+        notification = payload.get("NotificationType")
+        if notification != "SalesNotification" and notification not in MAIL_KINDS:
+            return {"accepted": 0, "ignored": True, "reason": "알 수 없는 메일 종류 (" + str(notification) + ")"}
         row = payload.get("Notification")
         if not isinstance(row, dict):
             raise ValueError("Notification object required")
@@ -773,32 +837,75 @@ class Store:
             return {"accepted": 0, "ignored": True, "reason": "추적하지 않는 품목 " + str(item)}
         if city not in CITIES:
             return {"accepted": 0, "ignored": True, "reason": "알 수 없는 도시 코드 " + str(row.get("LocationId"))}
-        def positive_integer(key):
+        def integer(key, minimum=1):
             value = row.get(key)
             if isinstance(value, bool) or not isinstance(value, (int, str)):
-                raise ValueError("Invalid sale " + key)
+                raise ValueError("Invalid mail " + key)
             value = int(value)
-            if not 0 < value <= 2**63-1:
-                raise ValueError("Invalid sale " + key)
+            if not minimum <= value <= 2**63-1:
+                raise ValueError("Invalid mail " + key)
             return value
-        mail_id = str(positive_integer("Id"))
-        price, amount = positive_integer("UnitPriceSilver"), positive_integer("Amount")
+        mail_id = str(integer("Id"))
         character = str(payload.get("CharacterId") or payload.get("CharacterName") or "").strip()
         identity = hashlib.sha256(("Europe|" + character).encode()).hexdigest()
         seen = self.clock().isoformat()
+        # The fork reports when the game sent the mail; the official client does not.
+        try:
+            mailed = parse_time(row["Received"]).isoformat() if row.get("Received") else None
+        except (ValueError, TypeError, OverflowError, OSError):
+            mailed = None
+        if notification in MAIL_KINDS:
+            return self.store_mail(MAIL_KINDS[notification], row, integer, identity, mail_id, item, city, seen, mailed, bool(character))
+        price, amount = integer("UnitPriceSilver"), integer("Amount")
         with self.lock, self.db:
             previous = self.db.execute("SELECT * FROM personal_sales WHERE identity=? AND mail_id=?", (identity, mail_id)).fetchone()
             if previous:
                 conflict = bool(previous["conflict"]) or any(previous[k] != v for k,v in (("item",item),("city",city),("price",price),("amount",amount)))
-                self.db.execute("UPDATE personal_sales SET last_seen=?,conflict=? WHERE identity=? AND mail_id=?", (seen,int(conflict),identity,mail_id))
+                self.db.execute("UPDATE personal_sales SET last_seen=?,conflict=?,mailed=COALESCE(mailed,?) WHERE identity=? AND mail_id=?", (seen,int(conflict),mailed,identity,mail_id))
                 return {"accepted": 0, "duplicate": True, "conflict": conflict}
-            self.db.execute("INSERT INTO personal_sales VALUES(?,?,?,?,?,?,?,?,?,?,0)",
-                (identity,mail_id,item,city,price,amount,seen,seen,str(row.get("Expires") or ""),int(bool(character))))
+            self.db.execute("""INSERT INTO personal_sales(identity,mail_id,item,city,price,amount,first_seen,last_seen,source_expires,identity_known,conflict,mailed)
+                VALUES(?,?,?,?,?,?,?,?,?,?,0,?)""", (identity,mail_id,item,city,price,amount,seen,seen,str(row.get("Expires") or ""),int(bool(character)),mailed))
         return {"accepted": 1, "received_at": seen}
+
+    def store_mail(self, kind, row, integer, identity, mail_id, item, city, seen, mailed, identity_known):
+        """A buy-order or expiry mail, in whole silver like sale mails. amount is the units that
+        traded (bought or sold), order_amount the order's size, silver the total moved: spent on
+        a completed buy, refunded on an expired buy, earned on an expired sell. price is the unit
+        price the fork derived, None when no unit traded or none was left to refund."""
+        if kind == "buy":
+            amount = order_amount = integer("Amount")
+            price, silver = integer("UnitPriceSilver"), integer("TotalSilver")
+        else:
+            order_amount = integer("Amount")
+            amount = integer("Bought" if kind == "buy_expired" else "Sold", 0)
+            silver = integer("RefundSilver" if kind == "buy_expired" else "TotalSilver", 0)
+            price = integer("UnitPriceSilver", 0) or None
+            if amount > order_amount:
+                raise ValueError("Traded units exceed the order size")
+        values = {"kind": kind, "item": item, "city": city, "price": price, "amount": amount, "order_amount": order_amount, "silver": silver}
+        with self.lock, self.db:
+            previous = self.db.execute("SELECT * FROM personal_mails WHERE identity=? AND mail_id=?", (identity, mail_id)).fetchone()
+            if previous:
+                conflict = bool(previous["conflict"]) or any(previous[k] != v for k, v in values.items())
+                self.db.execute("UPDATE personal_mails SET last_seen=?,conflict=?,mailed=COALESCE(mailed,?) WHERE identity=? AND mail_id=?", (seen, int(conflict), mailed, identity, mail_id))
+                return {"accepted": 0, "duplicate": True, "conflict": conflict}
+            self.db.execute("""INSERT INTO personal_mails(identity,mail_id,kind,item,city,price,amount,order_amount,silver,first_seen,last_seen,identity_known,conflict,mailed)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?)""", (identity, mail_id, kind, item, city, price, amount, order_amount, silver, seen, seen, int(identity_known), mailed))
+        return {"accepted": 1, "received_at": seen}
+
+    def personal_mails(self):
+        """Buy-order and expiry mails, listed apart from the sale statistics."""
+        with self.lock:
+            rows = [dict(r) for r in self.db.execute("""SELECT kind,item,city,price,amount,order_amount,silver,first_seen,mailed FROM personal_mails
+                WHERE conflict=0 ORDER BY COALESCE(mailed,first_seen) DESC, mail_id DESC LIMIT 60""")]
+            counts = dict(self.db.execute("SELECT kind,COUNT(*) FROM personal_mails WHERE conflict=0 GROUP BY kind").fetchall())
+            conflicts = self.db.execute("SELECT COUNT(*) FROM personal_mails WHERE conflict=1").fetchone()[0]
+        return {"recent": rows, "counts": counts, "conflicts": conflicts,
+                "note": "구매 주문 완료·만료 메일. 판매 통계(시장별 합계·누적 최고 단가)에는 더하지 않음. 시각은 게임이 메일을 보낸 때."}
 
     def personal_sales(self, item, city):
         with self.lock:
-            rows = [dict(r) for r in self.db.execute("SELECT item,city,price,amount,first_seen,last_seen,identity_known FROM personal_sales WHERE conflict=0 ORDER BY first_seen DESC,mail_id DESC")]
+            rows = [dict(r) for r in self.db.execute("SELECT item,city,price,amount,first_seen,last_seen,identity_known,mailed FROM personal_sales WHERE conflict=0 ORDER BY first_seen DESC,mail_id DESC")]
             markets = {}
             for row in rows:
                 key = row["item"] + "/" + row["city"]
@@ -812,7 +919,7 @@ class Store:
             return {"by_market":markets,"selected":selected[:100],"selected_count":len(selected),"mail_count":len(rows),"recent":rows[:30],
                 "conflicts":self.db.execute("SELECT COUNT(*) FROM personal_sales WHERE conflict=1").fetchone()[0],
                 "unknown_identity":sum(not r["identity_known"] for r in rows),
-                "note":"판매 완료 메일의 누적 기록 · 시각은 처음 읽은 때이며 체결 시각은 미확인. 시장 거래량·요일·시간대 집계에 더하지 않음. 같은 메일은 중복 집계하지 않음."}
+                "note":"판매 완료 메일의 누적 기록 · ‘처음 확인한 때’는 이 프로그램이 처음 읽은 때, ‘메일 받은 때’는 게임이 메일을 보낸 때(전용 수집기만 제공). 시장 거래량·요일·시간대 집계에 더하지 않음. 같은 메일은 중복 집계하지 않음."}
 
     def reset_book(self, item, city):
         if item not in self.cfg["items"] or city not in CITIES:
@@ -1474,7 +1581,7 @@ class Store:
                       {(item, city), *((r["item"], r["sell_city"]) for r in routes), *((b["item"], b["city"]) for b in buyouts)}}
             last = self.db.execute("SELECT received,topic FROM packets ORDER BY id DESC LIMIT 1").fetchone()
             count = self.db.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
-            return {"build": BUILD, "personal_sales": sales, "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "server": "Europe (게임도 유럽 서버인지 확인)",
+            return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "server": "Europe (게임도 유럽 서버인지 확인)",
                 "timezone": self.cfg["timezone"], "items": self.cfg["items"], "cities": CITIES,
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
@@ -1615,7 +1722,14 @@ def handler_class(store, token):
                 if path.startswith("/private/europe/"):
                     # Private uploaders also receive public orders. Ignore those here
                     # so the two destinations never double-ingest order snapshots.
-                    result = store.ingest_sale(payload) if path == "/private/europe/marketnotifications" else {"accepted":0,"ignored":True}
+                    # marketorders.mine exists only here: the fork's own-order lists.
+                    topic = path.rsplit("/", 1)[-1]
+                    if topic == "marketnotifications":
+                        result = store.ingest_sale(payload)
+                    elif topic == "marketorders.mine":
+                        result = store.ingest_my_orders(payload)
+                    else:
+                        result = {"accepted": 0, "ignored": True}
                 elif path.startswith("/ingest/europe/"):
                     result = store.ingest(path.rsplit("/", 1)[-1], payload)
                 else:

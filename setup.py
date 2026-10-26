@@ -11,6 +11,10 @@ ROOT = Path(__file__).resolve().parent
 RELEASE = "0.1.61"
 URL = f"https://github.com/ao-data/albiondata-client/releases/download/{RELEASE}/update-windows-amd64.exe.gz"
 ITEMS = "https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.txt"
+# The local fork (README: 전용 수집기) is built from source and copied in by hand. This script
+# only ever writes the official client's own file and provenance.json, so refreshing the
+# official release never replaces, renames or removes the fork.
+FORK = "albiondata-client-fork.exe"
 
 
 def fetch(url):
@@ -55,6 +59,8 @@ def main():
     license_url = "https://raw.githubusercontent.com/ao-data/albiondata-client/master/LICENSE"
     (vendor / "LICENSE-albiondata-client.txt").write_bytes(fetch(license_url))
     print("Official portable client and item mapping ready:", target)
+    if (vendor / FORK).exists():
+        print("Local fork kept as is; start.ps1 runs it instead of the official client:", vendor / FORK)
     print("Npcap must be installed separately: https://npcap.com/#download")
 
 

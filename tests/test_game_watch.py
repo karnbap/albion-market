@@ -102,6 +102,9 @@ class GameWatchTests(unittest.TestCase):
         self.platform.names={'albiondata-client.exe'}
         self.step();self.step(15)
         self.assertEqual(self.platform.stops,0)
+        self.platform.names={GAME,'albiondata-client-fork.exe'}
+        self.step()
+        self.assertEqual(self.platform.starts,0)
 
     def test_unknown_capture_state_not_started_or_stopped(self):
         self.platform.names={GAME};self.platform.running=None
