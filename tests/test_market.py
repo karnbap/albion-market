@@ -604,6 +604,51 @@ class MarketTests(unittest.TestCase):
         self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 100, 'amount': 10})
         self.assertEqual(self.store.state()['buyouts'], [])
 
+    def client_log(self, *lines):
+        """Append lines in the capture client's log format (ANSI colours included, as on stdout)."""
+        path = self.root/'vendor/albiondata-client.log'
+        path.parent.mkdir(exist_ok=True)
+        with path.open('a', encoding='utf-8') as handle:
+            for seconds, text in lines:
+                stamp = (self.now - timedelta(seconds=seconds)).astimezone(timezone(timedelta(hours=1))).isoformat(timespec='seconds')
+                handle.write(f'\x1b[37mDEBU\x1b[0m[{stamp}] {text}\n')
+
+    def test_my_orders_list_from_client_log_registers_updates_and_closes_own_orders(self):
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '1002', 'side': 'sell', 'price': 120, 'amount': 30})
+        self.client_log((2, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        result = self.capture(self.order(7, 120, 25), self.order(8, 300, 4))
+        self.assertEqual(result['accepted'], 2)
+        rows = {r['order_id']: r for r in self.store.state()['my_orders']}
+        self.assertEqual((rows['7']['source'], rows['7']['amount'], rows['7']['remaining'], rows['7']['filled']), ('manual', 30, 25, 5))
+        self.assertEqual((rows['8']['source'], rows['8']['amount'], rows['8']['remaining']), ('auto', 4, 4))
+        # The "my orders" answer is not a market page: the order book stays empty.
+        self.assertEqual(self.store.book('T7_RELIC', '1002', 'sell')['levels'], [])
+        # A normal market search afterwards is a market page again.
+        self.now += timedelta(minutes=1)
+        self.client_log((1, 'OperationRequest: [81]opAuctionGetOffers - 253:81'))
+        self.capture(self.order(1, 100, 5), self.order(7, 120, 20))
+        self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
+        self.assertEqual(next(r for r in self.store.state()['my_orders'] if r['order_id'] == '7')['remaining'], 20)
+        # Order 8 sold out: missing from the next "my orders" list of that city and side.
+        self.now += timedelta(minutes=1)
+        self.client_log((1, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        self.capture(self.order(7, 120, 20))
+        self.assertEqual([r['order_id'] for r in self.store.state()['my_orders']], ['7'])
+        debug = self.store.state()['client_debug']
+        self.assertTrue(debug['enabled'])
+        self.assertEqual(debug['lines'][0]['op'], 92)
+
+    def test_stale_my_orders_request_does_not_claim_market_pages(self):
+        self.client_log((300, 'OperationRequest: [92]opAuctionGetMyOpenOffers - 253:92'))
+        self.capture(self.order(1, 100, 5), self.order(2, 120, 3))
+        self.assertEqual(self.store.state()['my_orders'], [])
+        self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
+
+    def test_capture_debug_operations_match_start_script(self):
+        from market import CAPTURE_DEBUG_OPERATIONS
+        script = (ROOT/'start.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn(f"'-debug', '-operations', '{CAPTURE_DEBUG_OPERATIONS}'", script)
+
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
         path = self.root/'data/game-watch-state.json'

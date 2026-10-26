@@ -72,7 +72,10 @@ if (-not $albionDriver) {
 # Private uploads include public packets too; the receiver ignores those copies.
 # Version 0.1.61 crashes with 'noop'; private uploads use a full localhost HTTP URL.
 # Do NOT add -d: that disables local HTTP ingestion too.
-$albionClientProcess = Start-Process -FilePath $albionCapture -ArgumentList @('-i', "$albionAddress/ingest/europe", '-p', "$albionAddress/private/europe", '-minimize') -WorkingDirectory (Join-Path $albionRoot 'vendor') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $albionRoot 'data\capture-stdout.log') -RedirectStandardError (Join-Path $albionRoot 'data\capture-stderr.log')
+# -debug with an operation whitelist writes the in-game 'my orders' lists and mailbox messages
+# to vendor\albiondata-client.log; the receiver reads them (CAPTURE_DEBUG_OPERATIONS in market.py).
+# -events 65535 matches no event, so game events stay out of the log.
+$albionClientProcess = Start-Process -FilePath $albionCapture -ArgumentList @('-i', "$albionAddress/ingest/europe", '-p', "$albionAddress/private/europe", '-minimize', '-debug', '-operations', '81,82,92,93,174,175,176', '-events', '65535') -WorkingDirectory (Join-Path $albionRoot 'vendor') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $albionRoot 'data\capture-stdout.log') -RedirectStandardError (Join-Path $albionRoot 'data\capture-stderr.log')
 Set-Content -LiteralPath (Join-Path $albionRoot 'data\capture.pid') -Value $albionClientProcess.Id
 Write-Host 'Local capture started. Open Albion Europe and load a market item.'
 

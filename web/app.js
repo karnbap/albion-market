@@ -56,7 +56,7 @@ async function refresh(){
   const r=await fetch(`/api/state?item=${encodeURIComponent(selectedItem)}&city=${encodeURIComponent(selectedCity)}`);if(!r.ok)throw Error(r.status);
   const next=await r.json();token=next.token;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261026.8';
+  const legacy=next.build!=='20261026.9';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -110,12 +110,14 @@ function renderMailDiagnosis(){
  const c=d.counts,outcome={saved:'저장',duplicate:'이미 저장한 메일',conflict:'내용 충돌',ignored:'무시',rejected:'형식 오류'};
  let verdict;
  if(!d.private_topics.length)verdict=['warn','수집기의 개인 자료 통로(메일 전용)로 들어온 자료가 한 번도 없습니다. 수집기가 이 프로그램이 아닌 다른 방법으로 켜졌거나 오래된 실행 설정일 수 있습니다. 게임을 끄고 10초 뒤 다시 켜서 자동 수집으로 시작해 주세요.'];
- else if(!mail)verdict=['warn',`개인 자료 통로는 연결돼 있지만(시장 자료 ${n(orders?.count||0)}회) 판매 메일은 한 번도 오지 않았습니다. 수집기는 켜진 뒤 받은 우편함 목록으로만 메일을 읽습니다. 지역을 한 번 이동한 다음 우편함을 닫았다 다시 열고 판매 완료 메일을 열어 주세요. 아래 수집기 기록에 ‘Mail Info is not valid’가 보이면 이 경우입니다.`];
+ else if(!mail)verdict=['warn',`개인 자료 통로는 연결돼 있지만(시장 자료 ${n(orders?.count||0)}회) 판매 메일은 한 번도 오지 않았습니다. 수집기는 켜진 뒤 받은 우편함 목록으로만 메일을 읽습니다. 지역을 한 번 이동한 다음 우편함을 닫았다 다시 열고 판매 완료 메일을 열어 주세요. 아래 수집기 기록에 ‘Mail Info is not valid’가 지역을 옮긴 뒤에도 계속 보이면, 수집기가 우편함 목록 자체를 읽지 못하는 문제입니다. 맨 아래 원본 기록을 캡처해 보내 주세요.`];
  else if(!c.saved)verdict=['warn','판매 메일은 들어왔지만 저장된 것이 없습니다. 아래 기록의 무시 이유를 확인해 주세요.'];
  else verdict=['ok',`판매 메일이 정상적으로 들어오고 있습니다 · 저장 ${n(c.saved)}건`];
  const events=d.events.length?table(['받은 때','종류','품목','도시 코드','결과','이유'],d.events.map(e=>`<tr><td>${date(e.received)}</td><td>${esc(e.kind||'—')}</td><td>${esc(state.items[e.item]||e.item||'—')}</td><td>${esc(e.location||'—')}</td><td>${esc(outcome[e.outcome]||e.outcome)}</td><td>${esc(e.detail||'')}</td></tr>`),'mail-events'):'';
+ const dbg=state.client_debug,opName={92:'내 매도 주문 목록',93:'내 매수 주문 목록',174:'우편함 목록',175:'메일 개수',176:'메일 열기'};
+ const raw=!dbg?'':!dbg.enabled?'<p class="help">수집기가 디버그 기록 없이 켜져 있어 원본 기록이 없습니다. 최신 버전을 받은 뒤 게임을 끄고 10초 뒤 다시 켜 주세요.</p>':dbg.lines.length?`<p class="help">우편함을 열고 판매 완료 메일을 하나 연 뒤 이 부분을 캡처해 보내 주시면, 메일을 이 기록에서 직접 읽도록 고칠 수 있습니다.</p><pre class="client-log">${dbg.lines.map(l=>`${date(l.logged)} ${l.op?'['+(opName[l.op]||l.op)+'] ':''}${esc(l.text.length>600?l.text.slice(0,600)+'…':l.text)}`).join('\n')}</pre>`:'<p class="help">디버그 기록은 켜져 있지만 우편함·메일·내 주문 기록이 아직 없습니다. 게임에서 우편함과 내 주문 탭을 열어 주세요.</p>';
  const log=d.client_log.lines.length?`<pre class="client-log">${d.client_log.lines.map(esc).join('\n')}</pre>`:`<p class="help">${d.client_log.file?'수집기 기록에 메일 관련 줄이 없습니다.':'수집기 기록 파일을 찾지 못했습니다.'}</p>`;
- updateHtml('mail-diagnosis',`<p class="${verdict[0]==='ok'?'positive':'warn'} diagnosis">${esc(verdict[1])}</p><div class="diag-grid"><div><small>개인 통로 · 메일</small><b>${mail?n(mail.count)+'회':'없음'}</b><span>${mail?'마지막 '+date(mail.last):''}</span></div><div><small>개인 통로 · 시장 자료</small><b>${orders?n(orders.count)+'회':'없음'}</b><span>${orders?'마지막 '+date(orders.last):''}</span></div><div><small>메일 처리 결과</small><b>${Object.entries(c).map(([k,v])=>`${outcome[k]||k} ${n(v)}`).join(' · ')||'없음'}</b></div></div>${events}<h3 class="sub-head">수집기 기록 (메일 관련 최근 줄)</h3>${log}<p class="help">수집기는 판매 주문 완료 메일만 보냅니다. 구매 주문 완료·만료 메일은 보내지 않습니다.</p>`);
+ updateHtml('mail-diagnosis',`<p class="${verdict[0]==='ok'?'positive':'warn'} diagnosis">${esc(verdict[1])}</p><div class="diag-grid"><div><small>개인 통로 · 메일</small><b>${mail?n(mail.count)+'회':'없음'}</b><span>${mail?'마지막 '+date(mail.last):''}</span></div><div><small>개인 통로 · 시장 자료</small><b>${orders?n(orders.count)+'회':'없음'}</b><span>${orders?'마지막 '+date(orders.last):''}</span></div><div><small>메일 처리 결과</small><b>${Object.entries(c).map(([k,v])=>`${outcome[k]||k} ${n(v)}`).join(' · ')||'없음'}</b></div></div>${events}<h3 class="sub-head">수집기 기록 (메일 관련 최근 줄)</h3>${log}<h3 class="sub-head">수집기 원본 기록 (우편함·메일·내 주문)</h3>${raw}<p class="help">수집기는 판매 주문 완료 메일만 보냅니다. 구매 주문 완료·만료 메일은 보내지 않습니다.</p>`);
 }
 function renderPickHistory(){
  const rows=state.pick_history;
@@ -143,8 +145,11 @@ function renderMyOrders(){
  const rows=state.my_orders;
  if(!rows){updateHtml('my-orders',empty('내 매물 기능을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
  if(!$('my-item').options.length){$('my-item').innerHTML=Object.entries(state.items).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('');$('my-city').innerHTML=Object.entries(state.cities).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('')}
+ const auto=state.client_debug;
+ $('my-auto-status').className=auto?.enabled?'help':'warn';
+ $('my-auto-status').textContent=!auto?'':auto.enabled?(auto.last_my_orders?`자동 인식 켜짐 · 마지막으로 게임의 내 주문 목록을 읽은 때 ${ago(auto.last_my_orders)}`:'자동 인식 켜짐 · 게임 시장 창에서 내 주문 탭을 한 번 열어 주세요.'):'자동 인식 꺼짐: 수집기가 디버그 기록 없이 켜져 있습니다. 최신 버전을 받은 뒤 게임을 끄고 10초 뒤 다시 켜면 켜집니다.';
  const sideName={sell:'매도',buy:'매수'};
- updateHtml('my-orders',rows.length?table(['품목 · 도시','종류','내 가격','처음 수량 → 남은 수량','팔림/채워짐','내 앞 물량','상태',''],rows.map(r=>`<tr><td>${esc(state.items[r.item])}<br><small>${esc(state.cities[r.city])}</small></td><td>${sideName[r.side]}</td><td>${n(r.price)}</td><td>${n(r.amount)} → <b>${n(r.remaining)}</b></td><td>${n(r.filled)}개</td><td>${r.order_id?n(r.ahead)+'개':'—'}<small>${r.best==null?'':(r.side==='sell'?'최저 매도 ':'최고 매수 ')+n(r.best)}</small></td><td>${!r.order_id?'<span class="warn">아직 연결 안 됨 · 이 시장을 게임에서 열어 주세요</span>':r.is_best?'<span class="positive">맨 앞</span>':'<span class="warn">더 좋은 가격 있음</span>'}<small>${r.seen?'마지막 확인 '+ago(r.seen):'등록 '+ago(r.created)}</small></td><td><button type="button" class="secondary small-button" data-close="${r.id}">정리</button></td></tr>`),'my-orders'):empty('등록한 내 매물이 없습니다. 위에서 게임에 올린 주문을 추가해 주세요.'));
+ updateHtml('my-orders',rows.length?table(['품목 · 도시','종류','내 가격','처음 수량 → 남은 수량','팔림/채워짐','내 앞 물량','상태',''],rows.map(r=>`<tr><td>${esc(state.items[r.item])}${r.source==='auto'?' <span class="pill">자동</span>':''}<br><small>${esc(state.cities[r.city])}</small></td><td>${sideName[r.side]}</td><td>${n(r.price)}</td><td>${n(r.amount)} → <b>${n(r.remaining)}</b></td><td>${n(r.filled)}개</td><td>${r.order_id?n(r.ahead)+'개':'—'}<small>${r.best==null?'':(r.side==='sell'?'최저 매도 ':'최고 매수 ')+n(r.best)}</small></td><td>${!r.order_id?'<span class="warn">아직 연결 안 됨 · 게임에서 내 주문 탭이나 이 시장을 열어 주세요</span>':r.is_best?'<span class="positive">맨 앞</span>':'<span class="warn">더 좋은 가격 있음</span>'}<small>${r.seen?'마지막 확인 '+ago(r.seen):'등록 '+ago(r.created)}</small></td><td><button type="button" class="secondary small-button" data-close="${r.id}">정리</button></td></tr>`),'my-orders'):empty('등록한 내 매물이 없습니다. 위에서 게임에 올린 주문을 추가해 주세요.'));
 }
 function renderNow(){
  const picks=state.now;

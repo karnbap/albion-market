@@ -38,7 +38,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261026.8"
+BUILD = "20261026.9"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -167,6 +167,17 @@ def capture_status(root):
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# The official capture client never says which orders are the player's own, and in 0.1.61 it
+# drops opened sale mails when its mailbox list was never cached. Started with -debug and this
+# operation list (start.ps1) it writes those game messages to its own log, which the receiver
+# follows: 81/82 = market list requests, 92/93 = the in-game "my orders" sell / buy lists,
+# 174-176 = mailbox list, mail count and an opened mail.
+CAPTURE_DEBUG_OPERATIONS = "81,82,92,93,174,175,176"
+LOG_LINE = re.compile(r"^[A-Z]{4}\[(?P<ts>[^\]]+)\]\s*(?P<msg>.*)$")
+LOG_OPERATION = re.compile(r"Operation(?P<kind>Request|Response): \[(?P<op>\d+)\]")
+MY_ORDER_OPS = {92: "sell", 93: "buy"}
+MARKET_LIST_OPS = {81, 82}
+RAW_LOG_OPS = {92, 93, 174, 175, 176}
 
 
 def client_mail_log(root):
@@ -232,7 +243,10 @@ class Store:
         CREATE INDEX IF NOT EXISTS packet_topic_received ON packets(topic,received);
         CREATE INDEX IF NOT EXISTS order_lookup ON orders(order_id,seen);
         CREATE TABLE IF NOT EXISTS my_orders(id INTEGER PRIMARY KEY, item TEXT NOT NULL, city TEXT NOT NULL, side TEXT NOT NULL,
-          price REAL NOT NULL, amount INTEGER NOT NULL, created TEXT NOT NULL, order_id TEXT, closed TEXT);
+          price REAL NOT NULL, amount INTEGER NOT NULL, created TEXT NOT NULL, order_id TEXT, closed TEXT,
+          remaining INTEGER, checked TEXT, source TEXT NOT NULL DEFAULT 'manual');
+        CREATE TABLE IF NOT EXISTS client_lines(id INTEGER PRIMARY KEY, logged TEXT NOT NULL, op INTEGER, text TEXT NOT NULL,
+          UNIQUE(logged,text));
         CREATE TABLE IF NOT EXISTS order_fills(item TEXT NOT NULL, city TEXT NOT NULL, side TEXT NOT NULL, order_id TEXT NOT NULL,
           price REAL NOT NULL, amount INTEGER NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_events(id INTEGER PRIMARY KEY, received TEXT NOT NULL, kind TEXT,
@@ -244,7 +258,12 @@ class Store:
         CREATE TABLE IF NOT EXISTS observed_pages(session INTEGER NOT NULL REFERENCES sessions(id),
           ids TEXT NOT NULL, seen TEXT NOT NULL, PRIMARY KEY(session,ids));
         """)
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(my_orders)")}
+        for name, kind in (("remaining", "INTEGER"), ("checked", "TEXT"), ("source", "TEXT NOT NULL DEFAULT 'manual'")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE my_orders ADD COLUMN {name} {kind}")
         self.db.commit()
+        self.log_state, self.pending_mine, self.log_debug_seen = {"ident": None, "offset": 0}, [], False
         last = self.db.execute("SELECT payload FROM packets WHERE topic='marketorders.ingest' ORDER BY id DESC LIMIT 1").fetchone()
         orders = json.loads(last[0]).get("Orders", []) if last else []
         self.active_market = (orders[0]["ItemTypeId"], location(orders[0]["LocationId"])) if orders else None
@@ -324,8 +343,14 @@ class Store:
                         raise ValueError("Invalid order price / quantity / id")
                     expiry = parse_time(r["Expires"]).isoformat()
                     normalized.append((r, city, price, amount, expiry))
+                # An answer to the in-game "my orders" list is the player's own orders, not a
+                # market page: it updates my_orders and never touches the order book.
+                mine = self.claim_my_order_list()
+                if mine:
+                    self.sync_my_orders(normalized, received)
+                    topic = "marketorders.mine"
                 sessions, groups = {}, {}
-                for row in normalized:
+                for row in ([] if mine else normalized):
                     r, city, price, amount, expiry = row
                     side = "sell" if r["AuctionType"] == "offer" else "buy"
                     key = (r["ItemTypeId"], city, side)
@@ -584,6 +609,95 @@ class Store:
                 self.db.execute("UPDATE my_orders SET order_id=? WHERE id=?", (match, mine["id"]))
                 linked.add(match)
 
+    def read_client_log(self):
+        """Follow the capture client's own log, which the client rewrites each time it starts."""
+        path = self.root / "vendor/albiondata-client.log"
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        ident = (stat.st_dev, stat.st_ino)
+        if ident != self.log_state["ident"] or stat.st_size < self.log_state["offset"]:
+            self.log_state = {"ident": ident, "offset": max(0, stat.st_size - 8_000_000)}
+            self.pending_mine = []
+        start = self.log_state["offset"]
+        if stat.st_size <= start:
+            return
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                data = handle.read(stat.st_size - start)
+        except OSError:
+            # A log that cannot be read must never make a market upload fail.
+            return
+        end = data.rfind(b"\n")
+        if end < 0:
+            return
+        self.log_state["offset"] = start + end + 1
+        for raw in data[:end].decode("utf-8", "replace").splitlines():
+            self.note_client_line(ANSI.sub("", raw).strip())
+        self.db.execute("DELETE FROM client_lines WHERE id <= (SELECT MAX(id) FROM client_lines) - 200")
+
+    def note_client_line(self, line):
+        match = LOG_LINE.match(line)
+        if not match:
+            return
+        try:
+            logged = datetime.fromisoformat(match["ts"])
+        except ValueError:
+            return
+        logged = logged if logged.tzinfo else logged.astimezone()
+        msg = match["msg"]
+        op = LOG_OPERATION.search(msg)
+        number = int(op["op"]) if op else None
+        if op:
+            self.log_debug_seen = True
+            if op["kind"] == "Request" and number in MARKET_LIST_OPS:
+                self.pending_mine = []
+            elif op["kind"] == "Request" and number in MY_ORDER_OPS:
+                self.pending_mine.append(logged)
+        if number in RAW_LOG_OPS or "Error while decoding" in msg or "GetMailInfos" in msg or "Mail Info" in msg:
+            self.db.execute("INSERT OR IGNORE INTO client_lines(logged,op,text) VALUES(?,?,?)", (logged.isoformat(), number, msg[:4000]))
+
+    def claim_my_order_list(self):
+        """True when this market upload answers the in-game "my orders" list: the client logged
+        a GetMyOpenOffers/Requests request after the last normal market request. The client
+        uploads that answer like any market page, so without the log it cannot be told apart."""
+        self.read_client_log()
+        now = self.clock()
+        while self.pending_mine:
+            if -10 <= (now - self.pending_mine.pop(0)).total_seconds() <= 120:
+                return True
+        return False
+
+    def sync_my_orders(self, rows, received):
+        """Every order in the in-game "my orders" list is the player's own. Known ones get units
+        left and price refreshed, a matching hand-entered one is linked, the rest are registered
+        automatically. A tracked order missing from a fresh list of that city and side is gone
+        (sold out, cancelled or expired) and closed."""
+        listed = defaultdict(set)
+        for r, city, price, amount, _ in rows:
+            side, oid = "sell" if r["AuctionType"] == "offer" else "buy", str(r["Id"])
+            listed[(city, side)].add(oid)
+            mine = self.db.execute("SELECT id FROM my_orders WHERE order_id=? AND closed IS NULL", (oid,)).fetchone()
+            if mine is None:
+                mine = self.db.execute("""SELECT id FROM my_orders WHERE order_id IS NULL AND closed IS NULL AND item=? AND city=? AND side=?
+                    AND price=? AND amount>=? ORDER BY amount=? DESC, id LIMIT 1""", (r["ItemTypeId"], city, side, price, amount, amount)).fetchone()
+            if mine:
+                self.db.execute("UPDATE my_orders SET order_id=?,price=?,remaining=?,checked=? WHERE id=?", (oid, price, amount, received, mine["id"]))
+            else:
+                self.db.execute("INSERT INTO my_orders(item,city,side,price,amount,created,order_id,remaining,checked,source) VALUES(?,?,?,?,?,?,?,?,?,'auto')",
+                                (r["ItemTypeId"], city, side, price, amount, received, oid, amount, received))
+        for (city, side), ids in listed.items():
+            for row in self.db.execute("SELECT id,order_id FROM my_orders WHERE closed IS NULL AND order_id IS NOT NULL AND city=? AND side=?", (city, side)).fetchall():
+                if row["order_id"] not in ids:
+                    self.db.execute("UPDATE my_orders SET closed=? WHERE id=?", (received, row["id"]))
+
+    def client_debug(self):
+        lines = [dict(r) for r in self.db.execute("SELECT logged,op,text FROM client_lines ORDER BY logged DESC, id DESC LIMIT 15")]
+        last = self.db.execute("SELECT MAX(checked) FROM my_orders").fetchone()[0]
+        return {"enabled": self.log_debug_seen, "operations": CAPTURE_DEBUG_OPERATIONS, "lines": lines, "last_my_orders": last}
+
     def my_orders(self, books):
         """Open own orders with what the latest scans say: units left, units filled since,
         units ahead of them in the queue, and whether they are the best price right now."""
@@ -591,9 +705,13 @@ class Store:
         for mine in self.db.execute("SELECT * FROM my_orders WHERE closed IS NULL ORDER BY item,city,side,price"):
             r = dict(mine)
             latest = self.db.execute("SELECT amount,seen FROM orders WHERE order_id=? ORDER BY seen DESC LIMIT 1", (r["order_id"],)).fetchone() if r["order_id"] else None
-            r["remaining"] = latest["amount"] if latest else r["amount"]
-            r["seen"] = latest["seen"] if latest else None
-            r["filled"] = self.db.execute("SELECT COALESCE(SUM(amount),0) FROM order_fills WHERE order_id=?", (r["order_id"],)).fetchone()[0] if r["order_id"] else 0
+            # Units left come from whichever was seen last: a market scan or the "my orders" list.
+            remaining, seen = (r["remaining"] if r["remaining"] is not None else r["amount"]), r["checked"]
+            if latest and (seen is None or latest["seen"] > seen):
+                remaining, seen = latest["amount"], latest["seen"]
+            r["remaining"], r["seen"] = remaining, seen
+            fills = self.db.execute("SELECT COALESCE(SUM(amount),0) FROM order_fills WHERE order_id=?", (r["order_id"],)).fetchone()[0] if r["order_id"] else 0
+            r["filled"] = max(fills, r["amount"] - remaining)
             levels = books[r["item"]][r["city"]][r["side"]]["levels"]
             better = (lambda price: price < r["price"]) if r["side"] == "sell" else (lambda price: price > r["price"])
             r["ahead"] = sum(l["amount"] for l in levels if better(l["price"]))
@@ -1319,6 +1437,8 @@ class Store:
 
     def state(self, item=None, city=None):
         with self.lock:
+            with self.db:
+                self.read_client_log()
             item = item if item in self.cfg["items"] else next(iter(self.cfg["items"]))
             city = city if city in CITIES else "1002"
             books = {i: {c: {s: self.book(i, c, s) for s in ("sell", "buy")} for c in CITIES} for i in self.cfg["items"]}
@@ -1359,7 +1479,7 @@ class Store:
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
-                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(),
+                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
                 "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
