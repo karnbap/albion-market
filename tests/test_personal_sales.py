@@ -84,6 +84,29 @@ class PersonalSalesTests(unittest.TestCase):
             mail=copy.deepcopy(self.sale);mail['Notification'][field]=value
             with self.assertRaises(ValueError):self.store.ingest('marketnotifications',mail)
 
+    def test_every_mail_outcome_is_logged_for_diagnosis(self):
+        self.store.ingest('marketnotifications',self.sale)
+        self.store.ingest('marketnotifications',self.sale)
+        other=copy.deepcopy(self.sale);other['Notification']['LocationId']='9999';other['Notification']['Id']=2
+        self.store.ingest('marketnotifications',other)
+        broken=copy.deepcopy(self.sale);broken['Notification']['Amount']=0
+        with self.assertRaises(ValueError):self.store.ingest('marketnotifications',broken)
+        d=self.store.mail_diagnostics()
+        self.assertEqual(d['counts'],{'saved':1,'duplicate':1,'ignored':1,'rejected':1})
+        self.assertEqual(d['events'][1]['detail'],'알 수 없는 도시 코드 9999')
+        self.assertEqual(d['client_log'],{'file':None,'lines':[]})
+
+    def test_mail_list_covers_every_market_not_only_the_selected_one(self):
+        self.store.ingest('marketnotifications',self.sale)
+        s=self.store.personal_sales('T8_RUNE','1002')
+        self.assertEqual(s['selected_count'],0)
+        self.assertEqual(s['recent'][0]['city'],'3008')
+
+    def test_client_log_mail_lines_are_shown_without_colour_codes(self):
+        (self.root/'vendor').mkdir()
+        (self.root/'vendor/albiondata-client.log').write_text('noise\n\x1b[36mINFO\x1b[0m Mail Info is not valid. Please transition zones\n','utf-8')
+        self.assertEqual(self.store.mail_diagnostics()['client_log']['lines'],['INFO Mail Info is not valid. Please transition zones'])
+
     def test_unknown_identity_and_persistence(self):
         mail=copy.deepcopy(self.sale);mail.pop('CharacterId');mail.pop('CharacterName')
         self.store.ingest('marketnotifications',mail)
