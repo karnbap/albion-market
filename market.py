@@ -37,7 +37,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261026.4"
+BUILD = "20261026.5"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -229,6 +229,9 @@ class Store:
         CREATE TABLE IF NOT EXISTS mail_events(id INTEGER PRIMARY KEY, received TEXT NOT NULL, kind TEXT,
           item TEXT, location TEXT, outcome TEXT NOT NULL, detail TEXT);
         CREATE TABLE IF NOT EXISTS private_topics(topic TEXT PRIMARY KEY, count INTEGER NOT NULL, last TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS book_stats(item TEXT NOT NULL, city TEXT NOT NULL, side TEXT NOT NULL, bucket TEXT NOT NULL,
+          best REAL NOT NULL, amount INTEGER NOT NULL, levels INTEGER NOT NULL, PRIMARY KEY(item,city,side,bucket));
+        CREATE TABLE IF NOT EXISTS pick_log(id INTEGER PRIMARY KEY, created TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS observed_pages(session INTEGER NOT NULL REFERENCES sessions(id),
           ids TEXT NOT NULL, seen TEXT NOT NULL, PRIMARY KEY(session,ids));
         """)
@@ -363,6 +366,8 @@ class Store:
                         self.db.execute("INSERT INTO observed_pages VALUES(?,?,?) ON CONFLICT(session,ids) DO UPDATE SET seen=excluded.seen", (sid, encoded_ids, received))
                     for r, city, price, amount, expiry in group:
                         self.db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?) ON CONFLICT(session,order_id) DO UPDATE SET price=excluded.price,amount=excluded.amount,seen=excluded.seen,expires=excluded.expires", (sid, str(r["Id"]), price, amount, received, expiry))
+                    if len(group) >= 2:
+                        self.record_book_stats(key, sid, received)
                 kept = {"Orders": [r[0] for r in normalized]}
                 count = len(normalized)
             else:
@@ -393,6 +398,65 @@ class Store:
                 encoded = json.dumps(kept, ensure_ascii=False, separators=(",", ":"))
                 self.db.execute("INSERT INTO packets(received,topic,sha256,payload) VALUES(?,?,?,?)", (received, topic, hashlib.sha256(encoded.encode()).hexdigest(), encoded))
         return {"accepted": count, "received_at": received}
+
+    def record_book_stats(self, key, sid, received):
+        """One row per market side per 10 minutes: best price, visible quantity and price
+        levels of the current scan. These outlive the 15-minute freshness window and feed
+        the weekday/hour averages. Called only for list pages, never a selected single order."""
+        rows = self.db.execute("SELECT price,amount FROM orders WHERE session=? AND amount>0", (sid,)).fetchall()
+        moment = parse_time(received)
+        bucket = moment.replace(minute=moment.minute - moment.minute % 10, second=0, microsecond=0).isoformat()
+        best = (min if key[2] == "sell" else max)(r["price"] for r in rows)
+        self.db.execute("INSERT OR REPLACE INTO book_stats VALUES(?,?,?,?,?,?,?)",
+                        (*key, bucket, best, sum(r["amount"] for r in rows), len({r["price"] for r in rows})))
+
+    def book_patterns(self, item, city):
+        """Average best price and visible quantity per weekday and hour (configured time zone)
+        over the last 28 days of order-book observations."""
+        zone = ZoneInfo(self.cfg["timezone"])
+        since = (self.clock() - timedelta(days=28)).isoformat()
+        groups = {}
+        for r in self.db.execute("SELECT side,bucket,best,amount FROM book_stats WHERE item=? AND city=? AND bucket>?", (item, city, since)):
+            local = parse_time(r["bucket"]).astimezone(zone)
+            for scale, key in (("weekdays", local.weekday()), ("hourly", local.hour)):
+                g = groups.setdefault((r["side"], scale, key), [0, 0.0, 0])
+                g[0] += 1; g[1] += r["best"]; g[2] += r["amount"]
+        out = {}
+        for side in ("sell", "buy"):
+            out[side] = {scale: [{"key": k, "samples": groups[side, scale, k][0], "best": groups[side, scale, k][1] / groups[side, scale, k][0],
+                                  "amount": groups[side, scale, k][2] / groups[side, scale, k][0]}
+                                 for k in range(7 if scale == "weekdays" else 24) if (side, scale, k) in groups]
+                         for scale in ("weekdays", "hourly")}
+        return out
+
+    def timing(self, cache, item, city, books):
+        """How this moment compares with this market's usual pace: sales per hour at the current
+        local hour and weekday against its 28-day average, and current best bid/ask against the
+        usual price at this weekday. Factors are None until enough history exists."""
+        key = ("timing", item, city)
+        if key in cache:
+            return cache[key]
+        zone = ZoneInfo(self.cfg["timezone"])
+        local = self.clock().astimezone(zone)
+        p = cache.setdefault(("patterns", item, city), self.patterns(item, city))
+        def factor(rows, k):
+            seen = [r for r in rows if r["observed_hours"]]
+            if len(seen) < 3:
+                return None
+            usual = sum(r["total"] for r in seen) / sum(r["observed_hours"] for r in seen)
+            here = next((r for r in seen if r["key"] == k), None)
+            return here["per_observed_hour"] / usual if here and usual else None
+        bp = self.book_patterns(item, city)
+        def versus(side):
+            usual = next((r for r in bp[side]["weekdays"] if r["key"] == local.weekday()), None)
+            book = books[item][city][side]
+            if not usual or usual["samples"] < 2 or not book["fresh"]:
+                return None
+            return book["fresh_levels"][0]["price"] / usual["best"] - 1
+        cache[key] = result = {"weekday": local.weekday(), "hour": local.hour, "local_time": local.isoformat(),
+                               "sales_hour": factor(p["hourly"], local.hour), "sales_weekday": factor(p["weekdays"], local.weekday()),
+                               "bid_vs_usual": versus("buy"), "ask_vs_usual": versus("sell")}
+        return result
 
     def note_private(self, topic):
         """Counts every private upload so the page can tell whether the capture
@@ -992,6 +1056,12 @@ class Store:
                           "buy_high": best["top_price"], "sell_high": best["relist"], "sell_low": best["relist"], "certainty": certainty,
                           "score": best["profit"] * weight, "sell_per_day": self.volume_guide(cache, b["item"], b["city"])["per_day"],
                           "floor_after": best["floor"], "warnings": [r for r in b["reasons"] if r != FEES_UNCONFIRMED]})
+        for plan in plans:
+            # Listing and buyout plans sell over the coming day, so today's usual pace matters;
+            # an instant trade settles now and only gets the information.
+            plan["timing"] = timing = self.timing(cache, plan["item"], plan["sell_city"], books)
+            if plan["kind"] != "instant" and timing["sales_weekday"] is not None:
+                plan["score"] *= min(1.2, max(0.8, timing["sales_weekday"]))
         picks, buying, selling = [], set(), set()
         for plan in sorted(plans, key=lambda p: -p["score"]):
             source, dest = (plan["item"], plan["buy_city"]), (plan["item"], plan["sell_city"])
@@ -1003,6 +1073,23 @@ class Store:
             if len(picks) == 3:
                 break
         return picks
+
+    def log_picks(self, picks):
+        """Keep each new set of top picks, so earlier advice stays readable after the
+        15-minute freshness window closes or the next day. At most one entry per 5 minutes
+        unless the picks change; 30 days are kept."""
+        now = self.clock()
+        digest = hashlib.sha256(json.dumps([(p["kind"], p["item"], p["buy_city"], p["sell_city"], p["units"]) for p in picks]).encode()).hexdigest()
+        last = self.db.execute("SELECT created,digest FROM pick_log ORDER BY id DESC LIMIT 1").fetchone()
+        if last and (last["digest"] == digest or now - parse_time(last["created"]) < timedelta(minutes=5)):
+            return
+        with self.db:
+            self.db.execute("INSERT INTO pick_log(created,digest,payload) VALUES(?,?,?)", (now.isoformat(), digest, json.dumps(picks, ensure_ascii=False, allow_nan=False)))
+            self.db.execute("DELETE FROM pick_log WHERE created<?", ((now - timedelta(days=30)).isoformat(),))
+
+    def pick_history(self, limit=60):
+        return [{"created": r["created"], "picks": json.loads(r["payload"])} for r in
+                self.db.execute("SELECT created,payload FROM pick_log ORDER BY id DESC LIMIT ?", (limit,))]
 
     def state(self, item=None, city=None):
         with self.lock:
@@ -1017,6 +1104,9 @@ class Store:
             for card in board:
                 card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
             now = self.recommendations(books, every, buyouts, cache)
+            if now:
+                self.log_picks(now)
+            history = self.pick_history()
             # Trim per item so a busy first item cannot push the others off the list.
             candidates, shown = [], defaultdict(int)
             for candidate in every:
@@ -1039,7 +1129,8 @@ class Store:
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
-                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "mail_diagnostics": self.mail_diagnostics(), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "pick_history": history, "mail_diagnostics": self.mail_diagnostics(),
+                "book_patterns": self.book_patterns(item, city), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}

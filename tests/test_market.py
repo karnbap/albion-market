@@ -13,6 +13,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer
+from zoneinfo import ZoneInfo
 
 from market import Store, handler_class, parse_time, describe_depth, DEPTH_DEFAULTS, capture_status, CANDIDATES_PER_ITEM, volume_risk, CITIES
 
@@ -456,6 +457,49 @@ class MarketTests(unittest.TestCase):
         self.assertIn('Caerleon 이동은 레드존 통과 · 운반 중 약탈 위험', pick['warnings'])
         for bad in (['9999'], '3005', list(CITIES)):
             with self.assertRaises(ValueError): self.store.save_config({'excluded_cities': bad})
+
+    def test_order_book_stats_kept_per_ten_minutes_and_averaged_by_weekday_and_hour(self):
+        self.market('1002', 10, asks=[100, 110], bids=[90])
+        self.now += timedelta(minutes=3)
+        self.market('1002', 20, asks=[104, 110], bids=[92])
+        self.capture(self.order(99, 50, 1))  # a selected single order is not a list
+        rows = self.store.db.execute("SELECT side,best,amount FROM book_stats ORDER BY side").fetchall()
+        self.assertEqual([tuple(r) for r in rows], [('buy', 92, 20), ('sell', 104, 40)])
+        self.now += timedelta(days=7)
+        bp = self.store.book_patterns('T7_RELIC', '1002')
+        local = (self.now - timedelta(days=7)).astimezone(ZoneInfo('Europe/Paris'))
+        self.assertEqual(bp['sell']['weekdays'], [{'key': local.weekday(), 'samples': 1, 'best': 104, 'amount': 40}])
+        self.assertEqual(bp['buy']['hourly'][0]['key'], local.hour)
+
+    def test_timing_compares_now_with_usual_pace_and_price(self):
+        for days in range(1, 15):
+            # Buckets starting at the current hour sell 10; two other hours sell 30 and 20.
+            end = self.now - timedelta(days=days) + timedelta(hours=1)
+            for back, amount in ((0, 10), (3, 30), (6, 20)):
+                self.save_history(end=end - timedelta(hours=back), amount=amount)
+        for week in (1, 2):
+            self.now -= timedelta(days=7 * week)
+            self.market('1002', 100 * week, bids=[100])
+            self.now += timedelta(days=7 * week)
+        self.market('1002', 999, bids=[120])
+        cache = {}
+        books = {'T7_RELIC': {'1002': {s: self.store.book('T7_RELIC', '1002', s) for s in ('buy', 'sell')}}}
+        t = self.store.timing(cache, 'T7_RELIC', '1002', books)
+        self.assertAlmostEqual(t['sales_hour'], 10 / 20)
+        self.assertAlmostEqual(t['bid_vs_usual'], 120 / ((100 + 100 + 120) / 3) - 1)
+        self.assertIsNone(t['ask_vs_usual'])
+
+    def test_picks_are_logged_and_stay_readable_after_prices_go_stale(self):
+        self.market('1002', 10, asks=[100])
+        self.market('3008', 20, bids=[130])
+        first = self.store.state()['now']
+        self.store.state()
+        self.now += timedelta(minutes=16)
+        state = self.store.state()
+        self.assertEqual(state['now'], [])
+        self.assertEqual(len(state['pick_history']), 1)
+        self.assertEqual(state['pick_history'][0]['picks'][0]['units'], first[0]['units'])
+        self.assertIn('timing', first[0])
 
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
