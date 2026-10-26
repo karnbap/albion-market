@@ -46,7 +46,7 @@ async function refresh(){
   const r=await fetch(`/api/state?item=${encodeURIComponent(selectedItem)}&city=${encodeURIComponent(selectedCity)}`);if(!r.ok)throw Error(r.status);
   const next=await r.json();token=next.token;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261026.2';
+  const legacy=next.build!=='20261026.3';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -135,6 +135,7 @@ function renderBoard(){
  const dest=r=>r.sell_city===r.buy_city?'같은 도시':esc(state.cities[r.sell_city]);
  updateHtml('city-board',board.map(c=>{
   const name=esc(state.cities[c.city]);
+  if(c.excluded)return `<article class="board-card excluded"><div class="board-head"><h3>${name}</h3><small>거래 분석 제외</small></div><p class="board-empty">설정에서 뺀 도시입니다. 시세는 시장 상세 탭에서 볼 수 있습니다.</p></article>`;
   const routes=c.routes.map(r=>{const alt=r.alternative;return `<li><div class="board-line"><b>${esc(state.items[r.item])}</b>${gain(r)}</div><div class="board-sub">${n(r.buy_price)} → ${dest(r)} ${n(r.sell_price)}</div><div class="board-sub">${esc(shortGuide(guideFor(r.item,r.sell_city)))}</div><div class="board-mode"><span class="pill ${r.mode==='best'?'':'instant-badge'}">${esc(r.status)}</span>${alt?`<span class="board-alt">${esc(alt.status)}${alt.sell_city===r.sell_city?'':' · '+dest(alt)}: +${n(alt.net_per_unit)} · ${n(alt.roi*100,1)}%</span>`:''}</div>${r.warnings.length?`<div class="board-warn">${r.warnings.map(esc).join(' · ')}</div>`:''}</li>`}).join('');
   const best=(rows,label)=>rows.map(r=>`<li><div class="board-line"><b>${esc(state.items[r.item])}</b><span>${n(r.price)} <small>${n(r.amount)}개</small></span></div><div class="board-sub">${n(r.compared)}개 도시 중 ${label}${r.lead?` · 다음 도시와 ${n(r.lead)} 차이`:' · 동률'}</div></li>`).join('');
   const sell=best(c.sell_here,'최고 매수'),buy=best(c.buy_here,'최저 매도'),b=c.buyout;
@@ -194,8 +195,8 @@ function renderBars(id,rows,label){
  const max=Math.max(1,...rows.map(x=>x.per_observed_hour??0));
  updateHtml(id,rows.map(r=>r.observed_hours?`<div class="bar-row"><span>${esc(label(r.key))}</span><div class="bar-track"><div class="bar-fill" style="width:${(r.per_observed_hour??0)/max*100}%"></div></div><small><b>${n(r.total)}개</b>${r.observed_hours}시간 관측 · 시간당 ${n(r.per_observed_hour,1)}</small></div>`:`<div class="bar-row missing"><span>${esc(label(r.key))}</span><div class="bar-track"></div><small>관측 없음</small></div>`).join(''));
 }
-function fillSettings(){const f=$('settings');for(const [k,v]of Object.entries(state.settings)){if(!f.elements[k])continue;if(typeof v==='boolean')f.elements[k].checked=v;else f.elements[k].value=percentKeys.includes(k)?Math.round(v*10000)/100:v}if(draft){for(const [k,v]of Object.entries(draft)){const el=f.elements[k];if(el){if(el.type==='checkbox')el.checked=v;else el.value=v}}$('saved').textContent='이전 입력을 복원했습니다.'}}
-function readDraft(){const f=$('settings'),value={};for(const key of [...percentKeys,...numberKeys,...boolKeys]){const el=f.elements[key];value[key]=el.type==='checkbox'?el.checked:el.value}return value}
+function fillSettings(){const f=$('settings');if(!$('excluded-cities').children.length)$('excluded-cities').innerHTML=Object.entries(state.cities).map(([id,name])=>`<label class="check"><input type="checkbox" name="excluded_city" value="${esc(id)}">${esc(name)}</label>`).join('');const excluded=draft?.excluded_cities||state.settings.excluded_cities||[];for(const box of $('excluded-cities').querySelectorAll('input'))box.checked=excluded.includes(box.value);for(const [k,v]of Object.entries(state.settings)){if(!f.elements[k])continue;if(typeof v==='boolean')f.elements[k].checked=v;else f.elements[k].value=percentKeys.includes(k)?Math.round(v*10000)/100:v}if(draft){for(const [k,v]of Object.entries(draft)){const el=f.elements[k];if(el&&k!=='excluded_cities'){if(el.type==='checkbox')el.checked=v;else el.value=v}}$('saved').textContent='이전 입력을 복원했습니다.'}}
+function readDraft(){const f=$('settings'),value={};for(const key of [...percentKeys,...numberKeys,...boolKeys]){const el=f.elements[key];value[key]=el.type==='checkbox'?el.checked:el.value}value.excluded_cities=[...$('excluded-cities').querySelectorAll('input:checked')].map(box=>box.value);return value}
 function queueDraft(){formVersion++;draft=readDraft();storage.set('settingsDraft',draft);$('saved').textContent='입력 보관됨 · 자동 저장 대기';scheduleSave()}
 function scheduleSave(){clearTimeout(saveTimer);saveTimer=setTimeout(saveSettings,700)}
 async function post(path,value){
@@ -207,7 +208,7 @@ async function saveSettings(){
  if(!ready||!$('upgrade').hidden)return;if(saving){saveQueued=true;return}
  const f=$('settings'),values=readDraft();
  if(!f.checkValidity()||[...percentKeys,...numberKeys].some(k=>values[k]===''||!Number.isFinite(Number(values[k])))){$('saved').textContent='입력은 보관 중 · 빈칸과 입력 범위를 확인해 주세요.';return}
- const payload={};for(const key of percentKeys)payload[key]=Number(values[key])/100;for(const key of numberKeys)payload[key]=Number(values[key]);for(const key of boolKeys)payload[key]=values[key];
+ const payload={};for(const key of percentKeys)payload[key]=Number(values[key])/100;for(const key of numberKeys)payload[key]=Number(values[key]);for(const key of boolKeys)payload[key]=values[key];payload.excluded_cities=values.excluded_cities;
  const revision=formVersion;saving=true;$('saved').textContent='자동 저장 중…';
  try{await post('/api/settings',payload);if(revision===formVersion){draft=null;storage.set('settingsDraft',null);$('saved').textContent='자동 저장 완료 · '+new Intl.DateTimeFormat('ko-KR',{timeZone:'Europe/Paris',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(new Date())}await refresh()}
  catch(e){$('saved').textContent='서버 저장 실패 · 입력은 이 브라우저에 보관됨: '+e.message}
