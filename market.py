@@ -33,8 +33,10 @@ WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quantity_min": 500,
                   "wall_multiple": 3.0, "depth_price_band": 0.20}
 # Silver one recommended trade may spend; keeps the top picks within a player's means.
-SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000}
-BUILD = "20261026.2"
+# Caerleon is left out of trading by default: every route there crosses full-loot red zones,
+# and its price gaps are mostly that risk priced in, which would always top the rankings.
+SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005"]}
+BUILD = "20261026.3"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -258,6 +260,10 @@ class Store:
                 if not math.isfinite(value) or not value.is_integer() or value < 1 or value > 10**9:
                     raise ValueError(key + " must be a positive integer")
                 cfg[key] = int(value)
+            excluded = cfg["excluded_cities"]
+            if not isinstance(excluded, list) or any(c not in CITIES for c in excluded) or len(set(excluded)) >= len(CITIES):
+                raise ValueError("excluded_cities must list known cities and leave at least one")
+            cfg["excluded_cities"] = sorted(set(excluded), key=list(CITIES).index)
             budget = float(cfg["trade_budget"])
             if not math.isfinite(budget) or not budget.is_integer() or not 1 <= budget <= 10**12:
                 raise ValueError("trade_budget must be a positive integer")
@@ -690,11 +696,15 @@ class Store:
         cache = {} if cache is None else cache
         for item in cfg["items"]:
             rows = []
-            for source in CITIES:
-                for dest in CITIES:
+            for source in self.trade_cities():
+                for dest in self.trade_cities():
                     rows.extend(self.route_scenarios(item, source, dest, books[item], cache))
             out.extend(sorted(rows, key=lambda r: (r["mode"] == "depth", -r["roi"])))
         return out
+
+    def trade_cities(self):
+        """Cities trading analysis may buy in or sell to; the rest stay visible as prices only."""
+        return [c for c in CITIES if c not in self.cfg["excluded_cities"]]
 
     def route_scenarios(self, item, source, dest, books, cache):
         cfg = self.cfg
@@ -784,9 +794,13 @@ class Store:
         quotes = {}
         for item in self.cfg["items"]:
             for side in ("buy", "sell"):
-                quotes[item, side] = {city: books[item][city][side]["fresh_levels"][0] for city in CITIES if books[item][city][side]["fresh"]}
+                quotes[item, side] = {city: books[item][city][side]["fresh_levels"][0] for city in self.trade_cities() if books[item][city][side]["fresh"]}
         board = []
         for city in CITIES:
+            if city not in self.trade_cities():
+                board.append({"city": city, "excluded": True, "routes": [], "sell_here": [], "buy_here": [], "missing": [],
+                              "fresh_items": 0, "newest_seen": None})
+                continue
             picks = {}
             for c in candidates:
                 if c["buy_city"] != city or c["mode"] == "depth":
@@ -847,7 +861,7 @@ class Store:
         keep = 1 - cfg["sales_tax"] - cfg["setup_fee"]
         out = []
         for item in cfg["items"]:
-            for city in CITIES:
+            for city in self.trade_cities():
                 book = books[item][city]["sell"]
                 levels = book["fresh_levels"]
                 if not book["fresh"] or len(levels) < 2:

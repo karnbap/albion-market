@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from market import Store, handler_class, parse_time, describe_depth, DEPTH_DEFAULTS, capture_status, CANDIDATES_PER_ITEM, volume_risk
+from market import Store, handler_class, parse_time, describe_depth, DEPTH_DEFAULTS, capture_status, CANDIDATES_PER_ITEM, volume_risk, CITIES
 
 ROOT = Path(__file__).resolve().parents[1]
 UTC = timezone.utc
@@ -442,11 +442,21 @@ class MarketTests(unittest.TestCase):
         picks = self.store.state()['now']
         self.assertEqual([(p['buy_city'], p['sell_city']) for p in picks], [('1002', '3008')])
 
-    def test_now_warns_on_red_zone_routes(self):
+    def test_caerleon_is_left_out_of_trading_unless_re_enabled(self):
         self.market('1002', 10, asks=[100])
-        self.market('3005', 20, bids=[130])
-        pick = self.store.state()['now'][0]
+        self.market('3005', 20, asks=[90, 160], bids=[130])
+        state = self.store.state()
+        self.assertEqual(state['now'], [])
+        self.assertFalse(any('3005' in (c['buy_city'], c['sell_city']) for c in state['candidates']))
+        self.assertEqual(state['buyouts'], [])
+        caerleon = next(c for c in state['city_board'] if c['city'] == '3005')
+        self.assertTrue(caerleon['excluded'])
+        self.assertEqual(next(c for c in state['city_board'] if c['city'] == '1002')['buy_here'], [])
+        self.store.save_config({'excluded_cities': []})
+        pick = next(p for p in self.store.state()['now'] if p['sell_city'] == '3005')
         self.assertIn('Caerleon 이동은 레드존 통과 · 운반 중 약탈 위험', pick['warnings'])
+        for bad in (['9999'], '3005', list(CITIES)):
+            with self.assertRaises(ValueError): self.store.save_config({'excluded_cities': bad})
 
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
