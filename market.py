@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import hashlib
 import io
@@ -37,7 +38,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261026.6"
+BUILD = "20261026.7"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -229,6 +230,9 @@ class Store:
         CREATE INDEX IF NOT EXISTS session_lookup ON sessions(item,city,side,id);
         CREATE INDEX IF NOT EXISTS history_lookup ON history(item,city,stamp);
         CREATE INDEX IF NOT EXISTS packet_topic_received ON packets(topic,received);
+        CREATE INDEX IF NOT EXISTS order_lookup ON orders(order_id,seen);
+        CREATE TABLE IF NOT EXISTS order_fills(item TEXT NOT NULL, city TEXT NOT NULL, side TEXT NOT NULL, order_id TEXT NOT NULL,
+          price REAL NOT NULL, amount INTEGER NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_events(id INTEGER PRIMARY KEY, received TEXT NOT NULL, kind TEXT,
           item TEXT, location TEXT, outcome TEXT NOT NULL, detail TEXT);
         CREATE TABLE IF NOT EXISTS private_topics(topic TEXT PRIMARY KEY, count INTEGER NOT NULL, last TEXT NOT NULL);
@@ -368,6 +372,12 @@ class Store:
                         encoded_ids = json.dumps(sorted(ids), separators=(",", ":"))
                         self.db.execute("INSERT INTO observed_pages VALUES(?,?,?) ON CONFLICT(session,ids) DO UPDATE SET seen=excluded.seen", (sid, encoded_ids, received))
                     for r, city, price, amount, expiry in group:
+                        # A known order showing fewer units than last time was partly filled:
+                        # direct evidence of who traded (sell order shrank = someone bought instantly).
+                        # A changed price is the owner editing the order, not a trade.
+                        prev = self.db.execute("SELECT amount,seen,price FROM orders WHERE order_id=? ORDER BY seen DESC LIMIT 1", (str(r["Id"]),)).fetchone()
+                        if prev and amount < prev["amount"] and prev["price"] == price:
+                            self.db.execute("INSERT INTO order_fills VALUES(?,?,?,?,?,?,?,?)", (*key, str(r["Id"]), price, prev["amount"] - amount, prev["seen"], received))
                         self.db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?) ON CONFLICT(session,order_id) DO UPDATE SET price=excluded.price,amount=excluded.amount,seen=excluded.seen,expires=excluded.expires", (sid, str(r["Id"]), price, amount, received, expiry))
                     if len(group) >= 2:
                         self.record_book_stats(key, sid, received)
@@ -412,6 +422,81 @@ class Store:
         best = (min if key[2] == "sell" else max)(r["price"] for r in rows)
         self.db.execute("INSERT OR REPLACE INTO book_stats VALUES(?,?,?,?,?,?,?)",
                         (*key, bucket, best, sum(r["amount"] for r in rows), len({r["price"] for r in rows})))
+
+    def market_study(self, item, city, cache):
+        """Inputs for choosing how to trade a market (weekday accumulate and weekend sell, or
+        steady small trades): weekday vs weekend price and pace from 28 days of history; the
+        share of sales that were instant buys, placing each history bucket's average price
+        between that bucket's recorded best bid and ask; partial fills seen on re-scans; and
+        how often the lowest ask was undercut while the market was being watched."""
+        cfg = self.cfg
+        zone = ZoneInfo(cfg["timezone"])
+        now = self.clock()
+        since = (now - timedelta(days=28)).isoformat()
+        if ("patterns", item, city) not in cache:
+            cache["patterns", item, city] = self.patterns(item, city)
+        split = {}
+        for r in cache["patterns", item, city]["weekdays"]:
+            if r["observed_hours"]:
+                g = split.setdefault("weekend" if r["key"] >= 5 else "weekday", [0, 0, 0.0])
+                g[0] += r["total"]; g[1] += r["observed_hours"]; g[2] += r["silver"]
+        days = {k: {"per_day": t / h * 24, "price": silver / t if t else None, "observed_hours": h} for k, (t, h, silver) in split.items()}
+        book = {"sell": ([], []), "buy": ([], [])}
+        by_part = {}
+        for r in self.db.execute("SELECT side,bucket,best FROM book_stats WHERE item=? AND city=? AND bucket>? ORDER BY bucket", (item, city, since)):
+            moment = parse_time(r["bucket"])
+            book[r["side"]][0].append(moment); book[r["side"]][1].append(r["best"])
+            by_part.setdefault((r["side"], "weekend" if moment.astimezone(zone).weekday() >= 5 else "weekday"), []).append(r["best"])
+        def mean_in(side, a, b):
+            times, values = book[side]
+            chunk = values[bisect.bisect_left(times, a):bisect.bisect_left(times, b)]
+            return sum(chunk) / len(chunk) if chunk else None
+        weighted = weight = matched = 0
+        for r in self.db.execute("SELECT hours,stamp,amount,silver FROM history WHERE item=? AND city=? AND stamp>? AND amount>0", (item, city, since)):
+            end = parse_time(r["stamp"]); start = end - timedelta(hours=r["hours"])
+            ask, bid = mean_in("sell", start, end), mean_in("buy", start, end)
+            if ask is None or bid is None or ask <= bid:
+                continue
+            share = min(1, max(0, (r["silver"] / r["amount"] - bid) / (ask - bid)))
+            weighted += share * r["amount"]; weight += r["amount"]; matched += 1
+        observed = cuts = 0
+        times, values = book["sell"]
+        for t0, b0, t1, b1 in zip(times, values, times[1:], values[1:]):
+            gap = (t1 - t0).total_seconds() / 3600
+            if gap <= 0.5:
+                observed += gap; cuts += b1 < b0
+        fills = dict(self.db.execute("SELECT side,SUM(amount) FROM order_fills WHERE item=? AND city=? AND after>? GROUP BY side", (item, city, since)).fetchall())
+        def avg(values):
+            return sum(values) / len(values) if values else None
+        # Strategy A, roughly: buy order just above the usual weekday bid, sell order just under the
+        # usual weekend ask. Falls back to average traded prices when no quotes were recorded.
+        bid_weekday, ask_weekend = avg(by_part.get(("buy", "weekday"), [])), avg(by_part.get(("sell", "weekend"), []))
+        if bid_weekday is not None and ask_weekend is not None:
+            buy, sell, basis = bid_weekday + 1, ask_weekend - 1, "호가 기록"
+        elif "weekday" in days and "weekend" in days and days["weekday"]["price"] and days["weekend"]["price"]:
+            buy, sell, basis = days["weekday"]["price"], days["weekend"]["price"], "평균 체결가"
+        else:
+            buy = sell = basis = None
+        plan_a = None
+        if buy:
+            cost = buy * (1 + cfg["setup_fee"])
+            margin = sell * (1 - cfg["sales_tax"] - cfg["setup_fee"]) - cost
+            plan_a = {"buy": buy, "sell": sell, "margin": margin, "roi": margin / cost, "basis": basis}
+        price_gap = (days["weekend"]["price"] / days["weekday"]["price"] - 1
+                     if days.get("weekday", {}).get("price") and days.get("weekend", {}).get("price") else None)
+        return {"item": item, "city": city, "weekday": days.get("weekday"), "weekend": days.get("weekend"), "price_gap": price_gap,
+                "instant_buy_share": weighted / weight if matched >= 3 else None, "share_samples": matched,
+                "fills_sell": fills.get("sell", 0), "fills_buy": fills.get("buy", 0),
+                "undercut_hours": observed / cuts if cuts else None, "watched_hours": observed, "undercuts": cuts, "plan_a": plan_a}
+
+    def market_studies(self, cache):
+        # Heavy per market and slow-moving; rebuilt once a minute or when new data arrives.
+        last = self.db.execute("SELECT MAX(id) FROM packets").fetchone()[0]
+        key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(self.cfg["excluded_cities"]), self.cfg["sales_tax"], self.cfg["setup_fee"])
+        if getattr(self, "_study_key", None) != key:
+            self._studies = [self.market_study(i, c, cache) for i in self.cfg["items"] for c in self.trade_cities()]
+            self._study_key = key
+        return self._studies
 
     def book_patterns(self, item, city):
         """Average best price and visible quantity per weekday and hour (configured time zone)
@@ -1194,7 +1279,7 @@ class Store:
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(),
-                "book_patterns": self.book_patterns(item, city), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}

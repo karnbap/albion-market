@@ -56,7 +56,7 @@ async function refresh(){
   const r=await fetch(`/api/state?item=${encodeURIComponent(selectedItem)}&city=${encodeURIComponent(selectedCity)}`);if(!r.ok)throw Error(r.status);
   const next=await r.json();token=next.token;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261026.6';
+  const legacy=next.build!=='20261026.7';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -133,6 +133,12 @@ function renderBookPatterns(){
  updateHtml('book-weekdays',anything?table(['요일',...head.slice(1)],rows('weekdays',7,k=>WEEK[k],t.weekday),'book-weekdays'):empty('아직 쌓인 호가 기록이 없습니다. 이 시장을 여러 요일·시간에 열면 채워집니다.'));
  updateHtml('book-hours',anything?table(['시간',...head.slice(1)],rows('hourly',24,k=>String(k).padStart(2,'0')+'시',t.hour),'book-hours'):'');
 }
+function renderStudies(){
+ const rows=state.studies;
+ if(!rows){updateHtml('studies',empty('전략 연구를 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
+ const money=v=>v==null?'—':n(v,0);
+ updateHtml('studies',table(['품목 · 도시','평균 체결가 평일 → 주말','하루 판매량 평일 / 주말','즉시 구매 비율','체결 관찰 (28일)','최저가 깎임','평일 매수 주문 → 주말 매도 주문 (수수료 후)'],rows.map(r=>{const a=r.plan_a;return `<tr><td>${esc(state.items[r.item])}<br><small>${esc(state.cities[r.city])}</small></td><td>${money(r.weekday?.price)} → ${money(r.weekend?.price)}${r.price_gap==null?'':`<small class="${r.price_gap>0?'positive':'warn'}">${pct(r.price_gap)}</small>`}</td><td>${r.weekday?n(r.weekday.per_day)+'개':'—'} / ${r.weekend?n(r.weekend.per_day)+'개':'—'}</td><td>${r.instant_buy_share==null?'—':n(r.instant_buy_share*100)+'%'}<small>근거 ${n(r.share_samples)}구간</small></td><td><small>매도 주문 ${n(r.fills_sell)}개 팔림<br>매수 주문 ${n(r.fills_buy)}개 채워짐</small></td><td>${r.undercut_hours==null?'—':'평균 '+n(r.undercut_hours,1)+'시간마다'}<small>관찰 ${n(r.watched_hours,1)}시간 · ${n(r.undercuts)}번</small></td><td>${a?`<span class="${a.margin>0?'positive':'warn'}">${a.margin>0?'+':''}${n(a.margin)} · ${n(a.roi*100,1)}%</span><small>${n(a.buy)} → ${n(a.sell)} · ${esc(a.basis)} 기준</small>`:'—'}</td></tr>`}),'studies'));
+}
 function renderNow(){
  const picks=state.now;
  if(!picks){updateHtml('now-instant',empty('추천을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
@@ -195,7 +201,7 @@ function renderOverview(){
  updateHtml('all-items',items.map(item=>{const b=state.books[item][selectedCity];return `<article class="panel item-summary"><h3>${esc(state.items[item])}</h3><div class="extremes-pair">${extremeSummary(item,'buy')}${extremeSummary(item,'sell')}</div><div class="item-city-table"><table><thead><tr><th>도시</th><th>최고 매수</th><th>최저 매도</th></tr></thead><tbody>${Object.entries(state.cities).map(([city,name])=>{const pair=state.books[item][city];return `<tr><th scope="row">${esc(name)}</th>${['buy','sell'].map(side=>{const q=quote(pair[side]),best=state.city_extremes?.[item]?.[side]?.observations?.some(o=>o.city===city);return `<td class="quote-cell ${side} ${best?'best-'+side:''}">${n(q?.price)}<small>${n(q?.amount)}개</small><small class="quote-status">${pair[side].single_only?'미확인':q?.stale||pair[side].stale?'지난 자료':q?'유효 관측':'미조회'}</small></td>`}).join('')}</tr>`}).join('')}</tbody></table></div><h4 class="selected-city-label">${esc(state.cities[selectedCity])} 물량 상세</h4>${['buy','sell'].map(side=>{const book=b[side],d=book.fresh?book.analysis_depth:book.depth;return `<div class="item-side ${side}"><p>${quoteText(book,side)}</p><small>${d?.reference?.large?'대량 기준':'소량 제외 기준'} ${n(d?.reference?.price)} · ${n(d?.reference?.amount)}개</small><small>앞쪽 소량 ${n(d?.leading_small_levels)}호가 · ${n(d?.leading_small_amount)}개</small><div class="wall-list">${(d?.large_levels||[]).slice(0,3).map(r=>`<span class="pill ${r.wall?'wall-badge':''}">${r.wall?'벽':'대량'} ${n(r.price)} · ${n(r.amount)}개</span>`).join('')||'대량 관측 없음'}</div></div>`}).join('')}</article>`}).join(''));
 }
 function render(){
- renderNow();renderPickHistory();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderPersonal();renderMailDiagnosis();renderVolumeGuide();
+ renderNow();renderPickHistory();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderPersonal();renderMailDiagnosis();renderVolumeGuide();
  $('detail-context').textContent=state.cities[selectedCity]+' · '+state.items[selectedItem];
  const books=state.books[selectedItem];
  updateHtml('cities',Object.entries(state.cities).map(([id,name])=>{

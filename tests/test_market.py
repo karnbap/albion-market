@@ -540,6 +540,39 @@ class MarketTests(unittest.TestCase):
         pick = self.store.state()['now_groups']['wait'][0]
         self.assertTrue(any('수요가 적은 시간대' in w for w in pick['warnings']))
 
+    def test_shrinking_order_is_recorded_as_a_fill_but_repricing_is_not(self):
+        self.capture(self.order(1, 100, 10), self.order(2, 101, 10))
+        self.now += timedelta(minutes=5)
+        self.capture(self.order(1, 100, 6), self.order(2, 103, 4))
+        fills = [tuple(r) for r in self.store.db.execute("SELECT side,order_id,price,amount FROM order_fills")]
+        self.assertEqual(fills, [('sell', '1', 100, 4)])
+
+    def stat(self, side, when, best, city='1002'):
+        self.store.db.execute("INSERT OR REPLACE INTO book_stats VALUES(?,?,?,?,?,?,?)", ('T7_RELIC', city, side, when.isoformat(), best, 50, 3))
+
+    def test_market_study_estimates_instant_buy_share_undercuts_and_weekday_weekend_trade(self):
+        tuesday = datetime(2026, 10, 20, 9, tzinfo=UTC)
+        for h in range(3):
+            end = tuesday + timedelta(hours=h + 1)
+            self.save_history(end=end, amount=10, avg=105)  # bid 100, ask averages 109 within the hour
+            for minute in (0, 10, 20, 30, 40, 50):
+                at = end - timedelta(hours=1) + timedelta(minutes=minute)
+                self.stat('buy', at, 100)
+                self.stat('sell', at, 110 if minute < 30 else 108)
+        saturday = datetime(2026, 10, 24, 9, tzinfo=UTC)
+        self.stat('sell', saturday, 140)
+        self.save_history(end=saturday + timedelta(hours=1), amount=20, avg=150)
+        study = self.store.market_study('T7_RELIC', '1002', {})
+        self.assertAlmostEqual(study['instant_buy_share'], (105 - 100) / (109 - 100))
+        self.assertEqual(study['share_samples'], 3)
+        # 18 readings 10 minutes apart: watched 170 minutes, the ask dropped once inside each hour.
+        self.assertEqual(study['undercuts'], 3)
+        self.assertAlmostEqual(study['undercut_hours'], 170 / 60 / 3)
+        self.assertEqual((study['weekday']['price'], study['weekend']['price']), (105, 150))
+        a = study['plan_a']
+        self.assertEqual((a['buy'], a['sell'], a['basis']), (101, 139, '호가 기록'))
+        self.assertAlmostEqual(a['margin'], 139 * (1 - .08 - .025) - 101 * 1.025)
+
     def test_game_watch_heartbeat_marks_watcher_active(self):
         self.assertFalse(self.store.state()['game_watch']['active'])
         path = self.root/'data/game-watch-state.json'
