@@ -40,7 +40,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261027.6"
+BUILD = "20261027.7"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's

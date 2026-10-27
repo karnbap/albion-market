@@ -30,6 +30,7 @@ const outlookText=o=>`파는 곳 앞으로 6시간 예상 판매 ${n(o.next6)}�
 const hourRanges=hours=>{const out=[];for(const h of hours){const last=out[out.length-1];if(last&&(last[1]+1)%24===h)last[1]=h;else out.push([h,h])}return out.map(([a,b])=>a===b?`${String(a).padStart(2,'0')}시`:`${String(a).padStart(2,'0')}~${String(b).padStart(2,'0')}시`).join(', ')};
 const settingsWarnings=()=>[!state.settings.fees_confirmed&&'수수료 설정 미확인',!state.settings.transport_confirmed&&'운송비 설정 미확인'].filter(Boolean);
 const empty=text=>`<div class="empty">${esc(text)}</div>`;
+const editing=()=>!!document.activeElement?.closest('#my-order-form,#purchase-form,#bank-form')&&document.activeElement.matches('select,input');
 function table(headers,rows,key){return `<div class="table-wrap" data-scroll-key="${esc(key)}" tabindex="0" aria-label="${esc(key)} 표 스크롤"><table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`}
 function rememberView(){storage.set('view',{item:selectedItem,city:selectedCity,period:$('period').value,bookFilter:$('book-filter').value,scrollY:window.scrollY})}
 function updateHtml(id,html){
@@ -55,8 +56,11 @@ async function refresh(){
  try{
   const r=await fetch(`/api/state?item=${encodeURIComponent(selectedItem)}&city=${encodeURIComponent(selectedCity)}`);if(!r.ok)throw Error(r.status);
   const next=await r.json();token=next.token;
+  // While a hand-entry field is in use, neither reload nor redraw: either can close an open
+  // dropdown or reset a half-filled form. Leaving the field refreshes again.
+  if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261027.6';
+  const legacy=next.build!=='20261027.7';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -160,8 +164,10 @@ function renderMyOrders(){
  const auto=state.client_debug;
  $('my-auto-status').className=auto?.enabled||auto?.fork?'help':'warn';
  $('my-auto-status').textContent=!auto?'':auto.fork?(auto.last_direct?`자동 인식 켜짐 · 전용 수집기가 내 주문 목록을 직접 보냅니다 · 마지막으로 받은 때 ${ago(auto.last_direct)}`:'자동 인식 켜짐 · 전용 수집기 사용 중. 게임 시장 창에서 내 주문 탭(매도·매수)을 한 번 열어 주세요.'):auto.enabled?(auto.last_my_orders?`자동 인식 켜짐 · 마지막으로 게임의 내 주문 목록을 읽은 때 ${ago(auto.last_my_orders)}`:'자동 인식 켜짐 · 게임 시장 창에서 내 주문 탭을 한 번 열어 주세요.'):'자동 인식 꺼짐: 수집기가 디버그 기록 없이 켜져 있습니다. 최신 버전을 받은 뒤 게임을 끄고 10초 뒤 다시 켜면 켜집니다.';
- const sideName={sell:'매도',buy:'매수'};
- updateHtml('my-orders',rows.length?table(['품목 · 도시','종류','내 가격','처음 수량 → 남은 수량','팔림/채워짐','내 앞 물량','상태',''],rows.map(r=>`<tr><td>${esc(state.items[r.item])}${r.source==='auto'?' <span class="pill">자동</span>':''}<br><small>${esc(state.cities[r.city])}</small></td><td>${sideName[r.side]}</td><td>${n(r.price)}</td><td>${n(r.amount)} → <b>${n(r.remaining)}</b></td><td>${n(r.filled)}개</td><td>${r.order_id?n(r.ahead)+'개':'—'}<small>${r.best==null?'':(r.side==='sell'?'최저 매도 ':'최고 매수 ')+n(r.best)}</small></td><td>${!r.order_id?'<span class="warn">아직 연결 안 됨 · 게임에서 내 주문 탭이나 이 시장을 열어 주세요</span>':r.is_best?'<span class="positive">맨 앞</span>':'<span class="warn">더 좋은 가격 있음</span>'}<small>${r.seen?'마지막 확인 '+ago(r.seen):'등록 '+ago(r.created)}</small></td><td><button type="button" class="secondary small-button" data-close="${r.id}">정리</button></td></tr>`),'my-orders'):empty('등록한 내 매물이 없습니다. 위에서 게임에 올린 주문을 추가해 주세요.'));
+ const sideName={sell:'매도',buy:'매수'},view=storage.get('myOrdersView','all'),count=side=>rows.filter(r=>side==='all'||r.side===side).length;
+ for(const b of $('my-orders-view').querySelectorAll('button')){const on=b.dataset.side===view;b.classList.toggle('active',on);b.setAttribute('aria-pressed',String(on));b.textContent=`${b.dataset.side==='all'?'전체':sideName[b.dataset.side]} ${n(count(b.dataset.side))}`}
+ const shown=rows.filter(r=>view==='all'||r.side===view);
+ updateHtml('my-orders',!rows.length?empty('등록한 내 매물이 없습니다. 위에서 게임에 올린 주문을 추가해 주세요.'):!shown.length?empty(`${sideName[view]} 주문이 없습니다.`):table(['품목 · 도시','종류','내 가격','처음 수량 → 남은 수량','팔림/채워짐','내 앞 물량','상태',''],shown.map(r=>`<tr><td>${esc(state.items[r.item])}${r.source==='auto'?' <span class="pill">자동</span>':''}<br><small>${esc(state.cities[r.city])}</small></td><td>${sideName[r.side]}</td><td>${n(r.price)}</td><td>${n(r.amount)} → <b>${n(r.remaining)}</b></td><td>${n(r.filled)}개</td><td>${r.order_id?n(r.ahead)+'개':'—'}<small>${r.best==null?'':(r.side==='sell'?'최저 매도 ':'최고 매수 ')+n(r.best)}</small></td><td>${!r.order_id?'<span class="warn">아직 연결 안 됨 · 게임에서 내 주문 탭이나 이 시장을 열어 주세요</span>':r.is_best?'<span class="positive">맨 앞</span>':'<span class="warn">더 좋은 가격 있음</span>'}<small>${r.seen?'마지막 확인 '+ago(r.seen):'등록 '+ago(r.created)}</small></td><td><button type="button" class="secondary small-button" data-close="${r.id}">정리</button></td></tr>`),'my-orders'));
 }
 function renderStale(){
  const rows=state.stale_listings;
@@ -336,6 +342,7 @@ $('city-board').onclick=e=>{const button=e.target.closest('[data-city]');if(butt
 $('cities').onclick=e=>{const card=e.target.closest('[data-city]');if(card){$('city').value=card.dataset.city;chooseView()}};
 $('candidate-filter').value=['all','instant','wait'].includes(storage.get('candidateFilter','all'))?storage.get('candidateFilter','all'):'all';
 $('my-order-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/my-orders',{item:f.item.value,city:f.city.value,side:f.side.value,price:Number(f.price.value),amount:Number(f.amount.value)});f.price.value='';f.amount.value='';$('my-order-status').textContent='추가했습니다. 게임에서 그 시장을 열면 자동으로 연결됩니다.';await refresh()}catch(err){$('my-order-status').textContent='추가 실패: '+err.message}};
+$('my-orders-view').onclick=e=>{const b=e.target.closest('[data-side]');if(!b)return;storage.set('myOrdersView',b.dataset.side);if(state)preserveViewport(renderMyOrders)};
 $('my-orders').onclick=async e=>{const b=e.target.closest('[data-close]');if(!b)return;try{await post('/api/my-orders',{action:'close',id:Number(b.dataset.close)});await refresh()}catch(err){$('my-order-status').textContent='정리 실패: '+err.message}};
 $('bank-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/bank',{item:f.item.value,city:f.city.value,amount:Number(f.amount.value)});f.amount.value='';$('bank-status').textContent='은행 수량을 저장했습니다.';await refresh()}catch(err){$('bank-status').textContent='저장 실패: '+err.message}};
 $('purchase-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/purchases',{item:f.item.value,city:f.city.value,kind:f.kind.value,price:Number(f.price.value),amount:Number(f.amount.value),bought:f.bought.value||null});f.price.value='';f.amount.value='';f.bought.value='';$('purchase-status').textContent='매수 기록을 추가했습니다.';await refresh()}catch(err){$('purchase-status').textContent='추가 실패: '+err.message}};
@@ -351,3 +358,4 @@ $('reset').onclick=async()=>{try{await post('/api/reset',{item:selectedItem,city
 // A hidden tab does not poll; the server rebuilds every market on each request.
 refresh();setInterval(()=>{if(document.hidden)return;refresh();if(draft&&!saving)scheduleSave()},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});
+document.addEventListener('focusout',()=>setTimeout(()=>{if(ready&&!editing())refresh()},0));
