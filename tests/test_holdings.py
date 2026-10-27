@@ -57,6 +57,20 @@ class HoldingsTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 self.store.set_bank({"item": "T7_RELIC", "city": "4002", "amount": 1, **bad})
 
+    def test_value_if_sold_now_to_the_best_buy_order(self):
+        self.store.ingest("marketorders.ingest", {"Orders": [dict(self.order(11, 120, 4), AuctionType="request"),
+                                                             dict(self.order(12, 110, 9), AuctionType="request")]})
+        self.store.add_purchase({"item": "T7_RELIC", "city": "4002", "kind": "instant", "price": 100, "amount": 10})
+        self.store.set_bank({"item": "T7_RELIC", "city": "4002", "amount": 10})
+        self.store.set_bank({"item": "T8_SOUL", "city": "4002", "amount": 2})    # nobody buying souls there
+        rows = {r["item"]: r for r in self.holdings()["rows"]}
+        relic, net = rows["T7_RELIC"], 120 * (1 - self.store.cfg["sales_tax"])
+        self.assertEqual((relic["sell_now"], relic["sell_now_amount"]), (120, 4))
+        self.assertAlmostEqual(relic["net_now"], net)
+        self.assertAlmostEqual(relic["value_now"], 10 * net)
+        self.assertAlmostEqual(relic["profit_now"], 10 * (net - relic["cost"]))
+        self.assertEqual((rows["T8_SOUL"]["sell_now"], rows["T8_SOUL"]["value_now"], rows["T8_SOUL"]["profit_now"]), (None, None, None))
+
     def test_finished_tab_counts_what_i_bought_and_have_not_collected(self):
         me, them = "00000000-0000-0000-0000-00000000000a", "00000000-0000-0000-0000-00000000000b"
         bought = {"Id": 5, "Amount": 2, "IsFinished": True, "AuctionType": "request", "HasBuyerFetched": False, "HasSellerFetched": True,

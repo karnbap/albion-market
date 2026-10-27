@@ -44,7 +44,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261027.11"
+BUILD = "20261027.12"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Average purchase prices are shown for this many recent days next to all-time ones.
@@ -52,6 +52,13 @@ PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
 # rule); waiting is advised when the queue ahead should clear within SOON_DAYS.
 STALE_DAYS, SOON_DAYS = 3, 3
+# Portfolio advice (the user's routine): collect with buy orders Mon-Thu, sell Fri-Sun. One item
+# gets at most MAX_SHARE of the invested silver, and no more than it takes to sell MARKET_SHARE of
+# its sell city's sell-day sales over those days. Weights are return over price swing.
+BUY_DAYS, SELL_DAYS = (0, 1, 2, 3), (4, 5, 6)
+PORTFOLIO_MAX_SHARE, PORTFOLIO_MARKET_SHARE, PORTFOLIO_SWING_FLOOR = 0.5, 0.05, 0.02
+# My own sales outweigh the market estimate once this many units were sold in 28 days.
+PORTFOLIO_OWN_UNITS = 100
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -586,6 +593,138 @@ class Store:
             self._study_key = key
         return self._studies
 
+    def portfolio_quote(self, item, city, side, books, days, since):
+        """Typical best bid (side buy) or ask (side sell) in a market on that side's days: the
+        recorded bests on those days, else the recorded bests of any day, else the latest book,
+        each scaled by the city's average traded price on those days over all days; else that
+        average traded price."""
+        zone = ZoneInfo(self.cfg["timezone"])
+        keys = BUY_DAYS if side == "buy" else SELL_DAYS
+        rows = [(parse_time(r["bucket"]).astimezone(zone).weekday(), r["best"]) for r in self.db.execute(
+            "SELECT bucket,best FROM book_stats WHERE item=? AND city=? AND side=? AND bucket>?", (item, city, side, since))]
+        on_days = [best for day, best in rows if day in keys]
+        if len(on_days) >= 3:
+            return sum(on_days) / len(on_days), "호가 기록"
+        scale = days[side]["price"] / days["all"]["price"]
+        if len(rows) >= 3:
+            return sum(best for _, best in rows) / len(rows) * scale, "호가 기록 · 요일 보정"
+        book = books[item][city][side]
+        if book["levels"] and not book["single_only"]:
+            return book["levels"][0]["price"] * scale, "마지막 호가 · 요일 보정"
+        return days[side]["price"], "평균 체결가"
+
+    def portfolio_inputs(self, cache, books):
+        """Per item, the weekday-buy weekend-sell plan behind the portfolio advice, from the last
+        28 days in the trading cities. Buy city: the cheapest average traded price on buy days;
+        sell city: the dearest on sell days; each among cities selling at least a third of the
+        busiest city's pace on those days. Prices from portfolio_quote (buy order at the bid, sell
+        order at the ask). Swing: spread of the sell city's daily average prices over their median."""
+        last = self.db.execute("SELECT MAX(id) FROM packets").fetchone()[0]
+        key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(self.cfg["excluded_cities"]),
+               self.cfg["sales_tax"], self.cfg["setup_fee"], self.cfg["transport_per_unit"])
+        if getattr(self, "_portfolio_key", None) == key:
+            return self._portfolio_inputs
+        zone = ZoneInfo(self.cfg["timezone"])
+        since = (self.clock() - timedelta(days=28)).isoformat()
+        out = {}
+        for item in self.cfg["items"]:
+            days = {}
+            for city in self.trade_cities():
+                p = cache.setdefault(("patterns", item, city), self.patterns(item, city))
+                g = {}
+                for name, keys in (("buy", BUY_DAYS), ("sell", SELL_DAYS), ("all", range(7))):
+                    seen = [r for r in p["weekdays"] if r["key"] in keys and r["observed_hours"] and r["total"]]
+                    total, hours, silver = (sum(r[k] for r in seen) for k in ("total", "observed_hours", "silver"))
+                    g[name] = {"per_day": total / hours * 24, "price": silver / total} if total else None
+                priced = [r for r in p["weekdays"] if r["average_price"]]
+                g["cheapest_day"] = min(priced, key=lambda r: r["average_price"])["key"] if priced else None
+                g["dearest_day"] = max(priced, key=lambda r: r["average_price"])["key"] if priced else None
+                days[city] = g
+            def pick(side, better):
+                pool = {c: g[side] for c, g in days.items() if g[side]}
+                if not pool:
+                    return None
+                busiest = max(x["per_day"] for x in pool.values())
+                return better((c for c, x in pool.items() if x["per_day"] >= busiest / 3), key=lambda c: pool[c]["price"])
+            buy_city, sell_city = pick("buy", min), pick("sell", max)
+            if not buy_city or not sell_city:
+                out[item] = None
+                continue
+            buy, buy_basis = self.portfolio_quote(item, buy_city, "buy", books, days[buy_city], since)
+            sell, sell_basis = self.portfolio_quote(item, sell_city, "sell", books, days[sell_city], since)
+            daily = defaultdict(lambda: [0, 0])
+            for r in self.history_rows(item, sell_city, 28):
+                d = daily[parse_time(r["start"]).astimezone(zone).date()]
+                d[0] += r["amount"]; d[1] += r["silver"]
+            prices = [silver / amount for amount, silver in daily.values() if amount]
+            # Robust spread (1.4826 x median absolute deviation): a one-day spike or a bad print
+            # does not make a steady market look jumpy.
+            mid = median(prices) if len(prices) >= 7 else None
+            swing = 1.4826 * median(abs(x - mid) for x in prices) / mid if mid else None
+            cost = buy * (1 + self.cfg["setup_fee"]) + (self.cfg["transport_per_unit"] if buy_city != sell_city else 0)
+            net = sell * (1 - self.cfg["sales_tax"] - self.cfg["setup_fee"])
+            out[item] = {"buy_city": buy_city, "sell_city": sell_city, "buy": buy, "sell": sell, "buy_basis": buy_basis, "sell_basis": sell_basis,
+                         "cost": cost, "net": net, "margin": net - cost, "roi": net / cost - 1,
+                         "buy_per_day": days[buy_city]["buy"]["per_day"], "sell_per_day": days[sell_city]["sell"]["per_day"],
+                         "cheapest_day": days[buy_city]["cheapest_day"], "dearest_day": days[sell_city]["dearest_day"],
+                         "swing": swing, "swing_days": len(prices)}
+        self._portfolio_key, self._portfolio_inputs = key, out
+        return out
+
+    def portfolio(self, cache, books, capital, purchases):
+        """Target share of the invested silver (capital total) per item. Return: my own sales in
+        the last 28 days (sale mails) over the average purchase cost once PORTFOLIO_OWN_UNITS were
+        sold, else the market plan. Weight: return over swing (a steady 10% beats a jumpy 20%),
+        only for items that make money; capped at
+        PORTFOLIO_MAX_SHARE and at what selling PORTFOLIO_MARKET_SHARE of the sell city's sell-day
+        sales would move; what no item can take stays as silver. Beside it, the share held now
+        (units at cost plus open buy orders)."""
+        inputs, total = self.portfolio_inputs(cache, books), capital["total"]
+        since = (self.clock() - timedelta(days=28)).isoformat()
+        sold = {r["item"]: r for r in self.db.execute(
+            "SELECT item,SUM(amount) AS units,SUM(price*amount) AS silver FROM personal_sales WHERE conflict=0 AND COALESCE(mailed,first_seen)>? GROUP BY item", (since,))}
+        costs = {s["item"]: s["all"]["cost_average"] for s in purchases["summary"]}
+        mine, returns = {}, {}
+        for item in self.cfg["items"]:
+            if item in sold and sold[item]["units"]:
+                price, cost = sold[item]["silver"] / sold[item]["units"], costs.get(item)
+                mine[item] = {"units": sold[item]["units"], "price": price,
+                              "roi": price * (1 - self.cfg["sales_tax"] - self.cfg["setup_fee"]) / cost - 1 if cost else None}
+            own = mine.get(item)
+            if own and own["roi"] is not None and own["units"] >= PORTFOLIO_OWN_UNITS:
+                returns[item] = (own["roi"], "mine")
+            elif inputs.get(item):
+                returns[item] = (inputs[item]["roi"], "market")
+        plans = {item: inputs[item] for item, (roi, _) in returns.items() if roi > 0 and inputs.get(item)}
+        known = [x["swing"] for x in plans.values() if x["swing"] is not None]
+        fallback = max(known, default=0.1)  # no swing measured yet: assume the jumpiest seen
+        raw = {item: returns[item][0] / max(x["swing"] if x["swing"] is not None else fallback, PORTFOLIO_SWING_FLOOR) for item, x in plans.items()}
+        caps = {item: min(PORTFOLIO_MAX_SHARE, PORTFOLIO_MARKET_SHARE * x["sell_per_day"] * len(SELL_DAYS) * x["cost"] / total) if total else PORTFOLIO_MAX_SHARE
+                for item, x in plans.items()}
+        weights, left, free = {}, 1.0, dict(raw)
+        while free:
+            scale = left / sum(free.values())
+            over = [item for item, r in free.items() if r * scale >= caps[item]]
+            if not over:
+                weights.update((item, r * scale) for item, r in free.items())
+                left = 0.0
+                break
+            for item in over:
+                weights[item] = caps[item]
+                left -= caps[item]
+                free.pop(item)
+        rows = []
+        for item in self.cfg["items"]:
+            held = capital["items"].get(item)
+            now = held["value"] + held["orders_silver"] if held else 0.0
+            target = weights.get(item, 0.0)
+            roi, basis = returns.get(item, (None, None))
+            rows.append({"item": item, "plan": inputs.get(item), "roi": roi, "roi_basis": basis, "target": target, "capped": item in caps and target >= caps[item] - 1e-9,
+                         "cap": caps.get(item), "current": now / total if total else None, "current_silver": now,
+                         "target_silver": target * total if total else None, "gap_silver": target * total - now if total else None, "mine": mine.get(item)})
+        return {"rows": rows, "cash": max(0.0, left), "total": total, "buy_days": BUY_DAYS, "sell_days": SELL_DAYS,
+                "max_share": PORTFOLIO_MAX_SHARE, "market_share": PORTFOLIO_MARKET_SHARE, "own_units": PORTFOLIO_OWN_UNITS, "cities": self.trade_cities()}
+
     def book_patterns(self, item, city):
         """Average best price and visible quantity per weekday and hour (configured time zone)
         over the last 28 days of order-book observations."""
@@ -955,7 +1094,7 @@ class Store:
             else:
                 self.db.execute("DELETE FROM bank_stock WHERE item=? AND city=?", (item, city))
 
-    def holdings(self, open_orders, purchases):
+    def holdings(self, open_orders, purchases, books=None):
         """Units of tracked items the player holds per city: listed (units left on own sell
         orders), the bank (entered by hand) and the finished-trades tab (bought, not yet
         collected), valued at the average cost from purchases. A finished-trades entry counts
@@ -1010,7 +1149,21 @@ class Store:
             total, cost = cell["listed"] + cell["bank"] + cell["finished"] + cell["carried"], costs.get(item)
             if not total and cell["bank_source"] != "manual":
                 continue
-            rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost, "value": total * cost if cost is not None else None})
+            # 지금 이 도시에서 팔면 받는 돈: 매수 요청서에 즉시 판매(최고 매수가)에서 판매세를 뺀 값.
+            # 체결을 보장하지는 않습니다 — 그 가격의 잔량(sell_now_amount)도 같이 보냅니다.
+            sell_now = sell_now_amount = None
+            book = (books or {}).get(item, {}).get(city, {}).get("buy") if books else None
+            if book and not book.get("single_only"):
+                levels = book["fresh_levels"] if book.get("fresh") else book.get("levels") or []
+                if levels:
+                    sell_now, sell_now_amount = levels[0]["price"], levels[0]["amount"]
+            net = sell_now * (1 - self.cfg["sales_tax"]) if sell_now is not None else None
+            rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost,
+                         "value": total * cost if cost is not None else None,
+                         "sell_now": sell_now, "sell_now_amount": sell_now_amount,
+                         "net_now": net,
+                         "value_now": total * net if net is not None else None,
+                         "profit_now": total * (net - cost) if net is not None and cost is not None else None})
         return {"rows": rows, "finished": finished, "unmapped_banks": unmapped}
 
     def ingest_holdings(self, payload):
@@ -1960,7 +2113,7 @@ class Store:
             buyouts = self.buyouts(books, cache)
             for card in board:
                 card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
-            holdings = self.holdings(mine_rows, purchases)
+            holdings = self.holdings(mine_rows, purchases, books)
             capital = self.capital(cache, mine_rows, holdings)
             cache["inventory"] = capital["items"]
             now_groups = self.recommendations(books, every, buyouts, cache)
@@ -1997,7 +2150,7 @@ class Store:
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "past_candidates": past_candidates, "past_buyouts": past_buyouts, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
-                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": holdings, "capital": capital, "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": holdings, "capital": capital, "portfolio": self.portfolio(cache, books, capital, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
