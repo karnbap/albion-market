@@ -47,6 +47,10 @@ STOCKING_KINDS = ("instant_list", "best", "buyout")
 BUILD = "20261027.12"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
+# Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
+# 4002 <-> 4001). A bank can also be entered from a travel hub (4000), which names no city; other
+# banks are learned when entered from the city, or picked on the page.
+BANK_CITIES = {"0006": "7", "4001": "4002"}
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
@@ -59,6 +63,9 @@ BUY_DAYS, SELL_DAYS = (0, 1, 2, 3), (4, 5, 6)
 PORTFOLIO_MAX_SHARE, PORTFOLIO_MARKET_SHARE, PORTFOLIO_SWING_FLOOR = 0.5, 0.05, 0.02
 # My own sales outweigh the market estimate once this many units were sold in 28 days.
 PORTFOLIO_OWN_UNITS = 100
+# An hour of day is compared once it has this many days of hourly history; a gap under
+# PORTFOLIO_HOUR_GAP from the day's average is called no clear pattern.
+PORTFOLIO_HOUR_DAYS, PORTFOLIO_HOUR_GAP = 3, 0.03
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -613,6 +620,26 @@ class Store:
             return book["levels"][0]["price"] * scale, "마지막 호가 · 요일 보정"
         return days[side]["price"], "평균 체결가"
 
+    def portfolio_hours(self, cache, item, city, cheap):
+        """Hours of day (configured time zone) to buy (cheap) or sell in a market, from hourly
+        history: the three hours with the lowest (highest) average traded price among hours seen
+        on PORTFOLIO_HOUR_DAYS days or more; selling only counts hours at least as busy as the
+        median hour. Each hour's price is against the average over all hours."""
+        p = cache.setdefault(("patterns", item, city), self.patterns(item, city))
+        rows = [r for r in p["hourly"] if r["total"]]
+        days = median([r["observed_hours"] for r in rows]) if rows else 0
+        seen = [r for r in rows if r["observed_hours"] >= PORTFOLIO_HOUR_DAYS]
+        if len(seen) < 12:
+            return {"hours": [], "days": days, "enough": False, "clear": False}
+        average = sum(r["silver"] for r in rows) / sum(r["total"] for r in rows)
+        if not cheap:
+            busy = median([r["per_observed_hour"] for r in seen])
+            seen = [r for r in seen if r["per_observed_hour"] >= busy]
+        best = sorted(seen, key=lambda r: r["average_price"], reverse=not cheap)[:3]
+        hours = [{"hour": r["key"], "vs_average": r["average_price"] / average - 1, "per_hour": r["per_observed_hour"]} for r in best]
+        gap = sum(h["vs_average"] for h in hours) / len(hours)
+        return {"hours": hours, "days": days, "enough": True, "clear": abs(gap) >= PORTFOLIO_HOUR_GAP}
+
     def portfolio_inputs(self, cache, books):
         """Per item, the weekday-buy weekend-sell plan behind the portfolio advice, from the last
         28 days in the trading cities. Buy city: the cheapest average traded price on buy days;
@@ -667,7 +694,9 @@ class Store:
                          "cost": cost, "net": net, "margin": net - cost, "roi": net / cost - 1,
                          "buy_per_day": days[buy_city]["buy"]["per_day"], "sell_per_day": days[sell_city]["sell"]["per_day"],
                          "cheapest_day": days[buy_city]["cheapest_day"], "dearest_day": days[sell_city]["dearest_day"],
-                         "swing": swing, "swing_days": len(prices)}
+                         "swing": swing, "swing_days": len(prices),
+                         "buy_hours": self.portfolio_hours(cache, item, buy_city, True),
+                         "sell_hours": self.portfolio_hours(cache, item, sell_city, False)}
         self._portfolio_key, self._portfolio_inputs = key, out
         return out
 
@@ -713,13 +742,21 @@ class Store:
                 weights[item] = caps[item]
                 left -= caps[item]
                 free.pop(item)
+        # Units to buy this week: the silver still missing at the buy cost, spread over the buy
+        # days left (from Friday on, next week's).
+        today = self.clock().astimezone(ZoneInfo(self.cfg["timezone"])).weekday()
+        days_left = sum(1 for d in BUY_DAYS if d >= today) or len(BUY_DAYS)
         rows = []
         for item in self.cfg["items"]:
             held = capital["items"].get(item)
             now = held["value"] + held["orders_silver"] if held else 0.0
             target = weights.get(item, 0.0)
             roi, basis = returns.get(item, (None, None))
-            rows.append({"item": item, "plan": inputs.get(item), "roi": roi, "roi_basis": basis, "target": target, "capped": item in caps and target >= caps[item] - 1e-9,
+            plan = inputs.get(item)
+            units = math.floor(max(0.0, target * total - now) / plan["cost"]) if plan and target and total else 0
+            week = {"units": units, "per_day": math.ceil(units / days_left), "days_left": days_left, "next_week": today not in BUY_DAYS,
+                    "sellable": math.floor(PORTFOLIO_MARKET_SHARE * plan["sell_per_day"] * len(SELL_DAYS)) if plan else None}
+            rows.append({"week": week, "item": item, "plan": inputs.get(item), "roi": roi, "roi_basis": basis, "target": target, "capped": item in caps and target >= caps[item] - 1e-9,
                          "cap": caps.get(item), "current": now / total if total else None, "current_silver": now,
                          "target_silver": target * total if total else None, "gap_silver": target * total - now if total else None, "mine": mine.get(item)})
         return {"rows": rows, "cash": max(0.0, left), "total": total, "buy_days": BUY_DAYS, "sell_days": SELL_DAYS,
@@ -1094,6 +1131,17 @@ class Store:
             else:
                 self.db.execute("DELETE FROM bank_stock WHERE item=? AND city=?", (item, city))
 
+    def set_bank_city(self, values):
+        """The city of a bank cluster the fork read, picked on the page: remembered for later visits."""
+        place, city = str(values.get("location") or ""), values.get("city")
+        if city not in CITIES:
+            raise ValueError("Unknown city")
+        with self.lock, self.db:
+            if not self.db.execute("SELECT 1 FROM bank_auto WHERE location=?", (place,)).fetchone():
+                raise ValueError("Unknown bank")
+            self.db.execute("INSERT INTO bank_cities VALUES(?,?) ON CONFLICT(location) DO UPDATE SET city=excluded.city", (place, city))
+            self.db.execute("UPDATE bank_auto SET city=? WHERE location=?", (city, place))
+
     def holdings(self, open_orders, purchases, books=None):
         """Units of tracked items the player holds per city: listed (units left on own sell
         orders), the bank (entered by hand) and the finished-trades tab (bought, not yet
@@ -1109,13 +1157,15 @@ class Store:
         with self.lock:
             # A bank the fork read replaces what was typed in for that city: it lists every stack.
             auto, unmapped = defaultdict(dict), []
+            chosen = dict(self.db.execute("SELECT location,city FROM bank_cities").fetchall())
             for r in self.db.execute("SELECT location,city,items,seen FROM bank_auto ORDER BY seen"):
-                if r["city"] is None:
+                city = r["city"] or chosen.get(r["location"]) or BANK_CITIES.get(r["location"])
+                if city is None:
                     unmapped.append({"location": r["location"], "items": json.loads(r["items"]), "seen": r["seen"]})
                     continue
                 for item, amount in json.loads(r["items"]).items():
-                    auto[r["city"]][item] = auto[r["city"]].get(item, 0) + amount
-                auto[r["city"]][""] = r["seen"]  # newest bank read for the city (rows come oldest first)
+                    auto[city][item] = auto[city].get(item, 0) + amount
+                auto[city][""] = r["seen"]  # newest bank read for the city (rows come oldest first)
             for city, items in auto.items():
                 seen = items.pop("")
                 for item, amount in items.items():
@@ -1199,7 +1249,7 @@ class Store:
                 city = location(place)
                 if city not in CITIES:
                     learned = self.db.execute("SELECT city FROM bank_cities WHERE location=?", (place,)).fetchone()
-                    city = learned["city"] if learned else previous if previous in CITIES else None
+                    city = learned["city"] if learned else BANK_CITIES.get(place) or (previous if previous in CITIES else None)
                     if city and not learned:
                         self.db.execute("INSERT INTO bank_cities VALUES(?,?)", (place, city))
                 self.db.execute("INSERT INTO bank_auto VALUES(?,?,?,?) ON CONFLICT(location) DO UPDATE SET city=excluded.city,items=excluded.items,seen=excluded.seen",
@@ -2319,6 +2369,9 @@ def handler_class(store, token):
                             result = {"added": store.add_purchase(payload)}
                     elif path == "/api/bank":
                         store.set_bank(payload)
+                        result = {"saved": True}
+                    elif path == "/api/bank-city":
+                        store.set_bank_city(payload)
                         result = {"saved": True}
                     elif path == "/api/reset":
                         store.reset_book(payload["item"], payload["city"])

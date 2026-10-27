@@ -132,6 +132,28 @@ class HoldingsTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 self.store.ingest_holdings(bad)
 
+    def test_bank_entered_from_a_travel_hub_uses_known_or_picked_city(self):
+        # Entered from 4000 (a travel hub, no city): 4001 is a known Fort Sterling bank; 9001 is not.
+        self.store.ingest_holdings({"LocationId": "4001", "Inventory": {},
+                                    "Banks": [{"LocationId": "4001", "PreviousLocationId": "4000", "Items": {"2031": 6}},
+                                              {"LocationId": "9001", "PreviousLocationId": "9000", "Items": {"2038": 2}}]})
+        h = self.holdings()
+        self.assertEqual([(r["city"], r["item"], r["bank"]) for r in h["rows"]], [("4002", "T7_RELIC", 6)])
+        self.assertEqual([b["location"] for b in h["unmapped_banks"]], ["9001"])
+        self.store.set_bank_city({"location": "9001", "city": "3008"})
+        rows = {(r["city"], r["item"]): r["bank"] for r in self.holdings()["rows"]}
+        self.assertEqual(rows[("3008", "T8_SOUL")], 2)
+        self.assertEqual(self.holdings()["unmapped_banks"], [])
+        # Remembered for the next visit, even when entered from the hub again.
+        self.store.ingest_holdings({"LocationId": "9001", "Inventory": {}, "Banks": [{"LocationId": "9001", "PreviousLocationId": "9000", "Items": {"2038": 5}}]})
+        self.assertEqual({(r["city"], r["item"]): r["bank"] for r in self.holdings()["rows"]}[("3008", "T8_SOUL")], 5)
+        # A bank stored before its city was known is placed once the city is known.
+        self.store.db.execute("UPDATE bank_auto SET city=NULL WHERE location='4001'")
+        self.assertIn(("4002", "T7_RELIC"), {(r["city"], r["item"]) for r in self.holdings()["rows"]})
+        for bad in ({"location": "9001", "city": "9999"}, {"location": "1234", "city": "3008"}):
+            with self.assertRaises(ValueError, msg=bad):
+                self.store.set_bank_city(bad)
+
     def test_finished_lists_only_on_the_private_path_and_bank_needs_the_token(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class(self.store, "test-token"))
         threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from market import Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +87,36 @@ class PortfolioTests(unittest.TestCase):
         pf = self.store.portfolio({}, {}, capital, {"summary": []})
         self.assertEqual([round(r["target"], 9) for r in pf["rows"]], [.4, .4, .2, 0])
         self.assertAlmostEqual(pf["cash"], 0)
+
+    def test_units_to_buy_this_week(self):
+        self.store.portfolio_inputs = lambda cache, books: {
+            "T7_RELIC": {"roi": .10, "swing": .05, "sell_per_day": 1000, "cost": 100}, "T8_SOUL": None, "T8_RELIC": None, "T8_RUNE": None}
+        capital = {"total": 100000, "items": {"T7_RELIC": {"value": 2000, "orders_silver": 1000}}}
+        week = self.store.portfolio({}, {}, capital, {"summary": []})["rows"][0]["week"]
+        # Target 15% of 100,000 less 3,000 held, at 100 each, over Tuesday to Thursday.
+        self.assertEqual(week, {"units": 120, "per_day": 40, "days_left": 3, "next_week": False, "sellable": 150})
+        self.now = datetime(2026, 10, 30, 12, tzinfo=UTC)   # Friday: next week's four buy days
+        week = self.store.portfolio({}, {}, capital, {"summary": []})["rows"][0]["week"]
+        self.assertEqual((week["per_day"], week["days_left"], week["next_week"]), (30, 4, True))
+
+    def test_hours_to_buy_and_sell(self):
+        zone = ZoneInfo("Europe/Paris")
+        def day(date):
+            for hour in range(24):
+                start = datetime(2026, 10, date, hour, tzinfo=zone).astimezone(UTC)
+                price, amount = (90, 10) if hour in (3, 4, 5) else (110, 30) if hour in (17, 18, 19) else (100, 10)
+                end = start + timedelta(hours=1)
+                self.store.db.execute("INSERT INTO history VALUES(?,?,?,?,?,?,?)", ("T7_RELIC", "1002", 1, end.isoformat(), amount, amount * price, end.isoformat()))
+        day(20); day(21)
+        self.assertEqual(self.store.portfolio_hours({}, "T7_RELIC", "1002", True), {"hours": [], "days": 2, "enough": False, "clear": False})
+        day(22)
+        average = (18 * 10 * 100 + 3 * 10 * 90 + 3 * 30 * 110) / (21 * 10 + 3 * 30)
+        cheap = self.store.portfolio_hours({}, "T7_RELIC", "1002", True)
+        self.assertEqual([h["hour"] for h in cheap["hours"]], [3, 4, 5])
+        self.assertAlmostEqual(cheap["hours"][0]["vs_average"], 90 / average - 1)
+        self.assertTrue(cheap["enough"] and cheap["clear"])
+        dear = self.store.portfolio_hours({}, "T7_RELIC", "1002", False)
+        self.assertEqual([(h["hour"], h["per_hour"]) for h in dear["hours"]], [(17, 30), (18, 30), (19, 30)])
 
     def test_my_sales_replace_the_market_return_once_there_are_enough(self):
         self.store.portfolio_inputs = lambda cache, books: {
