@@ -659,10 +659,12 @@ class MarketTests(unittest.TestCase):
         self.hourly_profile(lambda t: 1)
         self.market('1002', 10, asks=[100, 101])
         self.market('3008', 20, asks=[200], bids=[130])
-        self.store.add_my_order({'item': 'T7_RELIC', 'city': '3008', 'side': 'sell', 'price': 250, 'amount': 10})
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '3008', 'side': 'sell', 'price': 250, 'amount': 6})
+        self.store.add_my_order({'item': 'T7_RELIC', 'city': '3008', 'side': 'sell', 'price': 280, 'amount': 4})
         pick = self.store.state()['now_groups']['wait'][0]
         self.assertEqual((pick['kind'], pick['units']), ('instant_list', 14))
-        self.assertTrue(any('내 기존 매도 주문 10개가 250에 남아 있음' in w and '뒤로 밀림' in w for w in pick['warnings']))
+        # Each price says how many of the 10 units sit there, not all 10 at the cheapest one.
+        self.assertTrue(any('내 기존 매도 주문 10개 남음(250에 6개 · 280에 4개)' in w and '뒤로 밀림' in w for w in pick['warnings']))
 
     def test_buyout_skips_my_own_listings(self):
         self.market('1002', 10, asks=[100, 150])  # two orders of 10 at each price

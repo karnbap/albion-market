@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261027.9';
+  const legacy=next.build!=='20261027.10';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';

@@ -44,7 +44,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261027.9"
+BUILD = "20261027.10"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
@@ -1814,7 +1814,12 @@ class Store:
                 left = sum(r["remaining"] for r in mine)
                 edge = min(r["price"] for r in mine) if side == "sell" else max(r["price"] for r in mine)
                 worse = price < edge if side == "sell" else price > edge
-                plan["warnings"].append(f"내 기존 {verb} 주문 {left:,}개가 {edge:,.0f}에 남아 있음 · 그만큼 수량을 줄였음"
+                # Units per price, best price first: one total with one price read as if every unit sat there.
+                at_price = defaultdict(int)
+                for r in mine:
+                    at_price[r["price"]] += r["remaining"]
+                spread = " · ".join(f"{p:,.0f}에 {n:,}개" for p, n in sorted(at_price.items(), reverse=side == "buy"))
+                plan["warnings"].append(f"내 기존 {verb} 주문 {left:,}개 남음({spread}) · 그만큼 수량을 줄였음"
                                         + (f" · {price:,.0f}에 새로 걸면 기존 주문이 뒤로 밀림" if worse else ""))
                 if worse:
                     plan["score"] *= 0.7
