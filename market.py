@@ -40,7 +40,9 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261027.1"
+BUILD = "20261027.2"
+# Average purchase prices are shown for this many recent days next to all-time ones.
+PURCHASE_WINDOW_DAYS = 30
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -278,6 +280,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS pick_log(id INTEGER PRIMARY KEY, created TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS observed_pages(session INTEGER NOT NULL REFERENCES sessions(id),
           ids TEXT NOT NULL, seen TEXT NOT NULL, PRIMARY KEY(session,ids));
+        CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY, item TEXT NOT NULL, city TEXT NOT NULL, kind TEXT NOT NULL,
+          price REAL NOT NULL, amount INTEGER NOT NULL, bought TEXT NOT NULL, created TEXT NOT NULL, removed TEXT);
         """)
         # mailed: when the game sent the mail (the fork reads it from the mailbox list).
         for table, name, kind in (("my_orders", "remaining", "INTEGER"), ("my_orders", "checked", "TEXT"),
@@ -622,6 +626,73 @@ class Store:
         with self.lock, self.db:
             if not self.db.execute("UPDATE my_orders SET closed=? WHERE id=? AND closed IS NULL", (self.clock().isoformat(), int(order))).rowcount:
                 raise ValueError("Unknown or already closed order")
+
+    def add_purchase(self, values):
+        """A purchase the capture client cannot see, entered by the player: an instant buy from a
+        sell order (kind instant, no fee) or buy-order units whose mail was never opened (kind
+        order, setup fee). bought is an ISO date or date-time, local to the settings' timezone
+        when it names none; now by default."""
+        item, city, kind = values.get("item"), values.get("city"), values.get("kind")
+        if item not in self.cfg["items"] or city not in CITIES or kind not in ("instant", "order"):
+            raise ValueError("Unknown item / city / kind")
+        price, amount = float(values.get("price")), values.get("amount")
+        if not math.isfinite(price) or price <= 0 or isinstance(amount, bool) or not isinstance(amount, int) or not 0 < amount <= 10**9:
+            raise ValueError("Price must be positive and amount a positive integer")
+        now = bought = self.clock()
+        if values.get("bought"):
+            bought = datetime.fromisoformat(str(values["bought"]))
+            bought = (bought.replace(tzinfo=ZoneInfo(self.cfg["timezone"])) if bought.tzinfo is None else bought).astimezone(UTC)
+            if bought > now + timedelta(minutes=5):
+                raise ValueError("Purchase time is in the future")
+        with self.lock, self.db:
+            return self.db.execute("INSERT INTO purchases(item,city,kind,price,amount,bought,created) VALUES(?,?,?,?,?,?,?)",
+                                   (item, city, kind, price, amount, bought.isoformat(), now.isoformat())).lastrowid
+
+    def remove_purchase(self, purchase):
+        with self.lock, self.db:
+            if not self.db.execute("UPDATE purchases SET removed=? WHERE id=? AND removed IS NULL", (self.clock().isoformat(), int(purchase))).rowcount:
+                raise ValueError("Unknown or already removed purchase")
+
+    def purchases(self, open_orders):
+        """What the player paid for tracked items: completed buy orders (the mail's total),
+        expired buy orders (units bought x the order price), units already filled on buy orders
+        still open (x the order price), and purchases entered by hand. Buy-order units carry the
+        setup fee in cost; instant buys do not. An open order counts until a buy mail of the same
+        market and price arrives after it was placed: that mail then covers the order (two open
+        orders at one price would both be taken as covered)."""
+        fee, rows = self.cfg["setup_fee"], []
+        with self.lock:
+            for r in self.db.execute("""SELECT kind,item,city,price,amount,silver,COALESCE(mailed,first_seen) AS at FROM personal_mails
+                    WHERE conflict=0 AND kind IN ('buy','buy_expired')"""):
+                if r["kind"] == "buy":
+                    rows.append({"source": "mail", "kind": "order", "item": r["item"], "city": r["city"], "amount": r["amount"],
+                                 "silver": r["silver"], "order_price": r["price"], "at": r["at"]})
+                elif r["amount"] and r["price"]:
+                    rows.append({"source": "expired_mail", "kind": "order", "item": r["item"], "city": r["city"], "amount": r["amount"],
+                                 "silver": r["price"] * r["amount"], "order_price": r["price"], "at": r["at"]})
+            for r in self.db.execute("SELECT id,item,city,kind,price,amount,bought FROM purchases WHERE removed IS NULL"):
+                rows.append({"source": "manual", "id": r["id"], "kind": r["kind"], "item": r["item"], "city": r["city"], "amount": r["amount"],
+                             "silver": r["price"] * r["amount"], "order_price": None, "at": r["bought"]})
+        mails = [(r["item"], r["city"], r["order_price"], parse_time(r["at"])) for r in rows if r["source"] != "manual"]
+        for o in open_orders:
+            if o["side"] != "buy" or o["filled"] <= 0:
+                continue
+            placed = parse_time(o["created"])
+            if any((item, city, price) == (o["item"], o["city"], o["price"]) and at >= placed for item, city, price, at in mails):
+                continue
+            rows.append({"source": "open_order", "kind": "order", "item": o["item"], "city": o["city"], "amount": o["filled"],
+                         "silver": o["price"] * o["filled"], "order_price": o["price"], "at": o["seen"] or o["created"]})
+        for r in rows:
+            r["unit"] = r["silver"] / r["amount"]
+            r["cost"] = r["silver"] * (1 + fee) if r["kind"] == "order" else r["silver"]
+        cutoff = self.clock() - timedelta(days=PURCHASE_WINDOW_DAYS)
+        def total(chosen):
+            units, silver, cost = sum(r["amount"] for r in chosen), sum(r["silver"] for r in chosen), sum(r["cost"] for r in chosen)
+            return {"units": units, "silver": round(silver), "average": silver / units if units else None, "cost_average": cost / units if units else None}
+        summary = [{"item": item, "recent": total([r for r in mine if parse_time(r["at"]) >= cutoff]), "all": total(mine)}
+                   for item in self.cfg["items"] if (mine := [r for r in rows if r["item"] == item])]
+        rows.sort(key=lambda r: parse_time(r["at"]), reverse=True)
+        return {"summary": summary, "recent": rows[:100], "window_days": PURCHASE_WINDOW_DAYS, "setup_fee": fee}
 
     def link_my_orders(self):
         """Match unlinked own orders to observed orders of the same market, side and price: an
@@ -1589,7 +1660,7 @@ class Store:
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
-                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": self.purchases(mine_rows), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
@@ -1746,6 +1817,12 @@ def handler_class(store, token):
                             result = {"closed": True}
                         else:
                             result = {"added": store.add_my_order(payload)}
+                    elif path == "/api/purchases":
+                        if payload.get("action") == "remove":
+                            store.remove_purchase(payload["id"])
+                            result = {"removed": True}
+                        else:
+                            result = {"added": store.add_purchase(payload)}
                     elif path == "/api/reset":
                         store.reset_book(payload["item"], payload["city"])
                         result = {"reset": True}
