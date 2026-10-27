@@ -56,7 +56,7 @@ async function refresh(){
   const r=await fetch(`/api/state?item=${encodeURIComponent(selectedItem)}&city=${encodeURIComponent(selectedCity)}`);if(!r.ok)throw Error(r.status);
   const next=await r.json();token=next.token;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261027.3';
+  const legacy=next.build!=='20261027.4';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -180,6 +180,17 @@ function renderStale(){
  updateHtml('stale-listings',rows.length?rows.map(r=>{const [tone,title,why]=advice(r),relist=r.advice==='relist',wait=['cheapest','soon','below_cost'].includes(r.advice);
   return `<article class="stale-card"><div class="stale-head"><b>${esc(state.items[r.item]||r.item)} · ${esc(state.cities[r.city]||r.city)}</b><span class="pill">${n(r.idle_days,1)}일째 안 팔림</span></div><p class="help">내 가격 ${n(r.price)} · 남은 ${n(r.remaining)}개 · ${r.sold_before?'마지막 판매 후':'처음 본 뒤 판매 없음'} · ${r.cost==null?'원가 미확인 (매수 기록을 넣으면 손익 계산)':'원가 '+n(r.cost)} · 내 앞 ${n(r.ahead)}개 (최저가 ${n(r.best)}, 호가 ${r.book_seen?ago(r.book_seen):'미조회'}) · ${pace(r)}</p><p class="stale-advice">추천: <b class="${tone}">${title}</b> — ${why}</p><div class="diag-grid">${tile('그대로 기다리기',r.wait,`${n(r.wait.price)} 그대로`,'',wait)}${tile('가격 고치기',r.relist,r.relist?`${n(r.relist.price)}로 다시 올림 · 수수료 ${n(r.relist.fee)}`:'','이미 최저가',relist)}${tile('매수 주문에 바로 팔기',r.instant,r.instant?`${r.instant.units<r.remaining?`${n(r.instant.units)} / ${n(r.remaining)}개만`:`${n(r.instant.units)}개`} · 평균 ${n(r.instant.price)}`:'','매수 주문 없음',false)}</div></article>`}).join(''):empty('3일 넘게 안 팔린 내 매도 주문이 없습니다.'));
 }
+function renderHoldings(){
+ const h=state.holdings;
+ if(!h){updateHtml('holdings',empty('보유량을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
+ if(!$('bank-item').options.length){$('bank-item').innerHTML=Object.entries(state.items).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('');$('bank-city').innerHTML=Object.entries(state.cities).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('')}
+ const byCity={};for(const r of h.rows)(byCity[r.city]??=[]).push(r);
+ const valued=h.rows.filter(r=>r.value!=null),unpriced=h.rows.length-valued.length;
+ $('holdings-context').textContent=h.rows.length?`${n(Object.keys(byCity).length)}개 도시 · 원가 기준 ${n(valued.reduce((s,r)=>s+r.value,0))}${unpriced?` (원가 미확인 ${n(unpriced)}줄 제외)`:''}`:'';
+ const rows=Object.entries(byCity).flatMap(([city,list])=>list.map((r,i)=>`<tr class="${i?'':'log-first'}"><td>${i?'':esc(state.cities[city]||city)}</td><td>${esc(state.items[r.item]||r.item)}</td><td>${n(r.listed)}개</td><td>${n(r.bank)}개${r.bank_updated?`<small>${ago(r.bank_updated)} 적음</small>`:''}</td><td><b>${n(r.total)}개</b></td><td>${r.value==null?'원가 미확인':n(r.value)}</td></tr>`));
+ const finished=h.finished.length?`<h3 class="sub-head">거래 완료 탭 (받아 둔 목록 · 합계에 아직 안 넣음)</h3>${table(['시장','항목','추적 품목','받은 때'],h.finished.map(f=>`<tr><td>${esc(state.cities[f.city]||f.location)}</td><td>${n(f.entries)}건</td><td>${n(f.tracked)}건</td><td>${ago(f.received)}</td></tr>`),'finished-lists')}`:'<p class="help">거래 완료 탭 목록은 아직 받지 않았습니다. 전용 수집기 local.3부터 게임 시장 창에서 거래 완료 탭을 열면 받아 둡니다.</p>';
+ updateHtml('holdings',(rows.length?table(['도시','품목','시장에 올린 것','은행','합계','원가 기준 금액'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭을 열거나 위에 은행 수량을 적어 주세요.'))+finished);
+}
 function renderPurchases(){
  const p=state.purchases;
  if(!p){updateHtml('purchases',empty('매수 기록을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
@@ -253,7 +264,7 @@ function renderOverview(){
  updateHtml('all-items',items.map(item=>{const b=state.books[item][selectedCity];return `<article class="panel item-summary"><h3>${esc(state.items[item])}</h3><div class="extremes-pair">${extremeSummary(item,'buy')}${extremeSummary(item,'sell')}</div><div class="item-city-table"><table><thead><tr><th>도시</th><th>최고 매수</th><th>최저 매도</th></tr></thead><tbody>${Object.entries(state.cities).map(([city,name])=>{const pair=state.books[item][city];return `<tr><th scope="row">${esc(name)}</th>${['buy','sell'].map(side=>{const q=quote(pair[side]),best=state.city_extremes?.[item]?.[side]?.observations?.some(o=>o.city===city);return `<td class="quote-cell ${side} ${best?'best-'+side:''}">${n(q?.price)}<small>${n(q?.amount)}개</small><small class="quote-status">${pair[side].single_only?'미확인':q?.stale||pair[side].stale?'지난 자료':q?'유효 관측':'미조회'}</small></td>`}).join('')}</tr>`}).join('')}</tbody></table></div><h4 class="selected-city-label">${esc(state.cities[selectedCity])} 물량 상세</h4>${['buy','sell'].map(side=>{const book=b[side],d=book.fresh?book.analysis_depth:book.depth;return `<div class="item-side ${side}"><p>${quoteText(book,side)}</p><small>${d?.reference?.large?'대량 기준':'소량 제외 기준'} ${n(d?.reference?.price)} · ${n(d?.reference?.amount)}개</small><small>앞쪽 소량 ${n(d?.leading_small_levels)}호가 · ${n(d?.leading_small_amount)}개</small><div class="wall-list">${(d?.large_levels||[]).slice(0,3).map(r=>`<span class="pill ${r.wall?'wall-badge':''}">${r.wall?'벽':'대량'} ${n(r.price)} · ${n(r.amount)}개</span>`).join('')||'대량 관측 없음'}</div></div>`}).join('')}</article>`}).join(''));
 }
 function render(){
- renderNow();renderPickHistory();renderMyOrders();renderStale();renderPurchases();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderPersonal();renderPersonalMails();renderMailDiagnosis();renderVolumeGuide();
+ renderNow();renderPickHistory();renderMyOrders();renderStale();renderHoldings();renderPurchases();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderPersonal();renderPersonalMails();renderMailDiagnosis();renderVolumeGuide();
  $('detail-context').textContent=state.cities[selectedCity]+' · '+state.items[selectedItem];
  const books=state.books[selectedItem];
  updateHtml('cities',Object.entries(state.cities).map(([id,name])=>{
@@ -320,6 +331,7 @@ $('cities').onclick=e=>{const card=e.target.closest('[data-city]');if(card){$('c
 $('candidate-filter').value=['all','instant','wait'].includes(storage.get('candidateFilter','all'))?storage.get('candidateFilter','all'):'all';
 $('my-order-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/my-orders',{item:f.item.value,city:f.city.value,side:f.side.value,price:Number(f.price.value),amount:Number(f.amount.value)});f.price.value='';f.amount.value='';$('my-order-status').textContent='추가했습니다. 게임에서 그 시장을 열면 자동으로 연결됩니다.';await refresh()}catch(err){$('my-order-status').textContent='추가 실패: '+err.message}};
 $('my-orders').onclick=async e=>{const b=e.target.closest('[data-close]');if(!b)return;try{await post('/api/my-orders',{action:'close',id:Number(b.dataset.close)});await refresh()}catch(err){$('my-order-status').textContent='정리 실패: '+err.message}};
+$('bank-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/bank',{item:f.item.value,city:f.city.value,amount:Number(f.amount.value)});f.amount.value='';$('bank-status').textContent='은행 수량을 저장했습니다.';await refresh()}catch(err){$('bank-status').textContent='저장 실패: '+err.message}};
 $('purchase-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/purchases',{item:f.item.value,city:f.city.value,kind:f.kind.value,price:Number(f.price.value),amount:Number(f.amount.value),bought:f.bought.value||null});f.price.value='';f.amount.value='';f.bought.value='';$('purchase-status').textContent='매수 기록을 추가했습니다.';await refresh()}catch(err){$('purchase-status').textContent='추가 실패: '+err.message}};
 $('purchases').onclick=async e=>{const b=e.target.closest('[data-remove-purchase]');if(!b)return;try{await post('/api/purchases',{action:'remove',id:Number(b.dataset.removePurchase)});await refresh()}catch(err){$('purchase-status').textContent='삭제 실패: '+err.message}};
 $('candidate-filter').onchange=()=>{storage.set('candidateFilter',$('candidate-filter').value);if(state)render()};

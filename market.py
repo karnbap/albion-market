@@ -40,7 +40,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261027.3"
+BUILD = "20261027.4"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
@@ -285,6 +285,9 @@ class Store:
           ids TEXT NOT NULL, seen TEXT NOT NULL, PRIMARY KEY(session,ids));
         CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY, item TEXT NOT NULL, city TEXT NOT NULL, kind TEXT NOT NULL,
           price REAL NOT NULL, amount INTEGER NOT NULL, bought TEXT NOT NULL, created TEXT NOT NULL, removed TEXT);
+        CREATE TABLE IF NOT EXISTS bank_stock(item TEXT NOT NULL, city TEXT NOT NULL, amount INTEGER NOT NULL, updated TEXT NOT NULL,
+          PRIMARY KEY(item,city));
+        CREATE TABLE IF NOT EXISTS finished_lists(location TEXT PRIMARY KEY, city TEXT NOT NULL, received TEXT NOT NULL, entries TEXT NOT NULL);
         """)
         # mailed: when the game sent the mail (the fork reads it from the mailbox list).
         # moved: when an own order's units left last went down in the "my orders" list.
@@ -894,6 +897,65 @@ class Store:
                 encoded = json.dumps({"Kind": kind, "Orders": [r[0] for r in normalized]}, ensure_ascii=False, separators=(",", ":"))
                 self.db.execute("INSERT INTO packets(received,topic,sha256,payload) VALUES(?,?,?,?)", (received, "marketorders.mine", hashlib.sha256(encoded.encode()).hexdigest(), encoded))
         return {"accepted": len(normalized), "received_at": received}
+
+    def ingest_finished(self, payload):
+        """One finished-trades tab list from the fork's private topic marketorders.finished,
+        entries as the game sent them, for the market at LocationId. Only the latest list per
+        market is kept. Which side the player took in each entry is not confirmed yet, so the
+        entries are stored for reading and not counted as holdings."""
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object required")
+        entries, place = payload.get("Entries"), str(payload.get("LocationId") or "")
+        if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+            raise ValueError("Entries must be a list of objects")
+        if not place:
+            raise ValueError("LocationId required")
+        received = self.clock().isoformat()
+        with self.lock, self.db:
+            self.db.execute("""INSERT INTO finished_lists VALUES(?,?,?,?) ON CONFLICT(location) DO UPDATE SET
+                city=excluded.city,received=excluded.received,entries=excluded.entries""",
+                            (place, location(place), received, json.dumps(entries, ensure_ascii=False, separators=(",", ":"))))
+        return {"accepted": len(entries), "received_at": received}
+
+    def set_bank(self, values):
+        """Units of a tracked item the player keeps in that city's bank, entered by hand: the
+        capture client does not read the bank. 0 clears the entry."""
+        item, city, amount = values.get("item"), values.get("city"), values.get("amount")
+        if item not in self.cfg["items"] or city not in CITIES:
+            raise ValueError("Unknown item / city")
+        if isinstance(amount, bool) or not isinstance(amount, int) or not 0 <= amount <= 10**9:
+            raise ValueError("Amount must be a whole number from 0")
+        with self.lock, self.db:
+            if amount:
+                self.db.execute("INSERT INTO bank_stock VALUES(?,?,?,?) ON CONFLICT(item,city) DO UPDATE SET amount=excluded.amount,updated=excluded.updated",
+                                (item, city, amount, self.clock().isoformat()))
+            else:
+                self.db.execute("DELETE FROM bank_stock WHERE item=? AND city=?", (item, city))
+
+    def holdings(self, open_orders, purchases):
+        """Units of tracked items the player holds per city: listed (units left on own sell
+        orders) plus the bank (entered by hand), valued at the average cost from purchases.
+        The finished-trades tab lists are reported apart until their entries are understood."""
+        costs = {s["item"]: s["recent"]["cost_average"] or s["all"]["cost_average"] for s in purchases["summary"]}
+        cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None})
+        for o in open_orders:
+            if o["side"] == "sell" and o["remaining"]:
+                cells[(o["city"], o["item"])]["listed"] += o["remaining"]
+        with self.lock:
+            for r in self.db.execute("SELECT item,city,amount,updated FROM bank_stock"):
+                cell = cells[(r["city"], r["item"])]
+                cell["bank"], cell["bank_updated"] = r["amount"], r["updated"]
+            lists = self.db.execute("SELECT location,city,received,entries FROM finished_lists ORDER BY received DESC").fetchall()
+        rows = []
+        for (city, item), cell in sorted(cells.items(), key=lambda kv: (list(CITIES).index(kv[0][0]) if kv[0][0] in CITIES else 99, kv[0][1])):
+            total, cost = cell["listed"] + cell["bank"], costs.get(item)
+            rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost, "value": total * cost if cost is not None else None})
+        finished = []
+        for r in lists:
+            entries = json.loads(r["entries"])
+            finished.append({"location": r["location"], "city": r["city"], "received": r["received"], "entries": len(entries),
+                             "tracked": sum(1 for e in entries if e.get("ItemTypeId") in self.cfg["items"])})
+        return {"rows": rows, "finished": finished}
 
     def client_debug(self):
         lines = [dict(r) for r in self.db.execute("SELECT logged,op,text FROM client_lines ORDER BY logged DESC, id DESC LIMIT 15")]
@@ -1729,7 +1791,7 @@ class Store:
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
-                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": self.holdings(mine_rows, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
@@ -1870,6 +1932,8 @@ def handler_class(store, token):
                         result = store.ingest_sale(payload)
                     elif topic == "marketorders.mine":
                         result = store.ingest_my_orders(payload)
+                    elif topic == "marketorders.finished":
+                        result = store.ingest_finished(payload)
                     else:
                         result = {"accepted": 0, "ignored": True}
                 elif path.startswith("/ingest/europe/"):
@@ -1892,6 +1956,9 @@ def handler_class(store, token):
                             result = {"removed": True}
                         else:
                             result = {"added": store.add_purchase(payload)}
+                    elif path == "/api/bank":
+                        store.set_bank(payload)
+                        result = {"saved": True}
                     elif path == "/api/reset":
                         store.reset_book(payload["item"], payload["city"])
                         result = {"reset": True}
