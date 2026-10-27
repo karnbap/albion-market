@@ -7,8 +7,8 @@ const savedView=storage.get('view',{});
 let state,token,selectedItem=savedView.item||'',selectedCity=savedView.city||'1002',ready=false,loading=false,refreshQueued=false,viewVersion=0;
 let formVersion=0,saving=false,saveQueued=false,saveTimer,scrollTimer,restorePending=true;
 let draft=storage.get('settingsDraft',null);
-const percentKeys=['sales_tax','setup_fee','minimum_margin','near_high_fraction','depth_price_band'];
-const numberKeys=['trade_budget','inventory_heavy_days','fresh_minutes','transport_per_unit','small_quantity_max','large_quantity_min','wall_quantity_min','wall_multiple'];
+const percentKeys=['sales_tax','setup_fee','minimum_margin','near_high_fraction','depth_price_band','cycle_share'];
+const numberKeys=['trade_budget','inventory_heavy_days','weekday_cycles','fresh_minutes','transport_per_unit','small_quantity_max','large_quantity_min','wall_quantity_min','wall_multiple'];
 const boolKeys=['fees_confirmed','transport_confirmed'];
 const fragmentCache=new Map(),innerScroll=storage.get('tableScroll',{});
 const formatters=new Map();
@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261027.12';
+  const legacy=next.build!=='20261027.13';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -153,22 +153,22 @@ function renderBookPatterns(){
 }
 function renderPortfolio(){
  const pf=state.portfolio;
- if(!pf){updateHtml('portfolio',empty('투자 비율 추천을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
- const city=c=>esc(state.cities[c]||c),days=k=>k.map(d=>WEEK[d]).join('·'),share=v=>v==null?'—':n(v*100,0)+'%',item=i=>esc(state.items[i]||i);
- const goal=pf.rows.filter(r=>r.target>0).map(r=>`${item(r.item)} ${share(r.target)}`).concat(pf.cash>0.005?[`실버로 남김 ${share(pf.cash)}`]:[]).join(' · ')||'지금 계산으로는 넣을 품목이 없습니다';
- const tiles=`<div class="diag-grid capital-grid"><div><small>지금 총 투자금</small><b>${n(pf.total)}</b><span>보유 원가 + 매수 주문 (총 투자금 추적과 같은 값)</span></div><div style="grid-column:span 3"><small>목표 비율</small><b>${goal}</b><span>${days(pf.buy_days)}요일에 매수 주문으로 모으고 ${days(pf.sell_days)}요일에 판매 · ${pf.cities.map(city).join(', ')}만 계산</span></div></div>`;
- const todo=r=>{const p=r.plan,gap=r.gap_silver,near=pf.total*0.05;
-  if(!r.target)return r.current_silver?`<span class="warn">새로 사지 않기</span><small>가진 것은 ${p?city(p.sell_city)+'에서 ':''}팔기</small>`:'<small>사지 않기</small>';
-  if(gap>near)return `<span class="positive">더 모으기</span><small>평일에 ${city(p.buy_city)}에서 약 ${n(gap)} 실버어치</small>`;
-  if(gap<-near)return `<span class="warn">목표보다 ${n(-gap)} 많음</span><small>더 사지 말고 먼저 팔기</small>`;
-  return '<span>목표 근처</span><small>지금처럼</small>'};
- const basis=r=>r.roi_basis==='mine'?`내 판매 ${n(r.mine.units)}개 기준 (28일)`:r.plan?`시장 호가 기준 · ${esc(r.plan.buy_basis)}`:'자료 부족';
- const rows=pf.rows.map(r=>{const p=r.plan;return `<tr><td>${item(r.item)}</td><td><b>${share(r.target)}</b> <small>지금 ${share(r.current)}</small><small>목표 ${r.target_silver==null?'—':n(r.target_silver)} / 지금 ${n(r.current_silver)}${r.capped?` · 상한 걸림`:''}</small></td><td>${todo(r)}</td><td>${p?`${city(p.buy_city)}<small>매수 주문 ${n(p.buy)}${p.cheapest_day!=null?` · 가장 쌌던 요일 ${WEEK[p.cheapest_day]}`:''}<br>평일 하루 ${n(p.buy_per_day)}개 팔림</small>`:'—'}</td><td>${p?`${city(p.sell_city)}<small>매도 주문 ${n(p.sell)}${p.dearest_day!=null?` · 가장 비쌌던 요일 ${WEEK[p.dearest_day]}`:''}<br>금~일 하루 ${n(p.sell_per_day)}개 팔림</small>`:'—'}</td><td>${r.roi==null?'—':`<span class="${r.roi>0?'positive':'warn'}">${pct(r.roi)}</span>`}${p?.swing==null?'':` <small>흔들림 ±${n(p.swing*100,1)}%</small>`}<small>${basis(r)}${r.roi_basis==='mine'&&p?` · 시장 호가로는 ${pct(p.roi)}`:''}${r.roi_basis!=='mine'&&r.mine?` · 내 판매 ${n(r.mine.units)}개${r.mine.roi==null?'':' '+pct(r.mine.roi)}`:''}</small></td></tr>`});
+ if(!pf){updateHtml('portfolio',empty('매매 계획을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
+ const city=c=>esc(state.cities[c]||c),share=v=>v==null?'—':n(v*100,0)+'%',item=i=>esc(state.items[i]||i),how={order:'매수 주문',instant:'바로 사기'};
  const hours=h=>!h?'—':!h.enough?`<small>자료 부족 · 같은 시각 ${n(h.days,0)}일치 (3일치부터)</small>`:`${h.clear?'':'뚜렷한 차이 없음 · '}${h.hours.map(x=>`${String(x.hour).padStart(2,'0')}시 <small>${pct(x.vs_average)}</small>`).join(' · ')}`;
- const buyNote=r=>{const w=r.week,p=r.plan;if(!r.target)return '<small>사지 않기</small>';if(!w.units)return '<small>목표 채움 · 더 안 사도 됨</small>';return `<b>${n(w.units)}개</b><small>${w.next_week?'다음 주 ':''}하루 약 ${n(w.per_day)}개 × ${n(w.days_left)}일 · ${city(p.buy_city)} 매수 주문 ${n(p.buy)}</small>`};
- const week=table(['품목','평일에 살 양','사기 좋은 시간 (살 곳)','금~일에 팔 양 (어림)','팔기 좋은 시간 (팔 곳)'],pf.rows.filter(r=>r.plan).map(r=>`<tr><td>${item(r.item)}</td><td>${buyNote(r)}</td><td>${hours(r.plan.buy_hours)}</td><td>${n(r.week.sellable)}개까지<small>${city(r.plan.sell_city)} 금~일 판매량의 ${n(pf.market_share*100,0)}%</small></td><td>${hours(r.plan.sell_hours)}</td></tr>`),'portfolio-week');
- updateHtml('portfolio',tiles+table(['품목','목표 비율','할 일','살 곳 (평일)','팔 곳 (금~일)','예상 수익률 · 가격 흔들림'],rows,'portfolio')
-  +`<p class="help">비율은 <b>수익률 ÷ 가격 흔들림</b>에 비례해 나눕니다. 그래서 꾸준한 10%가 들쭉날쭉한 20%보다 높게 나올 수 있습니다. 수익률은 최근 28일에 내가 ${n(pf.own_units)}개 넘게 판 품목이면 내 판매 메일의 평균 판매가와 평균 매수 원가로, 아니면 시장 호가(살 곳 최고 매수가 → 팔 곳 최저 매도가)로 계산합니다. 손해가 나는 품목은 0%입니다. 한 품목은 ${n(pf.max_share*100,0)}%까지만 넣고, 금~일 사흘 동안 팔 곳 판매량의 ${n(pf.market_share*100,0)}%를 넘게 사지 않도록 막습니다. 많이 사 두면 늦게 팔리거나 값을 내려 수수료를 다시 무는 일을 막기 위해서입니다. 상한에 걸린 품목은 ‘상한 걸림’으로 표시하고, 어느 품목에도 더 넣기 어려운 몫은 실버로 남깁니다. 가격 흔들림은 팔 곳의 하루 평균가가 보통 얼마나 오르내리는지입니다(하루짜리 튀는 값은 거의 빼고 계산). 살 곳은 평일에 가장 싸게, 팔 곳은 금~일에 가장 비싸게 팔린 도시입니다. 판매량이 가장 많은 도시의 3분의 1이 안 되는 곳은 고르지 않습니다.</p>`+`<h3 class="sub-head">이번 주 계획</h3>${week}<p class="help">평일에 살 양 = 목표까지 모자란 실버 ÷ 매수 원가(수수료 포함)를 남은 월~목에 나눈 것입니다. 사기 좋은 시간은 살 곳에서 평균 체결가가 가장 낮았던 시각, 팔기 좋은 시간은 팔 곳에서 판매량이 보통 이상인 시각 가운데 가장 비쌌던 시각입니다(${esc(state.timezone)} 기준, 괄호는 하루 평균가 대비). 같은 시각을 3일 이상 본 자료만 쓰고, 차이가 ${n(3)}% 미만이면 뚜렷한 차이 없음으로 표시합니다. 시간대 자료는 시장 상세에서 24시간 이력을 여러 날 열면 쌓입니다.</p>`);
+ const short=(silver,need)=>silver<need-0.5?`<small class="warn">돈이 모자라 ${n(silver)}만</small>`:'';
+ const tiles=`<div class="diag-grid capital-grid"><div><small>지금 총 투자금</small><b>${n(pf.total)}</b><span>보유 원가 + 매수 주문</span></div><div><small>평일 순환에 쓸 돈</small><b>${n(pf.weekday_silver)} · ${share(pf.weekday_share)}</b><span>품목마다 한 번 돌릴 만큼 · 하루 ${n(pf.turns)}번 돌림</span></div><div><small>주말 핫타임에 쓸 돈</small><b>${n(pf.weekend_silver)} · ${share(pf.weekend_share)}</b><span>금 저녁~일 싹쓸이·매도 · 필요 ${n(pf.weekend_need)}</span></div><div><small>내 몫</small><b>시장 하루 판매량의 ${n(pf.cycle_share*100,0)}%</b><span>설정 탭에서 바꿈 · ${pf.cities.map(city).join(', ')}만 계산</span></div></div>`;
+ const stock=w=>w.stock_turns>=1?`<span class="warn">가진 것 먼저 팔기</span><small>${n(w.stock_turns,1)}번 돌릴 만큼 있음</small>`:`<span class="positive">한 번에 ${n(w.to_buy)}개 더 사기</span><small>가진 것 ${n(w.turn_units-w.to_buy)}개 + 새로 ${n(w.to_buy)}개</small>`;
+ const weekday=pf.rows.map(r=>{const w=r.weekday,o=r.weekday_other;if(!w)return `<tr><td>${item(r.item)}</td><td style="text-align:left" colspan="6"><small>지금 호가로는 이익 나는 순환이 없습니다</small></td></tr>`;
+  return `<tr><td>${item(r.item)}<small>${how[w.method]}</small></td><td>${city(w.buy_city)}<small>${how[w.method]} ${n(w.buy)} · ${esc(w.buy_basis)}</small></td><td>${city(w.sell_city)}<small>매도 주문 ${n(w.sell)}</small></td><td><b>${n(w.turn_units)}개</b><small>${n(w.turn_silver)} · 투자금의 ${share(w.share)}</small>${short(w.silver,w.turn_silver)}</td><td><span class="positive">${pct(w.roi)}</span> <small>한 번 돌릴 때</small><small>하루 약 +${n(w.profit)} · 월~목 +${n(w.profit_week)}</small>${o?`<small>${how[o.method]}(${city(o.buy_city)}→${city(o.sell_city)})로는 ${pct(o.roi)} · 하루 +${n(o.profit)}</small>`:''}</td><td>${n(r.held)}개<br>${stock(w)}</td><td>${r.buy_hours&&r.sell_hours&&!r.buy_hours.enough&&!r.sell_hours.enough?hours(r.sell_hours):`<small>사기</small> ${hours(r.buy_hours)}<br><small>팔기</small> ${hours(r.sell_hours)}`}</td></tr>`});
+ const weekend=pf.rows.map(r=>{const k=r.weekend;if(!k)return `<tr><td>${item(r.item)}</td><td style="text-align:left" colspan="5"><small>지금 호가로는 주말에 이익 나는 싹쓸이가 없습니다</small></td></tr>`;
+  return `<tr><td>${item(r.item)}</td><td>${city(k.buy_city)}<small>바로 사기 ${n(k.buy)} (평일 최저 매도가)</small></td><td>${city(k.sell_city)}<small>매도 주문 ${n(k.sell)} (금~일) · ${esc(k.sell_basis)}</small></td><td><b>${n(k.units)}개</b><small>${n(k.need)} · 투자금의 ${share(k.share)}</small>${short(k.silver,k.need)}</td><td><span class="positive">${pct(k.roi)}</span><small>약 +${n(k.profit)}${r.swing==null?'':` · 가격 흔들림 ±${n(r.swing*100,1)}%`}</small></td><td>${hours(r.weekend_hours)}</td></tr>`});
+ updateHtml('portfolio',tiles
+  +`<h3 class="sub-head">평일 순환 (월~목 · 하루 ${n(pf.turns)}번)</h3>`+table(['품목','살 곳','팔 곳','한 번에','이익','지금 가진 것','좋은 시간'],weekday,'plan-weekday')
+  +`<h3 class="sub-head">주말 핫타임 (금 저녁~일)</h3>`+table(['품목','살 곳','팔 곳','팔 양 (어림)','예상 수익률','팔기 좋은 시간'],weekend,'plan-weekend')
+  +`<p class="help"><b>평일 순환</b>은 적게 사서 그날 팔고 다시 사는 것을 하루 ${n(pf.turns)}번 하는 계획입니다. 사는 방법은 두 가지를 모두 계산해 하루 이익이 큰 쪽을 보여 줍니다: 살 곳 최고 매수가에 <b>매수 주문</b>(수수료 포함)을 걸거나, 다른 도시의 최저 매도가로 <b>바로 사기</b>. 파는 것은 팔 곳 최저 매도가의 매도 주문입니다. 하루에 돌릴 양 = 시장 하루 판매량 가운데 그 주문을 채워 주는 몫(매도 주문은 즉시 구매 비율, 매수 주문은 나머지 · 아직 측정 전이면 절반으로 봄)의 ${n(pf.cycle_share*100,0)}%이고, 한 번에 = 그 양 ÷ ${n(pf.turns)}번입니다. 이미 가진 것이 있으면 먼저 팔고, 모자란 만큼만 삽니다.</p>`
+  +`<p class="help"><b>주말 핫타임</b>은 금요일 저녁부터 일요일까지(${n(pf.hot_days,2)}일) 싼 매물을 바로 사서 비싸게 매도 주문으로 파는 계획입니다. 살 값은 평일 최저 매도가, 팔 값은 금~일 최저 매도가로 잡았습니다. 실제로 살 매물은 <b>싹쓸이</b> 탭에서 지금 호가로 확인하세요. 팔 양 = 금~일 즉시 구매 수요의 ${n(pf.cycle_share*100,0)}% × ${n(pf.hot_days,2)}일.</p>`
+  +`<p class="help">평일 돈과 주말 돈은 같은 투자금을 다시 쓰는 것이라 따로 비율을 냅니다. 돈이 모자라면 돈 대비 이익이 큰 품목부터 채웁니다. 가격은 그 요일들의 호가 기록이 있으면 그것을, 없으면 다른 요일 호가나 지난 호가를 요일별 체결가 흐름으로 보정한 값을 씁니다(칸마다 근거 표시). 시간대는 같은 시각을 3일 이상 본 1시간 이력이 있어야 나오며, 시장 상세에서 24시간 이력을 여러 날 열면 쌓입니다(${esc(state.timezone)} 기준).</p>`);
 }
 function renderStudies(){
  const rows=state.studies;
