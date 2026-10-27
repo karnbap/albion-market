@@ -40,7 +40,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261027.4"
+BUILD = "20261027.5"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
@@ -132,6 +132,11 @@ def location(value):
     if value.isdigit():
         value = str(int(value))
     return PORTALS.get(value, value)
+
+
+def character_identity(character):
+    """A character's stored identity: a hash, so raw character IDs stay out of the tables."""
+    return hashlib.sha256(("Europe|" + character).encode()).hexdigest()
 
 
 # The local fork of the capture client (README: 전용 수집기) runs instead of the official
@@ -293,7 +298,8 @@ class Store:
         # moved: when an own order's units left last went down in the "my orders" list.
         for table, name, kind in (("my_orders", "remaining", "INTEGER"), ("my_orders", "checked", "TEXT"),
                                   ("my_orders", "source", "TEXT NOT NULL DEFAULT 'manual'"), ("my_orders", "moved", "TEXT"),
-                                  ("personal_sales", "mailed", "TEXT"), ("personal_mails", "mailed", "TEXT")):
+                                  ("personal_sales", "mailed", "TEXT"), ("personal_mails", "mailed", "TEXT"),
+                                  ("finished_lists", "identity", "TEXT")):
             if name not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         self.db.commit()
@@ -901,8 +907,8 @@ class Store:
     def ingest_finished(self, payload):
         """One finished-trades tab list from the fork's private topic marketorders.finished,
         entries as the game sent them, for the market at LocationId. Only the latest list per
-        market is kept. Which side the player took in each entry is not confirmed yet, so the
-        entries are stored for reading and not counted as holdings."""
+        market is kept, with the uploader's identity hashed like mail identities so holdings()
+        can tell which entries the player bought."""
         if not isinstance(payload, dict):
             raise ValueError("JSON object required")
         entries, place = payload.get("Entries"), str(payload.get("LocationId") or "")
@@ -910,11 +916,13 @@ class Store:
             raise ValueError("Entries must be a list of objects")
         if not place:
             raise ValueError("LocationId required")
+        character = str(payload.get("CharacterId") or "").strip()
         received = self.clock().isoformat()
         with self.lock, self.db:
-            self.db.execute("""INSERT INTO finished_lists VALUES(?,?,?,?) ON CONFLICT(location) DO UPDATE SET
-                city=excluded.city,received=excluded.received,entries=excluded.entries""",
-                            (place, location(place), received, json.dumps(entries, ensure_ascii=False, separators=(",", ":"))))
+            self.db.execute("""INSERT INTO finished_lists(location,city,received,entries,identity) VALUES(?,?,?,?,?) ON CONFLICT(location) DO UPDATE SET
+                city=excluded.city,received=excluded.received,entries=excluded.entries,identity=excluded.identity""",
+                            (place, location(place), received, json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
+                             character_identity(character) if character else None))
         return {"accepted": len(entries), "received_at": received}
 
     def set_bank(self, values):
@@ -934,10 +942,13 @@ class Store:
 
     def holdings(self, open_orders, purchases):
         """Units of tracked items the player holds per city: listed (units left on own sell
-        orders) plus the bank (entered by hand), valued at the average cost from purchases.
-        The finished-trades tab lists are reported apart until their entries are understood."""
+        orders), the bank (entered by hand) and the finished-trades tab (bought, not yet
+        collected), valued at the average cost from purchases. A finished-trades entry counts
+        when its buyer is the uploader and HasBuyerFetched is false (seen on the live server,
+        2026-10-27: buy-order fills waiting in the tab); entries the player sold are skipped.
+        Each market's tab is as of its latest list."""
         costs = {s["item"]: s["recent"]["cost_average"] or s["all"]["cost_average"] for s in purchases["summary"]}
-        cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None})
+        cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None, "finished": 0, "finished_seen": None})
         for o in open_orders:
             if o["side"] == "sell" and o["remaining"]:
                 cells[(o["city"], o["item"])]["listed"] += o["remaining"]
@@ -945,16 +956,28 @@ class Store:
             for r in self.db.execute("SELECT item,city,amount,updated FROM bank_stock"):
                 cell = cells[(r["city"], r["item"])]
                 cell["bank"], cell["bank_updated"] = r["amount"], r["updated"]
-            lists = self.db.execute("SELECT location,city,received,entries FROM finished_lists ORDER BY received DESC").fetchall()
-        rows = []
-        for (city, item), cell in sorted(cells.items(), key=lambda kv: (list(CITIES).index(kv[0][0]) if kv[0][0] in CITIES else 99, kv[0][1])):
-            total, cost = cell["listed"] + cell["bank"], costs.get(item)
-            rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost, "value": total * cost if cost is not None else None})
+            lists = self.db.execute("SELECT location,city,received,entries,identity FROM finished_lists ORDER BY received DESC").fetchall()
         finished = []
         for r in lists:
-            entries = json.loads(r["entries"])
+            entries, waiting = json.loads(r["entries"]), 0
+            for e in entries:
+                if not r["identity"] or e.get("HasBuyerFetched") is not False or e.get("ItemTypeId") not in self.cfg["items"]:
+                    continue
+                if int(e.get("QualityLevel") or 1) != 1 or int(e.get("EnchantmentLevel") or 0) != 0:
+                    continue
+                if character_identity(str(e.get("BuyerCharacterId") or "")) != r["identity"] or r["city"] not in CITIES:
+                    continue
+                cell = cells[(r["city"], e["ItemTypeId"])]
+                cell["finished"] += int(e.get("Amount") or 0)
+                cell["finished_seen"] = r["received"]
+                waiting += int(e.get("Amount") or 0)
             finished.append({"location": r["location"], "city": r["city"], "received": r["received"], "entries": len(entries),
-                             "tracked": sum(1 for e in entries if e.get("ItemTypeId") in self.cfg["items"])})
+                             "tracked": sum(1 for e in entries if e.get("ItemTypeId") in self.cfg["items"]),
+                             "waiting": waiting, "identity_known": bool(r["identity"])})
+        rows = []
+        for (city, item), cell in sorted(cells.items(), key=lambda kv: (list(CITIES).index(kv[0][0]) if kv[0][0] in CITIES else 99, kv[0][1])):
+            total, cost = cell["listed"] + cell["bank"] + cell["finished"], costs.get(item)
+            rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost, "value": total * cost if cost is not None else None})
         return {"rows": rows, "finished": finished}
 
     def client_debug(self):
@@ -1050,7 +1073,7 @@ class Store:
             return value
         mail_id = str(integer("Id"))
         character = str(payload.get("CharacterId") or payload.get("CharacterName") or "").strip()
-        identity = hashlib.sha256(("Europe|" + character).encode()).hexdigest()
+        identity = character_identity(character)
         seen = self.clock().isoformat()
         # The fork reports when the game sent the mail; the official client does not.
         try:

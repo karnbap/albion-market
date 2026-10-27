@@ -57,18 +57,29 @@ class HoldingsTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 self.store.set_bank({"item": "T7_RELIC", "city": "4002", "amount": 1, **bad})
 
-    def test_finished_tab_lists_are_kept_but_not_counted(self):
-        entry = {"Id": 5, "Amount": 2, "IsFinished": True, "AuctionType": "request", "HasBuyerFetched": False,
-                 "HasSellerFetched": True, "ItemTypeId": "T7_RELIC", "LocationId": None}
-        other = dict(entry, Id=6, ItemTypeId="T4_BAG")
-        self.assertEqual(self.store.ingest_finished({"LocationId": "1000-HellDen", "Entries": [entry, other]})["accepted"], 2)
+    def test_finished_tab_counts_what_i_bought_and_have_not_collected(self):
+        me, them = "00000000-0000-0000-0000-00000000000a", "00000000-0000-0000-0000-00000000000b"
+        bought = {"Id": 5, "Amount": 2, "IsFinished": True, "AuctionType": "request", "HasBuyerFetched": False, "HasSellerFetched": True,
+                  "BuyerCharacterId": me, "SellerCharacterId": them, "ItemTypeId": "T7_RELIC", "QualityLevel": 1, "EnchantmentLevel": 0, "LocationId": None}
+        entries = [bought,
+                   dict(bought, Id=6, Amount=3, AuctionType="offer"),                         # an instant buy: still mine to collect
+                   dict(bought, Id=7, HasBuyerFetched=True),                                  # already collected
+                   dict(bought, Id=8, BuyerCharacterId=them, SellerCharacterId=me),           # I sold it
+                   dict(bought, Id=9, ItemTypeId="T4_BAG")]                                   # not tracked
+        self.assertEqual(self.store.ingest_finished({"CharacterId": me, "LocationId": "1000-HellDen", "Entries": entries})["accepted"], 5)
         h = self.holdings()
-        self.assertEqual(h["rows"], [])
-        self.assertEqual([(f["location"], f["city"], f["entries"], f["tracked"]) for f in h["finished"]], [("1000-HellDen", "1002", 2, 1)])
+        self.assertEqual([(r["city"], r["item"], r["finished"], r["total"]) for r in h["rows"]], [("1002", "T7_RELIC", 5, 5)])
+        self.assertEqual([(f["location"], f["city"], f["entries"], f["tracked"], f["waiting"]) for f in h["finished"]], [("1000-HellDen", "1002", 5, 4, 5)])
+        # Raw character IDs are not stored beside the list.
+        self.assertNotIn(me, self.store.db.execute("SELECT identity FROM finished_lists").fetchone()[0])
+        # Without the uploader's identity nothing can be told apart, so nothing counts.
+        self.store.ingest_finished({"LocationId": "4002", "Entries": [bought]})
+        self.assertEqual({f["location"]: (f["waiting"], f["identity_known"]) for f in self.holdings()["finished"]}["4002"], (0, False))
         # Only the latest list per market is kept; an empty list says the tab is empty.
         self.now += timedelta(minutes=5)
-        self.store.ingest_finished({"LocationId": "1000-HellDen", "Entries": []})
-        self.assertEqual([(f["entries"], f["received"]) for f in self.holdings()["finished"]], [(0, self.now.isoformat())])
+        self.store.ingest_finished({"CharacterId": me, "LocationId": "1000-HellDen", "Entries": []})
+        self.assertEqual(self.holdings()["rows"], [])
+        self.assertEqual({f["location"]: (f["entries"], f["received"]) for f in self.holdings()["finished"]}["1000-HellDen"], (0, self.now.isoformat()))
         for bad in ([], {"LocationId": "1002"}, {"LocationId": "1002", "Entries": ["x"]}, {"Entries": []}):
             with self.assertRaises(ValueError, msg=bad):
                 self.store.ingest_finished(bad)

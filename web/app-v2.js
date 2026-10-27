@@ -56,7 +56,7 @@ async function refresh(){
   const r=await fetch(`/api/state?item=${encodeURIComponent(selectedItem)}&city=${encodeURIComponent(selectedCity)}`);if(!r.ok)throw Error(r.status);
   const next=await r.json();token=next.token;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261027.4';
+  const legacy=next.build!=='20261027.5';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -187,9 +187,9 @@ function renderHoldings(){
  const byCity={};for(const r of h.rows)(byCity[r.city]??=[]).push(r);
  const valued=h.rows.filter(r=>r.value!=null),unpriced=h.rows.length-valued.length;
  $('holdings-context').textContent=h.rows.length?`${n(Object.keys(byCity).length)}개 도시 · 원가 기준 ${n(valued.reduce((s,r)=>s+r.value,0))}${unpriced?` (원가 미확인 ${n(unpriced)}줄 제외)`:''}`:'';
- const rows=Object.entries(byCity).flatMap(([city,list])=>list.map((r,i)=>`<tr class="${i?'':'log-first'}"><td>${i?'':esc(state.cities[city]||city)}</td><td>${esc(state.items[r.item]||r.item)}</td><td>${n(r.listed)}개</td><td>${n(r.bank)}개${r.bank_updated?`<small>${ago(r.bank_updated)} 적음</small>`:''}</td><td><b>${n(r.total)}개</b></td><td>${r.value==null?'원가 미확인':n(r.value)}</td></tr>`));
- const finished=h.finished.length?`<h3 class="sub-head">거래 완료 탭 (받아 둔 목록 · 합계에 아직 안 넣음)</h3>${table(['시장','항목','추적 품목','받은 때'],h.finished.map(f=>`<tr><td>${esc(state.cities[f.city]||f.location)}</td><td>${n(f.entries)}건</td><td>${n(f.tracked)}건</td><td>${ago(f.received)}</td></tr>`),'finished-lists')}`:'<p class="help">거래 완료 탭 목록은 아직 받지 않았습니다. 전용 수집기 local.3부터 게임 시장 창에서 거래 완료 탭을 열면 받아 둡니다.</p>';
- updateHtml('holdings',(rows.length?table(['도시','품목','시장에 올린 것','은행','합계','원가 기준 금액'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭을 열거나 위에 은행 수량을 적어 주세요.'))+finished);
+ const rows=Object.entries(byCity).flatMap(([city,list])=>list.map((r,i)=>`<tr class="${i?'':'log-first'}"><td>${i?'':esc(state.cities[city]||city)}</td><td>${esc(state.items[r.item]||r.item)}</td><td>${n(r.listed)}개</td><td>${n(r.bank)}개${r.bank_updated?`<small>${ago(r.bank_updated)} 적음</small>`:''}</td><td>${n(r.finished)}개${r.finished_seen?`<small>${ago(r.finished_seen)} 확인</small>`:''}</td><td><b>${n(r.total)}개</b></td><td>${r.value==null?'원가 미확인':n(r.value)}</td></tr>`));
+ const finished=h.finished.length?`<h3 class="sub-head">거래 완료 탭 (시장별 마지막으로 받은 목록)</h3>${table(['시장','항목','추적 품목','내가 사서 안 찾은 것','받은 때'],h.finished.map(f=>`<tr><td>${esc(state.cities[f.city]||f.location)}</td><td>${n(f.entries)}건</td><td>${n(f.tracked)}건</td><td>${f.identity_known?n(f.waiting)+'개':'<span class="warn">캐릭터 확인 불가</span>'}</td><td>${ago(f.received)}</td></tr>`),'finished-lists')}`:'<p class="help">거래 완료 탭 목록은 아직 받지 않았습니다. 전용 수집기 local.3부터 게임 시장 창에서 거래 완료 탭을 열면 받아 둡니다.</p>';
+ updateHtml('holdings',(rows.length?table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','합계','원가 기준 금액'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭을 열거나, 위에 은행 수량을 적어 주세요.'))+finished);
 }
 function renderPurchases(){
  const p=state.purchases;
