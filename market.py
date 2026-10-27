@@ -44,7 +44,9 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261027.9"
+BUILD = "20261027.11"
+# Holdings rows for what the player carries (the inventory) use this key in place of a city.
+CARRIED = "carried"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
@@ -298,6 +300,9 @@ class Store:
           PRIMARY KEY(item,city));
         CREATE TABLE IF NOT EXISTS finished_lists(location TEXT PRIMARY KEY, city TEXT NOT NULL, received TEXT NOT NULL, entries TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS last_results(kind TEXT PRIMARY KEY, created TEXT NOT NULL, seen TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS bank_auto(location TEXT PRIMARY KEY, city TEXT, items TEXT NOT NULL, seen TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS bank_cities(location TEXT PRIMARY KEY, city TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS carried(id INTEGER PRIMARY KEY CHECK(id=1), items TEXT NOT NULL, seen TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS capital_log(at TEXT PRIMARY KEY, total REAL NOT NULL, holdings REAL NOT NULL, orders REAL NOT NULL,
           unpriced INTEGER NOT NULL, units TEXT NOT NULL);
         """)
@@ -958,14 +963,30 @@ class Store:
         2026-10-27: buy-order fills waiting in the tab); entries the player sold are skipped.
         Each market's tab is as of its latest list."""
         costs = {s["item"]: s["recent"]["cost_average"] or s["all"]["cost_average"] for s in purchases["summary"]}
-        cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None, "finished": 0, "finished_seen": None})
+        cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None, "bank_source": None, "finished": 0, "finished_seen": None, "carried": 0})
         for o in open_orders:
             if o["side"] == "sell" and o["remaining"]:
                 cells[(o["city"], o["item"])]["listed"] += o["remaining"]
         with self.lock:
+            # A bank the fork read replaces what was typed in for that city: it lists every stack.
+            auto, unmapped = defaultdict(dict), []
+            for r in self.db.execute("SELECT location,city,items,seen FROM bank_auto ORDER BY seen"):
+                if r["city"] is None:
+                    unmapped.append({"location": r["location"], "items": json.loads(r["items"]), "seen": r["seen"]})
+                    continue
+                for item, amount in json.loads(r["items"]).items():
+                    auto[r["city"]][item] = auto[r["city"]].get(item, 0) + amount
+                auto[r["city"]][""] = r["seen"]  # newest bank read for the city (rows come oldest first)
+            for city, items in auto.items():
+                seen = items.pop("")
+                for item, amount in items.items():
+                    cells[(city, item)].update(bank=amount, bank_updated=seen, bank_source="auto")
             for r in self.db.execute("SELECT item,city,amount,updated FROM bank_stock"):
-                cell = cells[(r["city"], r["item"])]
-                cell["bank"], cell["bank_updated"] = r["amount"], r["updated"]
+                if r["city"] not in auto:
+                    cells[(r["city"], r["item"])].update(bank=r["amount"], bank_updated=r["updated"], bank_source="manual")
+            carried = self.db.execute("SELECT items,seen FROM carried WHERE id=1").fetchone()
+            for item, amount in (json.loads(carried["items"]).items() if carried else ()):
+                cells[(CARRIED, item)].update(carried=amount, bank_updated=carried["seen"])
             lists = self.db.execute("SELECT location,city,received,entries,identity FROM finished_lists ORDER BY received DESC").fetchall()
         finished = []
         for r in lists:
@@ -986,9 +1007,51 @@ class Store:
                              "waiting": waiting, "identity_known": bool(r["identity"])})
         rows = []
         for (city, item), cell in sorted(cells.items(), key=lambda kv: (list(CITIES).index(kv[0][0]) if kv[0][0] in CITIES else 99, kv[0][1])):
-            total, cost = cell["listed"] + cell["bank"] + cell["finished"], costs.get(item)
+            total, cost = cell["listed"] + cell["bank"] + cell["finished"] + cell["carried"], costs.get(item)
+            if not total and cell["bank_source"] != "manual":
+                continue
             rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost, "value": total * cost if cost is not None else None})
-        return {"rows": rows, "finished": finished}
+        return {"rows": rows, "finished": finished, "unmapped_banks": unmapped}
+
+    def ingest_holdings(self, payload):
+        """Units per item the fork read from the inventory and from each bank opened this
+        session (private topic holdings.containers, items keyed by the game's item index). A bank
+        stands in its own cluster beside the city; its city is the cluster itself when that is a
+        market, else the city learned for that cluster before, else the city the player came
+        from when entering it (then learned). The inventory replaces the carried units."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("Inventory"), dict) or not isinstance(payload.get("Banks"), list):
+            raise ValueError("Inventory object and Banks list required")
+        def tracked(items):
+            if not isinstance(items, dict):
+                raise ValueError("Items must be an object")
+            out = {}
+            for key, amount in items.items():
+                if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+                    raise ValueError("Item amounts must be whole numbers")
+                item = self.cfg["item_numeric_ids"].get(str(key))
+                if item in self.cfg["items"] and amount:
+                    out[item] = out.get(item, 0) + amount
+            return out
+        seen = self.clock().isoformat()
+        banks = []
+        for bank in payload["Banks"]:
+            if not isinstance(bank, dict) or not str(bank.get("LocationId") or ""):
+                raise ValueError("Each bank needs a LocationId")
+            banks.append((str(bank["LocationId"]), location(bank.get("PreviousLocationId") or ""), tracked(bank.get("Items"))))
+        carried = tracked(payload["Inventory"])
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO carried VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET items=excluded.items,seen=excluded.seen",
+                            (json.dumps(carried, sort_keys=True), seen))
+            for place, previous, items in banks:
+                city = location(place)
+                if city not in CITIES:
+                    learned = self.db.execute("SELECT city FROM bank_cities WHERE location=?", (place,)).fetchone()
+                    city = learned["city"] if learned else previous if previous in CITIES else None
+                    if city and not learned:
+                        self.db.execute("INSERT INTO bank_cities VALUES(?,?)", (place, city))
+                self.db.execute("INSERT INTO bank_auto VALUES(?,?,?,?) ON CONFLICT(location) DO UPDATE SET city=excluded.city,items=excluded.items,seen=excluded.seen",
+                                (place, city, json.dumps(items, sort_keys=True), seen))
+        return {"accepted": len(banks), "carried": sum(carried.values()), "received_at": seen}
 
     def capital(self, cache, open_orders, holdings):
         """Silver tied up in tracked items: units held (holdings) at their average cost plus
@@ -2072,6 +2135,8 @@ def handler_class(store, token):
                         result = store.ingest_my_orders(payload)
                     elif topic == "marketorders.finished":
                         result = store.ingest_finished(payload)
+                    elif topic == "holdings.containers":
+                        result = store.ingest_holdings(payload)
                     else:
                         result = {"accepted": 0, "ignored": True}
                 elif path.startswith("/ingest/europe/"):
