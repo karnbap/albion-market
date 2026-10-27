@@ -555,6 +555,52 @@ class MarketTests(unittest.TestCase):
         self.assertEqual((listing['kind'], listing['units']), ('instant_list', 24))
         self.assertEqual(listing['outlook']['next24'], 24)
 
+    def test_capital_counts_stock_at_cost_plus_open_buy_orders_and_logs_its_growth(self):
+        self.six_hour_history(2, 2, 2, 2)  # 8 T7 relics sold a day (Lymhurst only)
+        self.store.add_purchase({'item': 'T7_RELIC', 'city': '1002', 'kind': 'instant', 'price': 100, 'amount': 10})
+        self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(1, 150, 10)]})
+        self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '1002', 'Orders': [self.order(2, 90, 5, 'request')]})
+        c = self.store.state()['capital']
+        relic = c['items']['T7_RELIC']
+        self.assertEqual((c['holdings'], c['orders'], c['total'], c['unpriced']), (1000, 450, 1450, 0))
+        self.assertEqual((relic['held'], relic['buying'], relic['per_day']), (10, 5, 8))
+        self.assertAlmostEqual(relic['days'], 15 / 8)
+        self.assertFalse(relic['heavy'])
+        self.assertEqual([ch['delta'] for ch in c['changes']], [None, None, None])
+        # Logged at most once an hour.
+        self.now += timedelta(minutes=30)
+        self.store.state()
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM capital_log").fetchone()[0], 1)
+        # A day later the bank holds 10 more: stock is now heavy and the growth shows.
+        self.now += timedelta(days=1)
+        self.store.set_bank({'item': 'T7_RELIC', 'city': '1002', 'amount': 10})
+        c = self.store.state()['capital']
+        day = c['changes'][0]
+        self.assertEqual((c['total'], day['total'], day['delta']), (2450, 1450, 1000))
+        self.assertAlmostEqual(day['ratio'], 1000 / 1450)
+        self.assertTrue(c['items']['T7_RELIC']['heavy'])
+        self.assertEqual(len(c['daily']), 2)
+
+    def test_heavy_stock_cuts_picks_that_add_stock_but_not_instant_round_trips(self):
+        self.hourly_profile(lambda t: 1)  # 24 a day in Martlock
+        self.market('1002', 10, asks=[100, 101])
+        self.market('3008', 20, asks=[200], bids=[130])
+        self.store.set_bank({'item': 'T7_RELIC', 'city': '3008', 'amount': 100})  # 100 / 24 = 4.2 days of stock
+        state = self.store.state()
+        groups = state['now_groups']
+        self.assertEqual([p['kind'] for p in groups['instant']], ['instant'])
+        listing = groups['wait'][0]
+        # 2 - 4.17 / 3 = 0.61 of the 24 units the plan would buy.
+        self.assertEqual((listing['kind'], listing['units']), ('instant_list', 14))
+        self.assertTrue(any('재고 4.2일치' in w and '24개에서 14개로' in w for w in listing['warnings']))
+        self.assertTrue(any('재고 4.2일치' in r for c in state['candidates'] if c['mode'] != 'instant' for r in c['reasons']))
+        self.assertFalse(any('재고' in r for c in state['candidates'] if c['mode'] == 'instant' for r in c['reasons']))
+        # Twice the limit: no more stock is bought at all.
+        self.store.set_bank({'item': 'T7_RELIC', 'city': '3008', 'amount': 150})
+        groups = self.store.state()['now_groups']
+        self.assertEqual(groups['wait'], [])
+        self.assertEqual([p['kind'] for p in groups['instant']], ['instant'])
+
     def test_quiet_hours_warn_waiting_trades(self):
         self.hourly_profile(lambda t: 1 if 14 <= t.hour < 20 else 10)
         self.market('1002', 10, asks=[100, 101])

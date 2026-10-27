@@ -39,8 +39,12 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # Caerleon and Brecilien are left out of trading by default: reaching them means crossing
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
-SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261027.8"
+# inventory_heavy_days: once units held and on the way (open buy orders) reach this many days of
+# the item's market-wide daily sales, picks that add stock buy less.
+SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3}
+# Plans that leave units to sell later; an instant round trip sells what it buys at once.
+STOCKING_KINDS = ("instant_list", "best", "buyout")
+BUILD = "20261027.9"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
@@ -294,6 +298,8 @@ class Store:
           PRIMARY KEY(item,city));
         CREATE TABLE IF NOT EXISTS finished_lists(location TEXT PRIMARY KEY, city TEXT NOT NULL, received TEXT NOT NULL, entries TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS last_results(kind TEXT PRIMARY KEY, created TEXT NOT NULL, seen TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS capital_log(at TEXT PRIMARY KEY, total REAL NOT NULL, holdings REAL NOT NULL, orders REAL NOT NULL,
+          unpriced INTEGER NOT NULL, units TEXT NOT NULL);
         """)
         # mailed: when the game sent the mail (the fork reads it from the mailbox list).
         # moved: when an own order's units left last went down in the "my orders" list.
@@ -341,6 +347,9 @@ class Store:
             if not math.isfinite(budget) or not budget.is_integer() or not 1 <= budget <= 10**12:
                 raise ValueError("trade_budget must be a positive integer")
             cfg["trade_budget"] = int(budget)
+            cfg["inventory_heavy_days"] = float(cfg["inventory_heavy_days"])
+            if not math.isfinite(cfg["inventory_heavy_days"]) or not 0.5 <= cfg["inventory_heavy_days"] <= 60:
+                raise ValueError("inventory_heavy_days must be between 0.5 and 60")
             for key in ("wall_multiple", "depth_price_band"):
                 cfg[key] = float(cfg[key])
             if cfg["large_quantity_min"] <= cfg["small_quantity_max"] or cfg["wall_quantity_min"] < cfg["large_quantity_min"]:
@@ -980,6 +989,57 @@ class Store:
             total, cost = cell["listed"] + cell["bank"] + cell["finished"], costs.get(item)
             rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost, "value": total * cost if cost is not None else None})
         return {"rows": rows, "finished": finished}
+
+    def capital(self, cache, open_orders, holdings):
+        """Silver tied up in tracked items: units held (holdings) at their average cost plus
+        silver locked in open buy orders (units left x price), logged at most once an hour so its
+        growth can be followed. Per item, the inventory in days of the item's market-wide daily
+        sales (volume_guide summed over cities): units held and still being bought, over that
+        pace. heavy once it reaches the inventory_heavy_days setting."""
+        now, items = self.clock(), {}
+        blank = lambda: {"held": 0, "buying": 0, "value": 0.0, "orders_silver": 0.0, "unpriced": 0, "cost": None}
+        for r in holdings["rows"]:
+            it = items.setdefault(r["item"], blank())
+            it["held"] += r["total"]
+            it["cost"] = r["cost"]
+            if r["cost"] is None:
+                it["unpriced"] += r["total"]
+            else:
+                it["value"] += r["total"] * r["cost"]
+        for o in open_orders:
+            if o["side"] == "buy" and o["remaining"]:
+                it = items.setdefault(o["item"], blank())
+                it["buying"] += o["remaining"]
+                it["orders_silver"] += o["remaining"] * o["price"]
+        heavy_days = self.cfg["inventory_heavy_days"]
+        for item, it in items.items():
+            paces = [p for c in CITIES if (p := self.volume_guide(cache, item, c)["per_day"]) is not None]
+            it["per_day"] = sum(paces) if paces else None
+            it["days"] = (it["held"] + it["buying"]) / it["per_day"] if it["per_day"] else None
+            it["heavy"] = it["days"] is not None and it["days"] >= heavy_days
+        holdings_value = sum(it["value"] for it in items.values())
+        orders_silver = sum(it["orders_silver"] for it in items.values())
+        unpriced = sum(it["unpriced"] for it in items.values())
+        total = holdings_value + orders_silver
+        units = {item: it["held"] for item, it in items.items() if it["held"]}
+        with self.lock:
+            last = self.db.execute("SELECT at FROM capital_log ORDER BY at DESC LIMIT 1").fetchone()
+            if (total or units or last) and (last is None or now - parse_time(last["at"]) >= timedelta(hours=1)):
+                with self.db:
+                    self.db.execute("INSERT INTO capital_log VALUES(?,?,?,?,?,?)", (now.isoformat(), total, holdings_value, orders_silver, unpriced,
+                                                                                   json.dumps(units, sort_keys=True)))
+                    self.db.execute("DELETE FROM capital_log WHERE at<?", ((now - timedelta(days=120)).isoformat(),))
+            changes = []
+            for days in (1, 7, 30):
+                then = self.db.execute("SELECT at,total FROM capital_log WHERE at<=? ORDER BY at DESC LIMIT 1", ((now - timedelta(days=days)).isoformat(),)).fetchone()
+                changes.append({"days": days, "at": then["at"] if then else None, "total": then["total"] if then else None,
+                                "delta": total - then["total"] if then else None,
+                                "ratio": (total - then["total"]) / then["total"] if then and then["total"] else None})
+            zone, daily = ZoneInfo(self.cfg["timezone"]), {}
+            for r in self.db.execute("SELECT at,total,holdings,orders,unpriced FROM capital_log WHERE at>=? ORDER BY at", ((now - timedelta(days=30)).isoformat(),)):
+                daily[parse_time(r["at"]).astimezone(zone).date().isoformat()] = dict(r)
+        return {"total": total, "holdings": holdings_value, "orders": orders_silver, "unpriced": unpriced, "heavy_days": heavy_days,
+                "items": items, "changes": changes, "daily": [{"date": d, **r} for d, r in daily.items()]}
 
     def client_debug(self):
         lines = [dict(r) for r in self.db.execute("SELECT logged,op,text FROM client_lines ORDER BY logged DESC, id DESC LIMIT 15")]
@@ -1709,6 +1769,29 @@ class Store:
                           "buy_high": best["top_price"], "sell_high": best["relist"], "sell_low": best["relist"], "certainty": certainty,
                           "score": best["profit"] * weight, "sell_per_day": self.volume_guide(cache, b["item"], b["city"])["per_day"],
                           "floor_after": best["floor"], "warnings": [r for r in b["reasons"] if r != FEES_UNCONFIRMED]})
+        heavy_days = self.cfg["inventory_heavy_days"]
+        for plan in plans:
+            # Stock already worth more than heavy_days of sales: picks that add stock buy only the
+            # share that keeps it there (none at all from twice the limit, so the plan drops), and a
+            # buyout, which must buy the whole sweep, ranks lower instead.
+            stock = cache.get("inventory", {}).get(plan["item"])
+            if plan["kind"] in STOCKING_KINDS and stock and stock["heavy"]:
+                note = f"재고 {stock['days']:,.1f}일치(보유 {stock['held']:,}개 + 매수 주문 {stock['buying']:,}개 · 시장 하루 {stock['per_day']:,.0f}개 팔림)"
+                if plan["kind"] == "buyout":
+                    plan["score"] *= heavy_days / stock["days"]
+                    plan["warnings"].append(note + " · 더 사기 전에 파는 쪽이 먼저라 순위를 낮췄음")
+                else:
+                    keep = max(0.0, 2 - stock["days"] / heavy_days)
+                    units = int(plan["units"] * keep)
+                    if units >= plan["units"]:
+                        continue
+                    if units < 1:
+                        plan["dropped"] = True
+                        continue
+                    ratio = units / plan["units"]
+                    plan["warnings"].append(note + f" · 매수 수량을 {plan['units']:,}개에서 {units:,}개로 줄였음")
+                    plan["units"], plan["cost"], plan["profit"], plan["score"] = units, round(plan["cost"] * ratio), round(plan["profit"] * ratio), plan["score"] * ratio
+        plans = [p for p in plans if not p.get("dropped")]
         for plan in plans:
             # Listing and buyout plans sell over the coming day, so today's usual pace matters;
             # an instant trade settles now and only gets the information.
@@ -1809,6 +1892,9 @@ class Store:
             buyouts = self.buyouts(books, cache)
             for card in board:
                 card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
+            holdings = self.holdings(mine_rows, purchases)
+            capital = self.capital(cache, mine_rows, holdings)
+            cache["inventory"] = capital["items"]
             now_groups = self.recommendations(books, every, buyouts, cache)
             now = now_groups["instant"] + now_groups["wait"]
             if now:
@@ -1825,6 +1911,9 @@ class Store:
                 candidate["personal_sale_evidence"] = evidence
                 if evidence:
                     candidate["reasons"].append(f"내 판매 메일 누적 최고 {evidence['highest_price']:,} / {evidence['highest_price_amount']:,}개 · 체결 시각 미확인, 현재 체결 보장 아님")
+                stock = capital["items"].get(candidate["item"])
+                if candidate["mode"] in STOCKING_KINDS + ("depth",) and stock and stock["heavy"]:
+                    candidate["reasons"].append(f"재고 {stock['days']:,.1f}일치 보유 · 더 사기 전에 파는 쪽이 먼저")
             past_candidates, past_buyouts = self.remember_results("candidates", candidates), self.remember_results("buyouts", buyouts)
             # Buying-quantity guides for every market a displayed number depends on.
             routes = [*candidates, *(past_candidates or {}).get("rows", []),
@@ -1840,7 +1929,7 @@ class Store:
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "past_candidates": past_candidates, "past_buyouts": past_buyouts, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
-                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": self.holdings(mine_rows, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": holdings, "capital": capital, "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
