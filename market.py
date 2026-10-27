@@ -40,9 +40,12 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261027.2"
+BUILD = "20261027.3"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
+# An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
+# rule); waiting is advised when the queue ahead should clear within SOON_DAYS.
+STALE_DAYS, SOON_DAYS = 3, 3
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}
@@ -284,8 +287,9 @@ class Store:
           price REAL NOT NULL, amount INTEGER NOT NULL, bought TEXT NOT NULL, created TEXT NOT NULL, removed TEXT);
         """)
         # mailed: when the game sent the mail (the fork reads it from the mailbox list).
+        # moved: when an own order's units left last went down in the "my orders" list.
         for table, name, kind in (("my_orders", "remaining", "INTEGER"), ("my_orders", "checked", "TEXT"),
-                                  ("my_orders", "source", "TEXT NOT NULL DEFAULT 'manual'"),
+                                  ("my_orders", "source", "TEXT NOT NULL DEFAULT 'manual'"), ("my_orders", "moved", "TEXT"),
                                   ("personal_sales", "mailed", "TEXT"), ("personal_mails", "mailed", "TEXT")):
             if name not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
@@ -694,6 +698,67 @@ class Store:
         rows.sort(key=lambda r: parse_time(r["at"]), reverse=True)
         return {"summary": summary, "recent": rows[:100], "window_days": PURCHASE_WINDOW_DAYS, "setup_fee": fee}
 
+    def stale_listings(self, cache, books, open_orders, purchases):
+        """Own sell orders that sold nothing for STALE_DAYS, with three ways out priced against
+        what the units cost (purchases): wait at the current price; cancel and relist one silver
+        under the cheapest other seller, paying the setup fee again on the new price; or sell now
+        into the best buy orders. Days to sell = units ahead of mine (plus mine) over the
+        market's slowest daily pace (volume_guide) times its instant-buy share when known (only
+        instant buys take sell orders). Idle time runs from the last time units left
+        went down, else from when this program first saw the order (not when it was placed).
+        Advice: cheapest (already first in line, demand is the limit), soon (my turn within
+        SOON_DAYS), below_cost (relisting would sell under cost), no_pace (no sales history to
+        tell), else relist."""
+        now, tax, fee = self.clock(), self.cfg["sales_tax"], self.cfg["setup_fee"]
+        costs = {s["item"]: s["recent"]["cost_average"] or s["all"]["cost_average"] for s in purchases["summary"]}
+        out = []
+        for o in open_orders:
+            if o["side"] != "sell" or not o["order_id"] or not o["remaining"]:
+                continue
+            filled = self.db.execute("SELECT MAX(after) FROM order_fills WHERE order_id=?", (o["order_id"],)).fetchone()[0]
+            last = max((parse_time(t) for t in (o["moved"], filled) if t), default=None)
+            idle = (now - (last or parse_time(o["created"]))).total_seconds() / 86400
+            if idle < STALE_DAYS:
+                continue
+            units, cost = o["remaining"], costs.get(o["item"])
+            # Only instant buys take sell orders; the rest of the volume hit buy orders.
+            if ("study", o["item"], o["city"]) not in cache:
+                cache["study", o["item"], o["city"]] = self.market_study(o["item"], o["city"], cache)
+            share = cache["study", o["item"], o["city"]]["instant_buy_share"]
+            per_day = self.volume_guide(cache, o["item"], o["city"])["per_day"]
+            per_day = per_day * share if per_day is not None and share is not None else per_day
+            def option(price, net, sold, queue, extra=0):
+                return {"price": price, "net": net, "units": sold, "days": queue / per_day if per_day and queue else 0 if not queue else None,
+                        "fee": extra, "margin": None if cost is None else net - cost}
+            wait = option(o["price"], o["price"] * (1 - tax), units, o["ahead"] + units)
+            relist = None
+            if o["ahead"] and o["best"] is not None and o["best"] > 1:
+                new = math.ceil(o["best"]) - 1
+                relist = option(new, new * (1 - tax - fee), units, units, new * fee * units)
+            sold = proceeds = 0
+            for level in books[o["item"]][o["city"]]["buy"]["levels"]:
+                take = min(units - sold, level["amount"])
+                sold, proceeds = sold + take, proceeds + take * level["price"]
+                if sold == units:
+                    break
+            instant = option(proceeds / sold, proceeds / sold * (1 - tax), sold, 0) if sold else None
+            if not o["ahead"]:
+                advice = "cheapest"
+            elif wait["days"] is not None and wait["days"] <= SOON_DAYS:
+                advice = "soon"
+            elif relist is None or (cost is not None and relist["net"] < cost):
+                advice = "below_cost"
+            elif per_day is None:
+                advice = "no_pace"
+            else:
+                advice = "relist"
+            out.append({"id": o["id"], "item": o["item"], "city": o["city"], "price": o["price"], "remaining": units,
+                        "idle_days": idle, "since": last.isoformat() if last else o["created"], "sold_before": last is not None,
+                        "ahead": o["ahead"], "best": o["best"], "book_seen": books[o["item"]][o["city"]]["sell"]["seen"],
+                        "per_day": per_day, "instant_buy_share": share, "cost": cost,
+                        "wait": wait, "relist": relist, "instant": instant, "advice": advice})
+        return sorted(out, key=lambda r: -r["idle_days"])
+
     def link_my_orders(self):
         """Match unlinked own orders to observed orders of the same market, side and price: an
         exact quantity first, else one with fewer units left (already partly sold). An order id
@@ -786,12 +851,15 @@ class Store:
         for r, city, price, amount, _ in rows:
             side, oid = "sell" if r["AuctionType"] == "offer" else "buy", str(r["Id"])
             listed[(city, side)].add(oid)
-            mine = self.db.execute("SELECT id FROM my_orders WHERE order_id=? AND closed IS NULL", (oid,)).fetchone()
+            mine = self.db.execute("SELECT id,remaining FROM my_orders WHERE order_id=? AND closed IS NULL", (oid,)).fetchone()
             if mine is None:
-                mine = self.db.execute("""SELECT id FROM my_orders WHERE order_id IS NULL AND closed IS NULL AND item=? AND city=? AND side=?
+                mine = self.db.execute("""SELECT id,remaining FROM my_orders WHERE order_id IS NULL AND closed IS NULL AND item=? AND city=? AND side=?
                     AND price=? AND amount>=? ORDER BY amount=? DESC, id LIMIT 1""", (r["ItemTypeId"], city, side, price, amount, amount)).fetchone()
             if mine:
-                self.db.execute("UPDATE my_orders SET order_id=?,price=?,remaining=?,checked=? WHERE id=?", (oid, price, amount, received, mine["id"]))
+                # Fewer units left than the last list showed: some sold (or filled) since.
+                moved = received if mine["remaining"] is not None and amount < mine["remaining"] else None
+                self.db.execute("UPDATE my_orders SET order_id=?,price=?,remaining=?,checked=?,moved=COALESCE(?,moved) WHERE id=?",
+                                (oid, price, amount, received, moved, mine["id"]))
             else:
                 self.db.execute("INSERT INTO my_orders(item,city,side,price,amount,created,order_id,remaining,checked,source) VALUES(?,?,?,?,?,?,?,?,?,'auto')",
                                 (r["ItemTypeId"], city, side, price, amount, received, oid, amount, received))
@@ -1625,6 +1693,7 @@ class Store:
             sales = self.personal_sales(item, city)
             cache = {}
             mine_rows = self.my_orders(books)
+            purchases = self.purchases(mine_rows)
             for r in mine_rows:
                 cache.setdefault("mine", {}).setdefault((r["item"], r["city"], r["side"]), []).append(r)
             every = self.candidates(books, cache)
@@ -1660,7 +1729,7 @@ class Store:
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
-                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": self.purchases(mine_rows), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
+                "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
