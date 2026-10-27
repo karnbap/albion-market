@@ -41,28 +41,31 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # which would always top the rankings.
 # inventory_heavy_days: once units held and on the way (open buy orders) reach this many days of
 # the item's market-wide daily sales, picks that add stock buy less.
-SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3}
+# cycle_share / weekday_cycles: the trading plan's part of a market's daily sales and weekday turns.
+SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3,
+                    "cycle_share": 0.2, "weekday_cycles": 2}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261027.12"
+BUILD = "20261027.13"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
-# 4002 <-> 4001). A bank can also be entered from a travel hub (4000), which names no city; other
-# banks are learned when entered from the city, or picked on the page.
-BANK_CITIES = {"0006": "7", "4001": "4002"}
+# 4002 <-> 4001, 1002 -> 1001 with the Lymhurst bank's stock as the player stated it). A bank can
+# also be entered from a travel hub (4000), which names no city; other banks are learned when
+# entered from the city, or picked on the page.
+BANK_CITIES = {"0006": "7", "4001": "4002", "1001": "1002"}
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
 # rule); waiting is advised when the queue ahead should clear within SOON_DAYS.
 STALE_DAYS, SOON_DAYS = 3, 3
-# Portfolio advice (the user's routine): collect with buy orders Mon-Thu, sell Fri-Sun. One item
-# gets at most MAX_SHARE of the invested silver, and no more than it takes to sell MARKET_SHARE of
-# its sell city's sell-day sales over those days. Weights are return over price swing.
-BUY_DAYS, SELL_DAYS = (0, 1, 2, 3), (4, 5, 6)
-PORTFOLIO_MAX_SHARE, PORTFOLIO_MARKET_SHARE, PORTFOLIO_SWING_FLOOR = 0.5, 0.05, 0.02
-# My own sales outweigh the market estimate once this many units were sold in 28 days.
-PORTFOLIO_OWN_UNITS = 100
+# Trading plan (the user's routine, 2026-10-27): on weekdays (BUY_DAYS) buy a little and sell it the
+# same day, turning the silver over weekday_cycles times a day; in the weekend hot time (Friday
+# evening to Sunday, HOT_DAYS long) sweep cheap listings and sell high. My part of a market is the
+# cycle_share setting of what it sells a day.
+BUY_DAYS, SELL_DAYS, HOT_DAYS = (0, 1, 2, 3), (4, 5, 6), 2.25
+# Without a measured instant-buy share, half of a market's sales are taken as sell orders filling.
+PLAN_INSTANT_SHARE = 0.5
 # An hour of day is compared once it has this many days of hourly history; a gap under
 # PORTFOLIO_HOUR_GAP from the day's average is called no clear pattern.
 PORTFOLIO_HOUR_DAYS, PORTFOLIO_HOUR_GAP = 3, 0.03
@@ -369,6 +372,13 @@ class Store:
             cfg["inventory_heavy_days"] = float(cfg["inventory_heavy_days"])
             if not math.isfinite(cfg["inventory_heavy_days"]) or not 0.5 <= cfg["inventory_heavy_days"] <= 60:
                 raise ValueError("inventory_heavy_days must be between 0.5 and 60")
+            cfg["cycle_share"] = float(cfg["cycle_share"])
+            if not math.isfinite(cfg["cycle_share"]) or not 0 < cfg["cycle_share"] <= 1:
+                raise ValueError("cycle_share must be above 0 and at most 1")
+            turns = float(cfg["weekday_cycles"])
+            if not math.isfinite(turns) or not turns.is_integer() or not 1 <= turns <= 12:
+                raise ValueError("weekday_cycles must be a whole number from 1 to 12")
+            cfg["weekday_cycles"] = int(turns)
             for key in ("wall_multiple", "depth_price_band"):
                 cfg[key] = float(cfg[key])
             if cfg["large_quantity_min"] <= cfg["small_quantity_max"] or cfg["wall_quantity_min"] < cfg["large_quantity_min"]:
@@ -600,25 +610,27 @@ class Store:
             self._study_key = key
         return self._studies
 
-    def portfolio_quote(self, item, city, side, books, days, since):
-        """Typical best bid (side buy) or ask (side sell) in a market on that side's days: the
-        recorded bests on those days, else the recorded bests of any day, else the latest book,
-        each scaled by the city's average traded price on those days over all days; else that
-        average traded price."""
+    def plan_quote(self, item, city, side, keys, days, books, since):
+        """Typical best bid (side buy) or ask (side sell) in a market on those weekdays (keys):
+        the recorded bests on those days, else the recorded bests of any day, else the latest
+        book, each scaled by the city's average traded price on those days over all days; else
+        that average traded price."""
         zone = ZoneInfo(self.cfg["timezone"])
-        keys = BUY_DAYS if side == "buy" else SELL_DAYS
         rows = [(parse_time(r["bucket"]).astimezone(zone).weekday(), r["best"]) for r in self.db.execute(
             "SELECT bucket,best FROM book_stats WHERE item=? AND city=? AND side=? AND bucket>?", (item, city, side, since))]
         on_days = [best for day, best in rows if day in keys]
         if len(on_days) >= 3:
             return sum(on_days) / len(on_days), "호가 기록"
-        scale = days[side]["price"] / days["all"]["price"]
+        group = days["weekday" if keys == BUY_DAYS else "weekend"]
+        if not group:
+            return None, None
+        scale = group["price"] / days["all"]["price"]
         if len(rows) >= 3:
             return sum(best for _, best in rows) / len(rows) * scale, "호가 기록 · 요일 보정"
         book = books[item][city][side]
         if book["levels"] and not book["single_only"]:
             return book["levels"][0]["price"] * scale, "마지막 호가 · 요일 보정"
-        return days[side]["price"], "평균 체결가"
+        return group["price"], "평균 체결가"
 
     def portfolio_hours(self, cache, item, city, cheap):
         """Hours of day (configured time zone) to buy (cheap) or sell in a market, from hourly
@@ -640,127 +652,142 @@ class Store:
         gap = sum(h["vs_average"] for h in hours) / len(hours)
         return {"hours": hours, "days": days, "enough": True, "clear": abs(gap) >= PORTFOLIO_HOUR_GAP}
 
-    def portfolio_inputs(self, cache, books):
-        """Per item, the weekday-buy weekend-sell plan behind the portfolio advice, from the last
-        28 days in the trading cities. Buy city: the cheapest average traded price on buy days;
-        sell city: the dearest on sell days; each among cities selling at least a third of the
-        busiest city's pace on those days. Prices from portfolio_quote (buy order at the bid, sell
-        order at the ask). Swing: spread of the sell city's daily average prices over their median."""
+    def plan_inputs(self, cache, books):
+        """Per item, the weekday cycle and the weekend sweep of the trading plan, from the last 28
+        days in the trading cities that sell at least a third of the busiest city's pace on those
+        days. Weekday cycle, two ways: a buy order at the buy city's bid, or an instant buy at its
+        ask (another city), then a sell order at the sell city's ask; units a day = the
+        cycle_share setting of the sales that fill those orders (sell orders: the instant-buy
+        share of the sell city's sales; buy orders: the rest of the buy city's). Weekend: an
+        instant buy at a city's weekday ask, a sell order at the sell city's weekend ask, over
+        HOT_DAYS. Each picks the city pair with the most profit. Prices from plan_quote; swing:
+        spread of the weekend sell city's daily average prices over their median."""
+        cfg = self.cfg
         last = self.db.execute("SELECT MAX(id) FROM packets").fetchone()[0]
-        key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(self.cfg["excluded_cities"]),
-               self.cfg["sales_tax"], self.cfg["setup_fee"], self.cfg["transport_per_unit"])
-        if getattr(self, "_portfolio_key", None) == key:
-            return self._portfolio_inputs
-        zone = ZoneInfo(self.cfg["timezone"])
+        key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(cfg["excluded_cities"]),
+               cfg["sales_tax"], cfg["setup_fee"], cfg["transport_per_unit"], cfg["cycle_share"])
+        if getattr(self, "_plan_key", None) == key:
+            return self._plan_inputs
+        zone = ZoneInfo(cfg["timezone"])
         since = (self.clock() - timedelta(days=28)).isoformat()
+        measured = {(s["item"], s["city"]): s["instant_buy_share"] for s in self.market_studies(cache)}
+        keep = 1 - cfg["sales_tax"] - cfg["setup_fee"]
         out = {}
-        for item in self.cfg["items"]:
+        for item in cfg["items"]:
             days = {}
             for city in self.trade_cities():
                 p = cache.setdefault(("patterns", item, city), self.patterns(item, city))
                 g = {}
-                for name, keys in (("buy", BUY_DAYS), ("sell", SELL_DAYS), ("all", range(7))):
+                for name, keys in (("weekday", BUY_DAYS), ("weekend", SELL_DAYS), ("all", range(7))):
                     seen = [r for r in p["weekdays"] if r["key"] in keys and r["observed_hours"] and r["total"]]
                     total, hours, silver = (sum(r[k] for r in seen) for k in ("total", "observed_hours", "silver"))
                     g[name] = {"per_day": total / hours * 24, "price": silver / total} if total else None
-                priced = [r for r in p["weekdays"] if r["average_price"]]
-                g["cheapest_day"] = min(priced, key=lambda r: r["average_price"])["key"] if priced else None
-                g["dearest_day"] = max(priced, key=lambda r: r["average_price"])["key"] if priced else None
                 days[city] = g
-            def pick(side, better):
-                pool = {c: g[side] for c, g in days.items() if g[side]}
-                if not pool:
-                    return None
-                busiest = max(x["per_day"] for x in pool.values())
-                return better((c for c, x in pool.items() if x["per_day"] >= busiest / 3), key=lambda c: pool[c]["price"])
-            buy_city, sell_city = pick("buy", min), pick("sell", max)
-            if not buy_city or not sell_city:
-                out[item] = None
-                continue
-            buy, buy_basis = self.portfolio_quote(item, buy_city, "buy", books, days[buy_city], since)
-            sell, sell_basis = self.portfolio_quote(item, sell_city, "sell", books, days[sell_city], since)
-            daily = defaultdict(lambda: [0, 0])
-            for r in self.history_rows(item, sell_city, 28):
-                d = daily[parse_time(r["start"]).astimezone(zone).date()]
-                d[0] += r["amount"]; d[1] += r["silver"]
-            prices = [silver / amount for amount, silver in daily.values() if amount]
-            # Robust spread (1.4826 x median absolute deviation): a one-day spike or a bad print
-            # does not make a steady market look jumpy.
-            mid = median(prices) if len(prices) >= 7 else None
-            swing = 1.4826 * median(abs(x - mid) for x in prices) / mid if mid else None
-            cost = buy * (1 + self.cfg["setup_fee"]) + (self.cfg["transport_per_unit"] if buy_city != sell_city else 0)
-            net = sell * (1 - self.cfg["sales_tax"] - self.cfg["setup_fee"])
-            out[item] = {"buy_city": buy_city, "sell_city": sell_city, "buy": buy, "sell": sell, "buy_basis": buy_basis, "sell_basis": sell_basis,
-                         "cost": cost, "net": net, "margin": net - cost, "roi": net / cost - 1,
-                         "buy_per_day": days[buy_city]["buy"]["per_day"], "sell_per_day": days[sell_city]["sell"]["per_day"],
-                         "cheapest_day": days[buy_city]["cheapest_day"], "dearest_day": days[sell_city]["dearest_day"],
-                         "swing": swing, "swing_days": len(prices),
-                         "buy_hours": self.portfolio_hours(cache, item, buy_city, True),
-                         "sell_hours": self.portfolio_hours(cache, item, sell_city, False)}
-        self._portfolio_key, self._portfolio_inputs = key, out
+            def busy(name):
+                pool = {c: g[name]["per_day"] for c, g in days.items() if g[name]}
+                return [c for c, v in pool.items() if v >= max(pool.values()) / 3] if pool else []
+            weekday, weekend = busy("weekday"), busy("weekend")
+            quote = lambda city, side, keys: self.plan_quote(item, city, side, keys, days[city], books, since)
+            bid = {c: quote(c, "buy", BUY_DAYS) for c in weekday}
+            ask = {c: quote(c, "sell", BUY_DAYS) for c in weekday}
+            ask_weekend = {c: quote(c, "sell", SELL_DAYS) for c in weekend}
+            share = {c: PLAN_INSTANT_SHARE if measured.get((item, c)) is None else measured[(item, c)] for c in days}
+            def plan(method, buy_city, sell_city, buy, sell, fee_in, units):
+                cost = buy[0] * (1 + fee_in) + (cfg["transport_per_unit"] if buy_city != sell_city else 0)
+                net = sell[0] * keep
+                return {"method": method, "buy_city": buy_city, "sell_city": sell_city, "buy": buy[0], "sell": sell[0],
+                        "buy_basis": buy[1], "sell_basis": sell[1], "cost": cost, "net": net, "margin": net - cost,
+                        "roi": net / cost - 1, "units": units, "profit": (net - cost) * units,
+                        "share_measured": measured.get((item, sell_city)) is not None}
+            cycles = []
+            for b in weekday:
+                for s in weekday:
+                    if ask[s][0] is None:
+                        continue
+                    sells = share[s] * days[s]["weekday"]["per_day"]
+                    if bid[b][0] is not None:
+                        buys = (1 - share[b]) * days[b]["weekday"]["per_day"]
+                        cycles.append(plan("order", b, s, bid[b], ask[s], cfg["setup_fee"], cfg["cycle_share"] * min(sells, buys)))
+                    if b != s and ask[b][0] is not None:
+                        cycles.append(plan("instant", b, s, ask[b], ask[s], 0, cfg["cycle_share"] * sells))
+            sweeps = [plan("instant", b, s, ask[b], ask_weekend[s], 0, cfg["cycle_share"] * share[s] * days[s]["weekend"]["per_day"] * HOT_DAYS)
+                      for s in weekend if ask_weekend[s][0] is not None for b in weekday if ask[b][0] is not None]
+            best = lambda options: max((o for o in options if o["margin"] > 0), key=lambda o: o["profit"], default=None)
+            cycle, sweep = best(cycles), best(sweeps)
+            other = best([o for o in cycles if cycle and o["method"] != cycle["method"]])
+            swing = None
+            if sweep:
+                daily = defaultdict(lambda: [0, 0])
+                for r in self.history_rows(item, sweep["sell_city"], 28):
+                    d = daily[parse_time(r["start"]).astimezone(zone).date()]
+                    d[0] += r["amount"]; d[1] += r["silver"]
+                prices = [silver / amount for amount, silver in daily.values() if amount]
+                # Robust spread (1.4826 x median absolute deviation): a one-day spike or a bad
+                # print does not make a steady market look jumpy.
+                mid = median(prices) if len(prices) >= 7 else None
+                swing = 1.4826 * median(abs(x - mid) for x in prices) / mid if mid else None
+            out[item] = {"weekday": cycle, "weekday_other": other, "weekend": sweep, "swing": swing,
+                         "buy_hours": self.portfolio_hours(cache, item, cycle["buy_city"], True) if cycle else None,
+                         "sell_hours": self.portfolio_hours(cache, item, cycle["sell_city"], False) if cycle else None,
+                         "weekend_hours": self.portfolio_hours(cache, item, sweep["sell_city"], False) if sweep else None}
+        self._plan_key, self._plan_inputs = key, out
         return out
 
     def portfolio(self, cache, books, capital, purchases):
-        """Target share of the invested silver (capital total) per item. Return: my own sales in
-        the last 28 days (sale mails) over the average purchase cost once PORTFOLIO_OWN_UNITS were
-        sold, else the market plan. Weight: return over swing (a steady 10% beats a jumpy 20%),
-        only for items that make money; capped at
-        PORTFOLIO_MAX_SHARE and at what selling PORTFOLIO_MARKET_SHARE of the sell city's sell-day
-        sales would move; what no item can take stays as silver. Beside it, the share held now
-        (units at cost plus open buy orders)."""
-        inputs, total = self.portfolio_inputs(cache, books), capital["total"]
+        """Silver per item for the trading plan, as shares of the invested silver (capital total).
+        Weekday: one turn (units a day over the weekday_cycles setting, at cost); weekend: the
+        units to sell in the hot time, at cost. The weekday and the weekend each fill items in
+        order of profit per silver tied (a weekday turn earns its margin weekday_cycles times a
+        day over the four days) until the total runs out; the rest stays as silver. Units held now
+        go first: a turn buys only what they do not cover. Beside it, my sale mails of the last 28
+        days against the average purchase cost."""
+        cfg = self.cfg
+        inputs, total, turns = self.plan_inputs(cache, books), capital["total"], cfg["weekday_cycles"]
+        def fill(needs):
+            left, given = total, {}
+            for item, (silver, _) in sorted(needs.items(), key=lambda kv: -kv[1][1]):
+                given[item] = min(silver, max(0.0, left))
+                left -= given[item]
+            return given
+        weekday_need, weekend_need = {}, {}
+        for item, x in inputs.items():
+            if x["weekday"]:
+                w = x["weekday"]
+                silver = math.ceil(w["units"] / turns) * w["cost"]
+                weekday_need[item] = (silver, w["profit"] * len(BUY_DAYS) / silver if silver else 0)
+            if x["weekend"]:
+                weekend_need[item] = (math.floor(x["weekend"]["units"]) * x["weekend"]["cost"], x["weekend"]["roi"])
+        weekday_given, weekend_given = fill(weekday_need), fill(weekend_need)
         since = (self.clock() - timedelta(days=28)).isoformat()
         sold = {r["item"]: r for r in self.db.execute(
             "SELECT item,SUM(amount) AS units,SUM(price*amount) AS silver FROM personal_sales WHERE conflict=0 AND COALESCE(mailed,first_seen)>? GROUP BY item", (since,))}
         costs = {s["item"]: s["all"]["cost_average"] for s in purchases["summary"]}
-        mine, returns = {}, {}
-        for item in self.cfg["items"]:
+        share = lambda silver: silver / total if total else None
+        rows = []
+        for item in cfg["items"]:
+            x, held = inputs[item], capital["items"].get(item)
+            units_held = held["held"] if held else 0
+            weekday = weekend = mine = None
+            if x["weekday"]:
+                w = x["weekday"]
+                turn = math.ceil(w["units"] / turns)
+                weekday = {**w, "turn_units": turn, "turn_silver": weekday_need[item][0], "turns": turns,
+                           "profit_week": w["profit"] * len(BUY_DAYS), "silver": weekday_given[item], "share": share(weekday_given[item]),
+                           "stock_turns": units_held / turn if turn else None, "to_buy": max(0, turn - units_held)}
+            if x["weekend"]:
+                units = math.floor(x["weekend"]["units"])
+                weekend = {**x["weekend"], "units": units, "need": weekend_need[item][0], "silver": weekend_given[item], "share": share(weekend_given[item])}
             if item in sold and sold[item]["units"]:
                 price, cost = sold[item]["silver"] / sold[item]["units"], costs.get(item)
-                mine[item] = {"units": sold[item]["units"], "price": price,
-                              "roi": price * (1 - self.cfg["sales_tax"] - self.cfg["setup_fee"]) / cost - 1 if cost else None}
-            own = mine.get(item)
-            if own and own["roi"] is not None and own["units"] >= PORTFOLIO_OWN_UNITS:
-                returns[item] = (own["roi"], "mine")
-            elif inputs.get(item):
-                returns[item] = (inputs[item]["roi"], "market")
-        plans = {item: inputs[item] for item, (roi, _) in returns.items() if roi > 0 and inputs.get(item)}
-        known = [x["swing"] for x in plans.values() if x["swing"] is not None]
-        fallback = max(known, default=0.1)  # no swing measured yet: assume the jumpiest seen
-        raw = {item: returns[item][0] / max(x["swing"] if x["swing"] is not None else fallback, PORTFOLIO_SWING_FLOOR) for item, x in plans.items()}
-        caps = {item: min(PORTFOLIO_MAX_SHARE, PORTFOLIO_MARKET_SHARE * x["sell_per_day"] * len(SELL_DAYS) * x["cost"] / total) if total else PORTFOLIO_MAX_SHARE
-                for item, x in plans.items()}
-        weights, left, free = {}, 1.0, dict(raw)
-        while free:
-            scale = left / sum(free.values())
-            over = [item for item, r in free.items() if r * scale >= caps[item]]
-            if not over:
-                weights.update((item, r * scale) for item, r in free.items())
-                left = 0.0
-                break
-            for item in over:
-                weights[item] = caps[item]
-                left -= caps[item]
-                free.pop(item)
-        # Units to buy this week: the silver still missing at the buy cost, spread over the buy
-        # days left (from Friday on, next week's).
-        today = self.clock().astimezone(ZoneInfo(self.cfg["timezone"])).weekday()
-        days_left = sum(1 for d in BUY_DAYS if d >= today) or len(BUY_DAYS)
-        rows = []
-        for item in self.cfg["items"]:
-            held = capital["items"].get(item)
-            now = held["value"] + held["orders_silver"] if held else 0.0
-            target = weights.get(item, 0.0)
-            roi, basis = returns.get(item, (None, None))
-            plan = inputs.get(item)
-            units = math.floor(max(0.0, target * total - now) / plan["cost"]) if plan and target and total else 0
-            week = {"units": units, "per_day": math.ceil(units / days_left), "days_left": days_left, "next_week": today not in BUY_DAYS,
-                    "sellable": math.floor(PORTFOLIO_MARKET_SHARE * plan["sell_per_day"] * len(SELL_DAYS)) if plan else None}
-            rows.append({"week": week, "item": item, "plan": inputs.get(item), "roi": roi, "roi_basis": basis, "target": target, "capped": item in caps and target >= caps[item] - 1e-9,
-                         "cap": caps.get(item), "current": now / total if total else None, "current_silver": now,
-                         "target_silver": target * total if total else None, "gap_silver": target * total - now if total else None, "mine": mine.get(item)})
-        return {"rows": rows, "cash": max(0.0, left), "total": total, "buy_days": BUY_DAYS, "sell_days": SELL_DAYS,
-                "max_share": PORTFOLIO_MAX_SHARE, "market_share": PORTFOLIO_MARKET_SHARE, "own_units": PORTFOLIO_OWN_UNITS, "cities": self.trade_cities()}
+                mine = {"units": sold[item]["units"], "price": price, "roi": price * (1 - cfg["sales_tax"] - cfg["setup_fee"]) / cost - 1 if cost else None}
+            rows.append({"item": item, "weekday": weekday, "weekday_other": x["weekday_other"], "weekend": weekend, "held": units_held,
+                         "current_silver": held["value"] + held["orders_silver"] if held else 0.0,
+                         "swing": x["swing"], "buy_hours": x["buy_hours"], "sell_hours": x["sell_hours"], "weekend_hours": x["weekend_hours"], "mine": mine})
+        weekday_silver, weekend_silver = sum(weekday_given.values()), sum(weekend_given.values())
+        return {"rows": rows, "total": total, "turns": turns, "cycle_share": cfg["cycle_share"], "hot_days": HOT_DAYS,
+                "weekday_need": sum(n for n, _ in weekday_need.values()), "weekday_silver": weekday_silver, "weekday_share": share(weekday_silver),
+                "weekend_need": sum(n for n, _ in weekend_need.values()), "weekend_silver": weekend_silver, "weekend_share": share(weekend_silver),
+                "cities": self.trade_cities()}
 
     def book_patterns(self, item, city):
         """Average best price and visible quantity per weekday and hour (configured time zone)

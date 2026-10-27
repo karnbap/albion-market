@@ -136,9 +136,10 @@ class HoldingsTests(unittest.TestCase):
         # Entered from 4000 (a travel hub, no city): 4001 is a known Fort Sterling bank; 9001 is not.
         self.store.ingest_holdings({"LocationId": "4001", "Inventory": {},
                                     "Banks": [{"LocationId": "4001", "PreviousLocationId": "4000", "Items": {"2031": 6}},
+                                              {"LocationId": "1001", "PreviousLocationId": "1000", "Items": {"2031": 4}},
                                               {"LocationId": "9001", "PreviousLocationId": "9000", "Items": {"2038": 2}}]})
         h = self.holdings()
-        self.assertEqual([(r["city"], r["item"], r["bank"]) for r in h["rows"]], [("4002", "T7_RELIC", 6)])
+        self.assertEqual([(r["city"], r["item"], r["bank"]) for r in h["rows"]], [("1002", "T7_RELIC", 4), ("4002", "T7_RELIC", 6)])
         self.assertEqual([b["location"] for b in h["unmapped_banks"]], ["9001"])
         self.store.set_bank_city({"location": "9001", "city": "3008"})
         rows = {(r["city"], r["item"]): r["bank"] for r in self.holdings()["rows"]}
