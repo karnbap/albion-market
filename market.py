@@ -29,7 +29,9 @@ ROOT = Path(__file__).resolve().parent
 UTC = timezone.utc
 CITIES = {"1002": "Lymhurst", "2004": "Bridgewatch", "3005": "Caerleon", "3008": "Martlock", "4002": "Fort Sterling", "7": "Thetford", "5003": "Brecilien"}
 # Portal markets are merged by the source project; keep these explicit and sourced.
-PORTALS = {"1301": "1002", "2301": "2004", "3301": "3008", "4301": "4002", "301": "7"}
+# 1000-HellDen: its market listed the same order IDs as Lymhurst's, public buy orders and the
+# player's own (live server, 2026-10-27), so it is Lymhurst's order book.
+PORTALS = {"1301": "1002", "2301": "2004", "3301": "3008", "4301": "4002", "301": "7", "1000-HellDen": "1002"}
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quantity_min": 500,
                   "wall_multiple": 3.0, "depth_price_band": 0.20}
@@ -38,7 +40,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261026.10"
+BUILD = "20261027.1"
 # Trade scenarios. "바로" crosses an existing order now; "주문" waits in the queue.
 MODE_LABELS = {"instant": "바로 매입 · 바로 판매", "instant_list": "바로 매입 · 주문 판매",
                "best": "주문 매입 · 주문 판매", "depth": "주문 매입 · 주문 판매 · 물량 기준 조건부"}

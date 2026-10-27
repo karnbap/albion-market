@@ -667,6 +667,17 @@ class MarketTests(unittest.TestCase):
         self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '1002', 'Orders': []})
         self.assertEqual(sorted(r['order_id'] for r in self.store.state()['my_orders']), ['21', '22'])
 
+    def test_hellden_market_is_lymhurst(self):
+        # The market in 1000-HellDen lists Lymhurst's orders; the fork reports where the player stands.
+        here = lambda *args: dict(self.order(*args), LocationId='1000-HellDen')
+        self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '1000-HellDen', 'Orders': [here(30, 90, 5, 'request')]})
+        self.assertEqual([(r['order_id'], r['city']) for r in self.store.state()['my_orders']], [('30', '1002')])
+        self.now += timedelta(minutes=1)
+        self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '1000-HellDen', 'Orders': []})
+        self.assertEqual(self.store.state()['my_orders'], [])
+        self.capture(here(1, 100, 5), here(2, 120, 3))
+        self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
+
     def test_full_fork_page_never_closes_orders_it_may_not_show(self):
         self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(1, 500, 1)]})
         page = [dict(self.order(100 + i, 130, 1), ItemTypeId='T4_BAG') for i in range(50)]
