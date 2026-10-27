@@ -667,6 +667,43 @@ class MarketTests(unittest.TestCase):
         self.store.ingest_my_orders({'Kind': 'buy', 'LocationId': '1002', 'Orders': []})
         self.assertEqual(sorted(r['order_id'] for r in self.store.state()['my_orders']), ['21', '22'])
 
+    def test_stale_listing_advice_weighs_waiting_against_relisting(self):
+        self.six_hour_history(2, 2, 2, 2)  # 8 sold a day in Lymhurst
+        cost = self.store.add_purchase({'item': 'T7_RELIC', 'city': '1002', 'kind': 'instant', 'price': 100, 'amount': 10})
+        self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(7, 150, 10), self.order(8, 110, 5)]})
+        self.market('1002', 10, asks=[120, 130], bids=[100])
+        self.assertEqual(self.store.state()['stale_listings'], [])
+        self.now += timedelta(days=4)
+        self.market('1002', 10, asks=[120, 130], bids=[100])
+        rows = {r['id']: r for r in self.store.state()['stale_listings']}
+        behind, first = rows[1], rows[2]
+        # 40 units ahead + my 10 at 8 a day: 6.25 days. Relisting at 119 pays the fee again but
+        # still clears cost (100) and sells within 1.25 days.
+        self.assertEqual((behind['ahead'], behind['advice'], behind['sold_before']), (40, 'relist', False))
+        self.assertAlmostEqual(behind['idle_days'], 4)
+        self.assertAlmostEqual(behind['wait']['days'], 6.25)
+        self.assertAlmostEqual(behind['wait']['margin'], 150 * .92 - 100)
+        self.assertEqual(behind['relist']['price'], 119)
+        self.assertAlmostEqual(behind['relist']['net'], 119 * (1 - .08 - .025))
+        self.assertAlmostEqual(behind['relist']['fee'], 119 * .025 * 10)
+        self.assertAlmostEqual(behind['relist']['days'], 1.25)
+        self.assertEqual((behind['instant']['units'], behind['instant']['price']), (10, 100))
+        self.assertAlmostEqual(behind['instant']['margin'], 92 - 100)
+        # Already the cheapest seller: relisting cannot move it forward.
+        self.assertEqual((first['ahead'], first['advice'], first['relist']), (0, 'cheapest', None))
+        # Relisting would now sell under what the units cost.
+        self.store.remove_purchase(cost)
+        self.store.add_purchase({'item': 'T7_RELIC', 'city': '1002', 'kind': 'instant', 'price': 110, 'amount': 10})
+        self.assertEqual({r['id']: r['advice'] for r in self.store.state()['stale_listings']}[1], 'below_cost')
+        # A sale resets the clock: the next "my orders" list shows fewer units left.
+        self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(7, 150, 9), self.order(8, 110, 5)]})
+        self.assertEqual([r['id'] for r in self.store.state()['stale_listings']], [2])
+        # Only instant buys take sell orders: half the volume halves the selling pace.
+        self.store.market_study = lambda item, city, cache: {'instant_buy_share': .5}
+        first = self.store.state()['stale_listings'][0]
+        self.assertEqual((first['instant_buy_share'], first['per_day']), (.5, 4))
+        self.assertAlmostEqual(first['wait']['days'], 5 / 4)
+
     def test_hellden_market_is_lymhurst(self):
         # The market in 1000-HellDen lists Lymhurst's orders; the fork reports where the player stands.
         here = lambda *args: dict(self.order(*args), LocationId='1000-HellDen')
