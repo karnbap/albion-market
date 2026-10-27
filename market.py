@@ -40,7 +40,7 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # full-loot red zones or the Mists, and their price gaps are mostly that risk priced in,
 # which would always top the rankings.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"]}
-BUILD = "20261027.5"
+BUILD = "20261027.6"
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
@@ -293,6 +293,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS bank_stock(item TEXT NOT NULL, city TEXT NOT NULL, amount INTEGER NOT NULL, updated TEXT NOT NULL,
           PRIMARY KEY(item,city));
         CREATE TABLE IF NOT EXISTS finished_lists(location TEXT PRIMARY KEY, city TEXT NOT NULL, received TEXT NOT NULL, entries TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS last_results(kind TEXT PRIMARY KEY, created TEXT NOT NULL, seen TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL);
         """)
         # mailed: when the game sent the mail (the fork reads it from the mailbox list).
         # moved: when an own order's units left last went down in the "my orders" list.
@@ -1764,6 +1765,28 @@ class Store:
             self.db.execute("INSERT INTO pick_log(created,digest,payload) VALUES(?,?,?)", (now.isoformat(), digest, json.dumps(picks, ensure_ascii=False, allow_nan=False)))
             self.db.execute("DELETE FROM pick_log WHERE created<?", ((now - timedelta(days=30)).isoformat(),))
 
+    def remember_results(self, kind, rows):
+        """Keep the latest non-empty list of a kind (candidates, buyouts) and hand it back when
+        the current one is empty, so the last advice stays readable after the 15-minute
+        freshness window closes. seen is the last time that list was current (refreshed at most
+        once a minute while it stays the same); None while the current list has rows."""
+        now = self.clock()
+        if rows:
+            payload = json.dumps(rows, ensure_ascii=False, allow_nan=False, sort_keys=True)
+            digest = hashlib.sha256(payload.encode()).hexdigest()
+            last = self.db.execute("SELECT digest,seen FROM last_results WHERE kind=?", (kind,)).fetchone()
+            if last is None or last["digest"] != digest:
+                with self.db:
+                    self.db.execute("""INSERT INTO last_results VALUES(?,?,?,?,?) ON CONFLICT(kind) DO UPDATE SET
+                        created=excluded.created,seen=excluded.seen,digest=excluded.digest,payload=excluded.payload""",
+                                    (kind, now.isoformat(), now.isoformat(), digest, payload))
+            elif now - parse_time(last["seen"]) >= timedelta(minutes=1):
+                with self.db:
+                    self.db.execute("UPDATE last_results SET seen=? WHERE kind=?", (now.isoformat(), kind))
+            return None
+        last = self.db.execute("SELECT created,seen,payload FROM last_results WHERE kind=?", (kind,)).fetchone()
+        return {"created": last["created"], "seen": last["seen"], "rows": json.loads(last["payload"])} if last else None
+
     def pick_history(self, limit=60):
         return [{"created": r["created"], "picks": json.loads(r["payload"])} for r in
                 self.db.execute("SELECT created,payload FROM pick_log ORDER BY id DESC LIMIT ?", (limit,))]
@@ -1802,17 +1825,20 @@ class Store:
                 candidate["personal_sale_evidence"] = evidence
                 if evidence:
                     candidate["reasons"].append(f"내 판매 메일 누적 최고 {evidence['highest_price']:,} / {evidence['highest_price_amount']:,}개 · 체결 시각 미확인, 현재 체결 보장 아님")
+            past_candidates, past_buyouts = self.remember_results("candidates", candidates), self.remember_results("buyouts", buyouts)
             # Buying-quantity guides for every market a displayed number depends on.
-            routes = [*candidates, *(r for card in board for r in (*card["routes"], *(x["alternative"] for x in card["routes"] if "alternative" in x)))]
+            routes = [*candidates, *(past_candidates or {}).get("rows", []),
+                      *(r for card in board for r in (*card["routes"], *(x["alternative"] for x in card["routes"] if "alternative" in x)))]
             guides = {f"{i}/{c}": self.volume_guide(cache, i, c) for i, c in
-                      {(item, city), *((r["item"], r["sell_city"]) for r in routes), *((b["item"], b["city"]) for b in buyouts)}}
+                      {(item, city), *((r["item"], r["sell_city"]) for r in routes),
+                       *((b["item"], b["city"]) for b in (*buyouts, *(past_buyouts or {}).get("rows", [])))}}
             last = self.db.execute("SELECT received,topic FROM packets ORDER BY id DESC LIMIT 1").fetchone()
             count = self.db.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
             return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "server": "Europe (게임도 유럽 서버인지 확인)",
                 "timezone": self.cfg["timezone"], "items": self.cfg["items"], "cities": CITIES,
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
-                "city_extremes": self.city_extremes(books), "candidates": candidates, "city_board": board,
+                "city_extremes": self.city_extremes(books), "candidates": candidates, "past_candidates": past_candidates, "past_buyouts": past_buyouts, "city_board": board,
                 "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
                 "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": self.holdings(mine_rows, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
