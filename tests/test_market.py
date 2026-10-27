@@ -379,6 +379,28 @@ class MarketTests(unittest.TestCase):
         self.assertEqual([volume_risk(n, guide) for n in (48, 49, 145)], ['ok', 'caution', 'danger'])
         self.assertEqual(volume_risk(1, self.store.volume_guide({}, 'T8_RUNE', '1002')), 'unknown')
 
+    def test_last_candidates_and_buyouts_stay_readable_after_the_window(self):
+        self.market('1002', 10, asks=[100, 101, 150, 160])
+        self.market('3008', 30, bids=[130])
+        self.six_hour_history(25, 25, 25, 25)
+        live = self.store.state()
+        self.assertTrue(live['candidates'] and live['buyouts'])
+        self.assertIsNone(live['past_candidates'])
+        self.assertIsNone(live['past_buyouts'])
+        seen = self.now.isoformat()
+        self.now += timedelta(minutes=16)  # every list is past the 15-minute window
+        later = self.store.state()
+        self.assertEqual((later['candidates'], later['buyouts']), ([], []))
+        self.assertEqual(later['past_candidates']['rows'], live['candidates'])
+        self.assertEqual(later['past_buyouts']['rows'], live['buyouts'])
+        self.assertEqual((later['past_candidates']['seen'], later['past_buyouts']['seen']), (seen, seen))
+        # Guides for the markets the past rows name are still sent.
+        self.assertIn('T7_RELIC/3008', later['volume_guides'])
+        # Fresh lists again: the current ones are shown, the past ones are not.
+        self.market('1002', 40, asks=[100, 101, 150, 160])
+        self.market('3008', 60, bids=[130])
+        self.assertIsNone(self.store.state()['past_candidates'])
+
     def test_buyout_lifts_floor_to_next_seen_price_and_relists_under_it(self):
         self.market('1002', 10, asks=[100, 101, 150, 160])
         self.six_hour_history(25, 25, 25, 25)
