@@ -30,7 +30,7 @@ const outlookText=o=>`파는 곳 앞으로 6시간 예상 판매 ${n(o.next6)}�
 const hourRanges=hours=>{const out=[];for(const h of hours){const last=out[out.length-1];if(last&&(last[1]+1)%24===h)last[1]=h;else out.push([h,h])}return out.map(([a,b])=>a===b?`${String(a).padStart(2,'0')}시`:`${String(a).padStart(2,'0')}~${String(b).padStart(2,'0')}시`).join(', ')};
 const settingsWarnings=()=>[!state.settings.fees_confirmed&&'수수료 설정 미확인',!state.settings.transport_confirmed&&'운송비 설정 미확인'].filter(Boolean);
 const empty=text=>`<div class="empty">${esc(text)}</div>`;
-const editing=()=>!!document.activeElement?.closest('#my-order-form,#purchase-form,#bank-form')&&document.activeElement.matches('select,input');
+const editing=()=>!!document.activeElement?.closest('#my-order-form,#purchase-form,#bank-form,.bank-city-form')&&document.activeElement.matches('select,input');
 function table(headers,rows,key){return `<div class="table-wrap" data-scroll-key="${esc(key)}" tabindex="0" aria-label="${esc(key)} 표 스크롤"><table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`}
 function rememberView(){storage.set('view',{item:selectedItem,city:selectedCity,period:$('period').value,bookFilter:$('book-filter').value,scrollY:window.scrollY})}
 function updateHtml(id,html){
@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261027.11';
+  const legacy=next.build!=='20261027.12';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -151,6 +151,25 @@ function renderBookPatterns(){
  updateHtml('book-weekdays',anything?table(['요일',...head.slice(1)],rows('weekdays',7,k=>WEEK[k],t.weekday),'book-weekdays'):empty('아직 쌓인 호가 기록이 없습니다. 이 시장을 여러 요일·시간에 열면 채워집니다.'));
  updateHtml('book-hours',anything?table(['시간',...head.slice(1)],rows('hourly',24,k=>String(k).padStart(2,'0')+'시',t.hour),'book-hours'):'');
 }
+function renderPortfolio(){
+ const pf=state.portfolio;
+ if(!pf){updateHtml('portfolio',empty('투자 비율 추천을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
+ const city=c=>esc(state.cities[c]||c),days=k=>k.map(d=>WEEK[d]).join('·'),share=v=>v==null?'—':n(v*100,0)+'%',item=i=>esc(state.items[i]||i);
+ const goal=pf.rows.filter(r=>r.target>0).map(r=>`${item(r.item)} ${share(r.target)}`).concat(pf.cash>0.005?[`실버로 남김 ${share(pf.cash)}`]:[]).join(' · ')||'지금 계산으로는 넣을 품목이 없습니다';
+ const tiles=`<div class="diag-grid capital-grid"><div><small>지금 총 투자금</small><b>${n(pf.total)}</b><span>보유 원가 + 매수 주문 (총 투자금 추적과 같은 값)</span></div><div style="grid-column:span 3"><small>목표 비율</small><b>${goal}</b><span>${days(pf.buy_days)}요일에 매수 주문으로 모으고 ${days(pf.sell_days)}요일에 판매 · ${pf.cities.map(city).join(', ')}만 계산</span></div></div>`;
+ const todo=r=>{const p=r.plan,gap=r.gap_silver,near=pf.total*0.05;
+  if(!r.target)return r.current_silver?`<span class="warn">새로 사지 않기</span><small>가진 것은 ${p?city(p.sell_city)+'에서 ':''}팔기</small>`:'<small>사지 않기</small>';
+  if(gap>near)return `<span class="positive">더 모으기</span><small>평일에 ${city(p.buy_city)}에서 약 ${n(gap)} 실버어치</small>`;
+  if(gap<-near)return `<span class="warn">목표보다 ${n(-gap)} 많음</span><small>더 사지 말고 먼저 팔기</small>`;
+  return '<span>목표 근처</span><small>지금처럼</small>'};
+ const basis=r=>r.roi_basis==='mine'?`내 판매 ${n(r.mine.units)}개 기준 (28일)`:r.plan?`시장 호가 기준 · ${esc(r.plan.buy_basis)}`:'자료 부족';
+ const rows=pf.rows.map(r=>{const p=r.plan;return `<tr><td>${item(r.item)}</td><td><b>${share(r.target)}</b> <small>지금 ${share(r.current)}</small><small>목표 ${r.target_silver==null?'—':n(r.target_silver)} / 지금 ${n(r.current_silver)}${r.capped?` · 상한 걸림`:''}</small></td><td>${todo(r)}</td><td>${p?`${city(p.buy_city)}<small>매수 주문 ${n(p.buy)}${p.cheapest_day!=null?` · 가장 쌌던 요일 ${WEEK[p.cheapest_day]}`:''}<br>평일 하루 ${n(p.buy_per_day)}개 팔림</small>`:'—'}</td><td>${p?`${city(p.sell_city)}<small>매도 주문 ${n(p.sell)}${p.dearest_day!=null?` · 가장 비쌌던 요일 ${WEEK[p.dearest_day]}`:''}<br>금~일 하루 ${n(p.sell_per_day)}개 팔림</small>`:'—'}</td><td>${r.roi==null?'—':`<span class="${r.roi>0?'positive':'warn'}">${pct(r.roi)}</span>`}${p?.swing==null?'':` <small>흔들림 ±${n(p.swing*100,1)}%</small>`}<small>${basis(r)}${r.roi_basis==='mine'&&p?` · 시장 호가로는 ${pct(p.roi)}`:''}${r.roi_basis!=='mine'&&r.mine?` · 내 판매 ${n(r.mine.units)}개${r.mine.roi==null?'':' '+pct(r.mine.roi)}`:''}</small></td></tr>`});
+ const hours=h=>!h?'—':!h.enough?`<small>자료 부족 · 같은 시각 ${n(h.days,0)}일치 (3일치부터)</small>`:`${h.clear?'':'뚜렷한 차이 없음 · '}${h.hours.map(x=>`${String(x.hour).padStart(2,'0')}시 <small>${pct(x.vs_average)}</small>`).join(' · ')}`;
+ const buyNote=r=>{const w=r.week,p=r.plan;if(!r.target)return '<small>사지 않기</small>';if(!w.units)return '<small>목표 채움 · 더 안 사도 됨</small>';return `<b>${n(w.units)}개</b><small>${w.next_week?'다음 주 ':''}하루 약 ${n(w.per_day)}개 × ${n(w.days_left)}일 · ${city(p.buy_city)} 매수 주문 ${n(p.buy)}</small>`};
+ const week=table(['품목','평일에 살 양','사기 좋은 시간 (살 곳)','금~일에 팔 양 (어림)','팔기 좋은 시간 (팔 곳)'],pf.rows.filter(r=>r.plan).map(r=>`<tr><td>${item(r.item)}</td><td>${buyNote(r)}</td><td>${hours(r.plan.buy_hours)}</td><td>${n(r.week.sellable)}개까지<small>${city(r.plan.sell_city)} 금~일 판매량의 ${n(pf.market_share*100,0)}%</small></td><td>${hours(r.plan.sell_hours)}</td></tr>`),'portfolio-week');
+ updateHtml('portfolio',tiles+table(['품목','목표 비율','할 일','살 곳 (평일)','팔 곳 (금~일)','예상 수익률 · 가격 흔들림'],rows,'portfolio')
+  +`<p class="help">비율은 <b>수익률 ÷ 가격 흔들림</b>에 비례해 나눕니다. 그래서 꾸준한 10%가 들쭉날쭉한 20%보다 높게 나올 수 있습니다. 수익률은 최근 28일에 내가 ${n(pf.own_units)}개 넘게 판 품목이면 내 판매 메일의 평균 판매가와 평균 매수 원가로, 아니면 시장 호가(살 곳 최고 매수가 → 팔 곳 최저 매도가)로 계산합니다. 손해가 나는 품목은 0%입니다. 한 품목은 ${n(pf.max_share*100,0)}%까지만 넣고, 금~일 사흘 동안 팔 곳 판매량의 ${n(pf.market_share*100,0)}%를 넘게 사지 않도록 막습니다. 많이 사 두면 늦게 팔리거나 값을 내려 수수료를 다시 무는 일을 막기 위해서입니다. 상한에 걸린 품목은 ‘상한 걸림’으로 표시하고, 어느 품목에도 더 넣기 어려운 몫은 실버로 남깁니다. 가격 흔들림은 팔 곳의 하루 평균가가 보통 얼마나 오르내리는지입니다(하루짜리 튀는 값은 거의 빼고 계산). 살 곳은 평일에 가장 싸게, 팔 곳은 금~일에 가장 비싸게 팔린 도시입니다. 판매량이 가장 많은 도시의 3분의 1이 안 되는 곳은 고르지 않습니다.</p>`+`<h3 class="sub-head">이번 주 계획</h3>${week}<p class="help">평일에 살 양 = 목표까지 모자란 실버 ÷ 매수 원가(수수료 포함)를 남은 월~목에 나눈 것입니다. 사기 좋은 시간은 살 곳에서 평균 체결가가 가장 낮았던 시각, 팔기 좋은 시간은 팔 곳에서 판매량이 보통 이상인 시각 가운데 가장 비쌌던 시각입니다(${esc(state.timezone)} 기준, 괄호는 하루 평균가 대비). 같은 시각을 3일 이상 본 자료만 쓰고, 차이가 ${n(3)}% 미만이면 뚜렷한 차이 없음으로 표시합니다. 시간대 자료는 시장 상세에서 24시간 이력을 여러 날 열면 쌓입니다.</p>`);
+}
 function renderStudies(){
  const rows=state.studies;
  if(!rows){updateHtml('studies',empty('전략 연구를 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
@@ -215,10 +234,33 @@ function renderHoldings(){
  const valued=h.rows.filter(r=>r.value!=null),unpriced=h.rows.length-valued.length,place=city=>city==='carried'?'들고 있는 것':state.cities[city]||city;
  const bankCell=r=>r.city==='carried'?'—':`${n(r.bank)}개${r.bank_source==='auto'?`<small>자동 · ${ago(r.bank_updated)} 연 은행</small>`:r.bank_source==='manual'?`<small>${ago(r.bank_updated)} 적음</small>`:''}`;
  $('holdings-context').textContent=h.rows.length?`${n(Object.keys(byCity).filter(c=>c!=='carried').length)}개 도시 · 원가 기준 ${n(valued.reduce((s,r)=>s+r.value,0))}${unpriced?` (원가 미확인 ${n(unpriced)}줄 제외)`:''}`:'';
- const rows=Object.entries(byCity).flatMap(([city,list])=>list.map((r,i)=>`<tr class="${i?'':'log-first'}"><td>${i?'':esc(place(city))}</td><td>${esc(state.items[r.item]||r.item)}</td><td>${r.city==='carried'?'—':n(r.listed)+'개'}</td><td>${bankCell(r)}</td><td>${r.city==='carried'?'—':`${n(r.finished)}개${r.finished_seen?`<small>${ago(r.finished_seen)} 확인</small>`:''}`}</td><td>${r.city==='carried'?`${n(r.carried)}개<small>${ago(r.bank_updated)} 확인</small>`:'—'}</td><td><b>${n(r.total)}개</b></td><td>${r.value==null?'원가 미확인':n(r.value)}</td></tr>`));
+ const rows=Object.entries(byCity).flatMap(([city,list])=>list.map((r,i)=>`<tr class="${i?'':'log-first'}"><td>${i?'':esc(place(city))}</td><td>${esc(state.items[r.item]||r.item)}</td><td>${r.city==='carried'?'—':n(r.listed)+'개'}</td><td>${bankCell(r)}</td><td>${r.city==='carried'?'—':`${n(r.finished)}개${r.finished_seen?`<small>${ago(r.finished_seen)} 확인</small>`:''}`}</td><td>${r.city==='carried'?`${n(r.carried)}개<small>${ago(r.bank_updated)} 확인</small>`:'—'}</td><td><b>${n(r.total)}개</b></td><td>${r.value==null?'원가 미확인':n(r.value)}</td><td>${r.city==='carried'?'—':r.value_now==null?'사는 사람 없음':`${n(Math.round(r.value_now))}<small>단가 ${n(Math.round(r.net_now))} · 잔량 ${n(r.sell_now_amount)}개</small>`}</td></tr>`));
  const finished=h.finished.length?`<h3 class="sub-head">거래 완료 탭 (시장별 마지막으로 받은 목록)</h3>${table(['시장','항목','추적 품목','내가 사서 안 찾은 것','받은 때'],h.finished.map(f=>`<tr><td>${esc(state.cities[f.city]||f.location)}</td><td>${n(f.entries)}건</td><td>${n(f.tracked)}건</td><td>${f.identity_known?n(f.waiting)+'개':'<span class="warn">캐릭터 확인 불가</span>'}</td><td>${ago(f.received)}</td></tr>`),'finished-lists')}`:'<p class="help">거래 완료 탭 목록은 아직 받지 않았습니다. 전용 수집기 local.3부터 게임 시장 창에서 거래 완료 탭을 열면 받아 둡니다.</p>';
- const unmapped=(h.unmapped_banks||[]).length?`<p class="warn">어느 도시 은행인지 아직 모르는 은행: ${h.unmapped_banks.map(b=>`${esc(b.location)} (${Object.entries(b.items).map(([k,v])=>`${esc(state.items[k]||k)} ${n(v)}개`).join(', ')||'추적 품목 없음'})`).join(' · ')} · 도시에서 그 은행 구역으로 걸어 들어가 은행을 한 번 열면 도시가 정해집니다.</p>`:'';
- updateHtml('holdings',(rows.length?table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','인벤토리','합계','원가 기준 금액'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭, 은행을 열거나, 위에 은행 수량을 적어 주세요.'))+unmapped+finished);
+ const unmapped=(h.unmapped_banks||[]).length?`<div><p class="warn">어느 도시 은행인지 모르는 은행이 있습니다. 빠른 이동 도착지처럼 도시가 아닌 곳에서 은행에 들어가면 이렇게 됩니다. 도시를 한 번 골라 주면 기억합니다.</p>${h.unmapped_banks.map(b=>`<form class="bank-city-form my-order-form" data-location="${esc(b.location)}"><span>은행 구역 ${esc(b.location)} · ${Object.entries(b.items).map(([k,v])=>`${esc(state.items[k]||k)} ${n(v)}개`).join(', ')||'추적 품목 없음'} · ${ago(b.seen)} 연 은행</span><label>도시<select name="city">${Object.entries(state.cities).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label><button type="submit">이 도시로 정하기</button></form>`).join('')}<p class="help" id="bank-city-status"></p></div>`:'';
+ // 품목별 한 줄 요약: 얼마에 사서 몇 개 들고 있고, 지금 팔면 얼마가 되는가.
+ const byItem={};
+ for(const r of h.rows){const g=byItem[r.item]??={total:0,cost_silver:0,costed:0,value_now:0,priced:0,unpriced:0,cities:new Set()};
+  g.total+=r.total; if(r.city!=='carried')g.cities.add(r.city);
+  if(r.cost!=null&&r.total){g.cost_silver+=r.total*r.cost; g.costed+=r.total}
+  if(r.net_now!=null&&r.total){g.value_now+=r.total*r.net_now; g.priced+=r.total} else if(r.total) g.unpriced+=r.total;}
+ const items=Object.entries(byItem).filter(([,g])=>g.total);
+ const sum=items.reduce((a,[,g])=>({buy:a.buy+g.cost_silver,now:a.now+g.value_now}),{buy:0,now:0});
+ const money=v=>v==null?'—':n(Math.round(v));
+ const summary=items.length?table(
+   ['품목','총 갯수','평균 매수가','총 매수금액','지금 팔면 단가','총금액','총수익'],
+   items.map(([item,g])=>{
+     const avg=g.costed?g.cost_silver/g.costed:null, unit=g.priced?g.value_now/g.priced:null;
+     const profit=(avg!=null&&unit!=null)?g.value_now-(g.priced*avg):null;
+     const warn=g.unpriced?`<small class="warn">${n(g.unpriced)}개는 지금 살 사람 없음</small>`:'';
+     return `<tr><td>${esc(state.items[item]||item)}<small>${n(g.cities.size)}개 도시</small></td>`
+       +`<td><b>${n(g.total)}개</b></td><td>${money(avg)}</td><td>${money(g.cost_silver||null)}</td>`
+       +`<td>${money(unit)}${warn}</td><td>${money(g.value_now||null)}</td>`
+       +`<td class="${profit==null?'':profit>=0?'positive':'warn'}">${money(profit)}</td></tr>`}),
+   'holdings-by-item')
+   +`<p class="help">지금 팔면 단가 = 그 도시 <b>최고 매수가</b>에서 판매세 ${n(state.settings.sales_tax*100,1)}%를 뺀 값(매수 요청서에 즉시 판매). 체결을 보장하지 않고, 그 가격의 잔량보다 많이 팔면 값이 내려갑니다. 총수익은 원가를 아는 수량만 셉니다.</p>`
+   +`<p class="help">합계 — 매수 ${money(sum.buy||null)} → 지금 팔면 ${money(sum.now||null)} (차액 <b class="${sum.now-sum.buy>=0?'positive':'warn'}">${money(sum.now-sum.buy)}</b>)</p>`:'';
+ updateHtml('holdings',(items.length?`<h3 class="sub-head">품목별 — 사서 들고 있는 것과 지금 가치</h3>${summary}`:'')
+   +(rows.length?`<h3 class="sub-head">도시별 자세히</h3>`+table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','인벤토리','합계','원가 기준 금액','지금 팔면'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭, 은행을 열거나, 위에 은행 수량을 적어 주세요.'))+unmapped+finished);
 }
 function renderPurchases(){
  const p=state.purchases;
@@ -296,7 +338,7 @@ function renderOverview(){
  updateHtml('all-items',items.map(item=>{const b=state.books[item][selectedCity];return `<article class="panel item-summary"><h3>${esc(state.items[item])}</h3><div class="extremes-pair">${extremeSummary(item,'buy')}${extremeSummary(item,'sell')}</div><div class="item-city-table"><table><thead><tr><th>도시</th><th>최고 매수</th><th>최저 매도</th></tr></thead><tbody>${Object.entries(state.cities).map(([city,name])=>{const pair=state.books[item][city];return `<tr><th scope="row">${esc(name)}</th>${['buy','sell'].map(side=>{const q=quote(pair[side]),best=state.city_extremes?.[item]?.[side]?.observations?.some(o=>o.city===city);return `<td class="quote-cell ${side} ${best?'best-'+side:''}">${n(q?.price)}<small>${n(q?.amount)}개</small><small class="quote-status">${pair[side].single_only?'미확인':q?.stale||pair[side].stale?'지난 자료':q?'유효 관측':'미조회'}</small></td>`}).join('')}</tr>`}).join('')}</tbody></table></div><h4 class="selected-city-label">${esc(state.cities[selectedCity])} 물량 상세</h4>${['buy','sell'].map(side=>{const book=b[side],d=book.fresh?book.analysis_depth:book.depth;return `<div class="item-side ${side}"><p>${quoteText(book,side)}</p><small>${d?.reference?.large?'대량 기준':'소량 제외 기준'} ${n(d?.reference?.price)} · ${n(d?.reference?.amount)}개</small><small>앞쪽 소량 ${n(d?.leading_small_levels)}호가 · ${n(d?.leading_small_amount)}개</small><div class="wall-list">${(d?.large_levels||[]).slice(0,3).map(r=>`<span class="pill ${r.wall?'wall-badge':''}">${r.wall?'벽':'대량'} ${n(r.price)} · ${n(r.amount)}개</span>`).join('')||'대량 관측 없음'}</div></div>`}).join('')}</article>`}).join(''));
 }
 function render(){
- renderNow();renderPickHistory();renderMyOrders();renderStale();renderCapital();renderHoldings();renderPurchases();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderPersonal();renderPersonalMails();renderMailDiagnosis();renderVolumeGuide();
+ renderNow();renderPickHistory();renderMyOrders();renderStale();renderCapital();renderHoldings();renderPurchases();renderPortfolio();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderPersonal();renderPersonalMails();renderMailDiagnosis();renderVolumeGuide();
  $('detail-context').textContent=state.cities[selectedCity]+' · '+state.items[selectedItem];
  const books=state.books[selectedItem];
  updateHtml('cities',Object.entries(state.cities).map(([id,name])=>{
@@ -359,9 +401,9 @@ function chooseView(){selectedItem=$('item').value;selectedCity=$('city').value;
 $('item').onchange=chooseView;$('city').onchange=chooseView;
 $('overview').onclick=e=>{const cell=e.target.closest('[data-item][data-city]');if(cell){$('item').value=cell.dataset.item;$('city').value=cell.dataset.city;chooseView()}};
 const tabs=[...document.querySelectorAll('.tabs [data-tab]')];
-function showTab(name){if(!tabs.some(b=>b.dataset.tab===name))name='cities';for(const b of tabs){const on=b.dataset.tab===name;b.classList.toggle('active',on);b.setAttribute('aria-selected',String(on))}for(const panel of document.querySelectorAll('.tab-panel'))panel.hidden=panel.dataset.tab!==name;storage.set('tab',name)}
+function showTab(name){if(!tabs.some(b=>b.dataset.tab===name))name='now';for(const b of tabs){const on=b.dataset.tab===name;b.classList.toggle('active',on);b.setAttribute('aria-selected',String(on))}for(const panel of document.querySelectorAll('.tab-panel'))panel.hidden=panel.dataset.tab!==name;storage.set('tab',name)}
 document.querySelector('.tabs').onclick=e=>{const b=e.target.closest('[data-tab]');if(b)showTab(b.dataset.tab)};
-showTab(storage.get('tab','cities'));
+showTab(storage.get('tab','now'));
 $('city-board').onclick=e=>{const button=e.target.closest('[data-city]');if(button){$('city').value=button.dataset.city;chooseView();showTab('market');document.querySelector('.tabs').scrollIntoView({block:'start'})}};
 $('cities').onclick=e=>{const card=e.target.closest('[data-city]');if(card){$('city').value=card.dataset.city;chooseView()}};
 $('candidate-filter').value=['all','instant','wait'].includes(storage.get('candidateFilter','all'))?storage.get('candidateFilter','all'):'all';
@@ -369,6 +411,7 @@ $('my-order-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{aw
 $('my-orders-filters').onclick=e=>{const b=e.target.closest('[data-key]');if(!b||!state)return;storage.set('myOrdersFilter',{...myOrderFilter(state.my_orders||[]),[b.dataset.key]:b.dataset.value});preserveViewport(renderMyOrders)};
 $('my-orders').onclick=async e=>{const b=e.target.closest('[data-close]');if(!b)return;try{await post('/api/my-orders',{action:'close',id:Number(b.dataset.close)});await refresh()}catch(err){$('my-order-status').textContent='목록에서 빼기 실패: '+err.message}};
 $('bank-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/bank',{item:f.item.value,city:f.city.value,amount:Number(f.amount.value)});f.amount.value='';$('bank-status').textContent='은행 수량을 저장했습니다.';await refresh()}catch(err){$('bank-status').textContent='저장 실패: '+err.message}};
+$('holdings').onsubmit=async e=>{const f=e.target.closest('.bank-city-form');if(!f)return;e.preventDefault();try{await post('/api/bank-city',{location:f.dataset.location,city:f.city.value});document.activeElement?.blur();await refresh()}catch(err){const s=$('bank-city-status');if(s)s.textContent='저장 실패: '+err.message}};
 $('purchase-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/purchases',{item:f.item.value,city:f.city.value,kind:f.kind.value,price:Number(f.price.value),amount:Number(f.amount.value),bought:f.bought.value||null});f.price.value='';f.amount.value='';f.bought.value='';$('purchase-status').textContent='매수 기록을 추가했습니다.';await refresh()}catch(err){$('purchase-status').textContent='추가 실패: '+err.message}};
 $('purchases').onclick=async e=>{const b=e.target.closest('[data-remove-purchase]');if(!b)return;try{await post('/api/purchases',{action:'remove',id:Number(b.dataset.removePurchase)});await refresh()}catch(err){$('purchase-status').textContent='삭제 실패: '+err.message}};
 $('candidate-filter').onchange=()=>{storage.set('candidateFilter',$('candidate-filter').value);if(state)render()};

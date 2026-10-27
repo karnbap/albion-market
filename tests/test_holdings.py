@@ -57,6 +57,20 @@ class HoldingsTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 self.store.set_bank({"item": "T7_RELIC", "city": "4002", "amount": 1, **bad})
 
+    def test_value_if_sold_now_to_the_best_buy_order(self):
+        self.store.ingest("marketorders.ingest", {"Orders": [dict(self.order(11, 120, 4), AuctionType="request"),
+                                                             dict(self.order(12, 110, 9), AuctionType="request")]})
+        self.store.add_purchase({"item": "T7_RELIC", "city": "4002", "kind": "instant", "price": 100, "amount": 10})
+        self.store.set_bank({"item": "T7_RELIC", "city": "4002", "amount": 10})
+        self.store.set_bank({"item": "T8_SOUL", "city": "4002", "amount": 2})    # nobody buying souls there
+        rows = {r["item"]: r for r in self.holdings()["rows"]}
+        relic, net = rows["T7_RELIC"], 120 * (1 - self.store.cfg["sales_tax"])
+        self.assertEqual((relic["sell_now"], relic["sell_now_amount"]), (120, 4))
+        self.assertAlmostEqual(relic["net_now"], net)
+        self.assertAlmostEqual(relic["value_now"], 10 * net)
+        self.assertAlmostEqual(relic["profit_now"], 10 * (net - relic["cost"]))
+        self.assertEqual((rows["T8_SOUL"]["sell_now"], rows["T8_SOUL"]["value_now"], rows["T8_SOUL"]["profit_now"]), (None, None, None))
+
     def test_finished_tab_counts_what_i_bought_and_have_not_collected(self):
         me, them = "00000000-0000-0000-0000-00000000000a", "00000000-0000-0000-0000-00000000000b"
         bought = {"Id": 5, "Amount": 2, "IsFinished": True, "AuctionType": "request", "HasBuyerFetched": False, "HasSellerFetched": True,
@@ -117,6 +131,28 @@ class HoldingsTests(unittest.TestCase):
         for bad in ({}, {"Inventory": {}, "Banks": [{}]}, {"Inventory": {"2031": -1}, "Banks": []}, {"Inventory": [], "Banks": []}):
             with self.assertRaises(ValueError, msg=bad):
                 self.store.ingest_holdings(bad)
+
+    def test_bank_entered_from_a_travel_hub_uses_known_or_picked_city(self):
+        # Entered from 4000 (a travel hub, no city): 4001 is a known Fort Sterling bank; 9001 is not.
+        self.store.ingest_holdings({"LocationId": "4001", "Inventory": {},
+                                    "Banks": [{"LocationId": "4001", "PreviousLocationId": "4000", "Items": {"2031": 6}},
+                                              {"LocationId": "9001", "PreviousLocationId": "9000", "Items": {"2038": 2}}]})
+        h = self.holdings()
+        self.assertEqual([(r["city"], r["item"], r["bank"]) for r in h["rows"]], [("4002", "T7_RELIC", 6)])
+        self.assertEqual([b["location"] for b in h["unmapped_banks"]], ["9001"])
+        self.store.set_bank_city({"location": "9001", "city": "3008"})
+        rows = {(r["city"], r["item"]): r["bank"] for r in self.holdings()["rows"]}
+        self.assertEqual(rows[("3008", "T8_SOUL")], 2)
+        self.assertEqual(self.holdings()["unmapped_banks"], [])
+        # Remembered for the next visit, even when entered from the hub again.
+        self.store.ingest_holdings({"LocationId": "9001", "Inventory": {}, "Banks": [{"LocationId": "9001", "PreviousLocationId": "9000", "Items": {"2038": 5}}]})
+        self.assertEqual({(r["city"], r["item"]): r["bank"] for r in self.holdings()["rows"]}[("3008", "T8_SOUL")], 5)
+        # A bank stored before its city was known is placed once the city is known.
+        self.store.db.execute("UPDATE bank_auto SET city=NULL WHERE location='4001'")
+        self.assertIn(("4002", "T7_RELIC"), {(r["city"], r["item"]) for r in self.holdings()["rows"]})
+        for bad in ({"location": "9001", "city": "9999"}, {"location": "1234", "city": "3008"}):
+            with self.assertRaises(ValueError, msg=bad):
+                self.store.set_bank_city(bad)
 
     def test_finished_lists_only_on_the_private_path_and_bank_needs_the_token(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class(self.store, "test-token"))
