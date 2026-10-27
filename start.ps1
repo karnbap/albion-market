@@ -49,8 +49,12 @@ try {
     try { $albionCaptureLocked=$albionCaptureMutex.WaitOne(30000) } catch [System.Threading.AbandonedMutexException] { $albionCaptureLocked=$true }
     if(-not $albionCaptureLocked) { throw 'Capture launcher is busy.' }
 $albionCapture = Join-Path $albionRoot 'vendor\albiondata-client.exe'
+# The local fork (README: 전용 수집기) reads sale/buy mails and the in-game "my orders" lists
+# itself and sends them only to the private localhost URL. Use it whenever it is present.
+$albionFork = Join-Path $albionRoot 'vendor\albiondata-client-fork.exe'
+if (Test-Path -LiteralPath $albionFork) { $albionCapture = $albionFork }
 if (-not (Test-Path -LiteralPath $albionCapture)) { if($Automatic) { throw 'Capture client missing; run setup manually.' }; & $albionPython (Join-Path $albionRoot 'setup.py') }
-$albionOtherClients = Get-Process -Name 'albiondata-client' -ErrorAction SilentlyContinue
+$albionOtherClients = Get-Process -Name 'albiondata-client','albiondata-client-fork' -ErrorAction SilentlyContinue
 if ($albionOtherClients) {
     Write-Host 'An Albion Data Client is already running. It was not stopped or replaced.'
     Write-Host 'Close that client yourself, then run this launcher again to use local capture.'
@@ -72,10 +76,11 @@ if (-not $albionDriver) {
 # Private uploads include public packets too; the receiver ignores those copies.
 # Version 0.1.61 crashes with 'noop'; private uploads use a full localhost HTTP URL.
 # Do NOT add -d: that disables local HTTP ingestion too.
-# -debug with an operation whitelist writes the in-game 'my orders' lists and mailbox messages
+# -debug with an operation whitelist writes the in-game 'my orders' requests and mailbox messages
 # to vendor\albiondata-client.log; the receiver reads them (CAPTURE_DEBUG_OPERATIONS in market.py).
+# The fork sends both itself; the log then only feeds the dashboard's raw-record view.
 # -events 65535 matches no event, so game events stay out of the log.
-$albionClientProcess = Start-Process -FilePath $albionCapture -ArgumentList @('-i', "$albionAddress/ingest/europe", '-p', "$albionAddress/private/europe", '-minimize', '-debug', '-operations', '81,82,92,93,174,175,176', '-events', '65535') -WorkingDirectory (Join-Path $albionRoot 'vendor') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $albionRoot 'data\capture-stdout.log') -RedirectStandardError (Join-Path $albionRoot 'data\capture-stderr.log')
+$albionClientProcess = Start-Process -FilePath $albionCapture -ArgumentList @('-i', "$albionAddress/ingest/europe", '-p', "$albionAddress/private/europe", '-minimize', '-debug', '-operations', '81,82,94,174,175,176', '-events', '65535') -WorkingDirectory (Join-Path $albionRoot 'vendor') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $albionRoot 'data\capture-stdout.log') -RedirectStandardError (Join-Path $albionRoot 'data\capture-stderr.log')
 Set-Content -LiteralPath (Join-Path $albionRoot 'data\capture.pid') -Value $albionClientProcess.Id
 Write-Host 'Local capture started. Open Albion Europe and load a market item.'
 

@@ -13,6 +13,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 GAME = 'albion-online.exe'
+CAPTURE_NAMES = ('albiondata-client-fork.exe', 'albiondata-client.exe')
 
 
 class WindowsPlatform:
@@ -67,8 +68,9 @@ class WindowsPlatform:
             raise ctypes.WinError(ctypes.get_last_error())
         if not self.k.QueryFullProcessImageNameW(handle,0,image,ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
-        expected = os.path.normcase(str((self.root/'vendor/albiondata-client.exe').resolve()))
-        return code.value == 259 and os.path.normcase(image.value) == expected
+        # start.ps1 runs the local fork instead of the official client when it is present.
+        expected = {os.path.normcase(str((self.root/'vendor'/name).resolve())) for name in CAPTURE_NAMES}
+        return code.value == 259 and os.path.normcase(image.value) in expected
 
     def capture_running(self):
         pid = self.capture_pid()
@@ -177,7 +179,7 @@ class Controller:
                 return self.check_receiver(now)
             if capture is None:
                 return self.status('수집기 상태 확인 불가 · 중복 실행 보류',True,None)
-            if 'albiondata-client.exe' in names:
+            if names & set(CAPTURE_NAMES):
                 return self.status('다른 수집기 실행 중 · 중복 실행 보류',True,None)
             if now < self.next_start:
                 return self.status('수집기 재시도 대기',True,False)
