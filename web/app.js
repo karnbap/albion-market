@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261027.10';
+  const legacy=next.build!=='20261027.11';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -212,11 +212,13 @@ function renderHoldings(){
  if(!h){updateHtml('holdings',empty('보유량을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
  if(!$('bank-item').options.length){$('bank-item').innerHTML=Object.entries(state.items).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('');$('bank-city').innerHTML=Object.entries(state.cities).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('')}
  const byCity={};for(const r of h.rows)(byCity[r.city]??=[]).push(r);
- const valued=h.rows.filter(r=>r.value!=null),unpriced=h.rows.length-valued.length;
- $('holdings-context').textContent=h.rows.length?`${n(Object.keys(byCity).length)}개 도시 · 원가 기준 ${n(valued.reduce((s,r)=>s+r.value,0))}${unpriced?` (원가 미확인 ${n(unpriced)}줄 제외)`:''}`:'';
- const rows=Object.entries(byCity).flatMap(([city,list])=>list.map((r,i)=>`<tr class="${i?'':'log-first'}"><td>${i?'':esc(state.cities[city]||city)}</td><td>${esc(state.items[r.item]||r.item)}</td><td>${n(r.listed)}개</td><td>${n(r.bank)}개${r.bank_updated?`<small>${ago(r.bank_updated)} 적음</small>`:''}</td><td>${n(r.finished)}개${r.finished_seen?`<small>${ago(r.finished_seen)} 확인</small>`:''}</td><td><b>${n(r.total)}개</b></td><td>${r.value==null?'원가 미확인':n(r.value)}</td></tr>`));
+ const valued=h.rows.filter(r=>r.value!=null),unpriced=h.rows.length-valued.length,place=city=>city==='carried'?'들고 있는 것':state.cities[city]||city;
+ const bankCell=r=>r.city==='carried'?'—':`${n(r.bank)}개${r.bank_source==='auto'?`<small>자동 · ${ago(r.bank_updated)} 연 은행</small>`:r.bank_source==='manual'?`<small>${ago(r.bank_updated)} 적음</small>`:''}`;
+ $('holdings-context').textContent=h.rows.length?`${n(Object.keys(byCity).filter(c=>c!=='carried').length)}개 도시 · 원가 기준 ${n(valued.reduce((s,r)=>s+r.value,0))}${unpriced?` (원가 미확인 ${n(unpriced)}줄 제외)`:''}`:'';
+ const rows=Object.entries(byCity).flatMap(([city,list])=>list.map((r,i)=>`<tr class="${i?'':'log-first'}"><td>${i?'':esc(place(city))}</td><td>${esc(state.items[r.item]||r.item)}</td><td>${r.city==='carried'?'—':n(r.listed)+'개'}</td><td>${bankCell(r)}</td><td>${r.city==='carried'?'—':`${n(r.finished)}개${r.finished_seen?`<small>${ago(r.finished_seen)} 확인</small>`:''}`}</td><td>${r.city==='carried'?`${n(r.carried)}개<small>${ago(r.bank_updated)} 확인</small>`:'—'}</td><td><b>${n(r.total)}개</b></td><td>${r.value==null?'원가 미확인':n(r.value)}</td></tr>`));
  const finished=h.finished.length?`<h3 class="sub-head">거래 완료 탭 (시장별 마지막으로 받은 목록)</h3>${table(['시장','항목','추적 품목','내가 사서 안 찾은 것','받은 때'],h.finished.map(f=>`<tr><td>${esc(state.cities[f.city]||f.location)}</td><td>${n(f.entries)}건</td><td>${n(f.tracked)}건</td><td>${f.identity_known?n(f.waiting)+'개':'<span class="warn">캐릭터 확인 불가</span>'}</td><td>${ago(f.received)}</td></tr>`),'finished-lists')}`:'<p class="help">거래 완료 탭 목록은 아직 받지 않았습니다. 전용 수집기 local.3부터 게임 시장 창에서 거래 완료 탭을 열면 받아 둡니다.</p>';
- updateHtml('holdings',(rows.length?table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','합계','원가 기준 금액'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭을 열거나, 위에 은행 수량을 적어 주세요.'))+finished);
+ const unmapped=(h.unmapped_banks||[]).length?`<p class="warn">어느 도시 은행인지 아직 모르는 은행: ${h.unmapped_banks.map(b=>`${esc(b.location)} (${Object.entries(b.items).map(([k,v])=>`${esc(state.items[k]||k)} ${n(v)}개`).join(', ')||'추적 품목 없음'})`).join(' · ')} · 도시에서 그 은행 구역으로 걸어 들어가 은행을 한 번 열면 도시가 정해집니다.</p>`:'';
+ updateHtml('holdings',(rows.length?table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','인벤토리','합계','원가 기준 금액'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭, 은행을 열거나, 위에 은행 수량을 적어 주세요.'))+unmapped+finished);
 }
 function renderPurchases(){
  const p=state.purchases;

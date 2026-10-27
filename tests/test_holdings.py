@@ -84,6 +84,40 @@ class HoldingsTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 self.store.ingest_finished(bad)
 
+    def test_banks_and_inventory_the_fork_reads(self):
+        # Item indexes as the game sends them (config maps 2031 to T7_RELIC, 2038 to T8_SOUL).
+        self.store.set_bank({"item": "T7_RELIC", "city": "7", "amount": 999})      # typed in, about to be replaced
+        self.store.set_bank({"item": "T8_SOUL", "city": "3008", "amount": 4})      # typed in, no bank read there
+        self.store.add_purchase({"item": "T7_RELIC", "city": "7", "kind": "instant", "price": 100, "amount": 1})
+        result = self.store.ingest_holdings({"LocationId": "0006", "Inventory": {"2031": 12, "2038": 10, "9999": 3},
+                                             "Banks": [{"LocationId": "0006", "PreviousLocationId": "0007", "Items": {"2031": 1, "2038": 169, "77": 2}},
+                                                       {"LocationId": "4001", "PreviousLocationId": "4002", "Items": {"2031": 580}},
+                                                       {"LocationId": "9001", "PreviousLocationId": "", "Items": {"2031": 5}}]})
+        self.assertEqual((result["accepted"], result["carried"]), (3, 22))
+        h = self.holdings()
+        rows = {(r["city"], r["item"]): r for r in h["rows"]}
+        # A bank cluster's city: the place the player came from (0006 from Thetford 0007).
+        self.assertEqual((rows[("7", "T7_RELIC")]["bank"], rows[("7", "T7_RELIC")]["bank_source"]), (1, "auto"))
+        self.assertEqual(rows[("7", "T8_SOUL")]["bank"], 169)
+        self.assertEqual(rows[("4002", "T7_RELIC")]["bank"], 580)
+        self.assertEqual((rows[("3008", "T8_SOUL")]["bank"], rows[("3008", "T8_SOUL")]["bank_source"]), (4, "manual"))
+        self.assertEqual((rows[("carried", "T7_RELIC")]["carried"], rows[("carried", "T8_SOUL")]["carried"]), (12, 10))
+        self.assertEqual(rows[("carried", "T7_RELIC")]["total"], 12)
+        self.assertEqual([(b["location"], b["items"]) for b in h["unmapped_banks"]], [("9001", {"T7_RELIC": 5})])
+        # Carried units are part of the capital.
+        capital = self.store.state()["capital"]
+        self.assertEqual(capital["items"]["T7_RELIC"]["held"], 1 + 580 + 12)
+        # Next visit: 0006 entered from outside still belongs to Thetford (learned).
+        self.now += timedelta(minutes=10)
+        self.store.ingest_holdings({"LocationId": "0006", "Inventory": {}, "Banks": [{"LocationId": "0006", "PreviousLocationId": "0000", "Items": {"2031": 3}}]})
+        rows = {(r["city"], r["item"]): r for r in self.holdings()["rows"]}
+        self.assertEqual((rows[("7", "T7_RELIC")]["bank"], rows[("7", "T7_RELIC")]["bank_updated"]), (3, self.now.isoformat()))
+        self.assertNotIn(("7", "T8_SOUL"), rows)          # the bank no longer holds souls
+        self.assertNotIn(("carried", "T7_RELIC"), rows)   # nothing carried now
+        for bad in ({}, {"Inventory": {}, "Banks": [{}]}, {"Inventory": {"2031": -1}, "Banks": []}, {"Inventory": [], "Banks": []}):
+            with self.assertRaises(ValueError, msg=bad):
+                self.store.ingest_holdings(bad)
+
     def test_finished_lists_only_on_the_private_path_and_bank_needs_the_token(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class(self.store, "test-token"))
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -95,6 +129,12 @@ class HoldingsTests(unittest.TestCase):
             with urllib.request.urlopen(urllib.request.Request(url + "/ingest/europe/marketorders.finished", data=body)) as r:
                 self.assertEqual(json.load(r)["accepted"], 0)
             self.assertEqual(len(self.holdings()["finished"]), 1)
+            held = json.dumps({"LocationId": "4001", "Inventory": {"2031": 2}, "Banks": []}).encode()
+            with urllib.request.urlopen(urllib.request.Request(url + "/ingest/europe/holdings.containers", data=held)) as r:
+                self.assertEqual(json.load(r)["accepted"], 0)
+            self.assertEqual(self.holdings()["rows"], [])
+            with urllib.request.urlopen(urllib.request.Request(url + "/private/europe/holdings.containers", data=held)) as r:
+                self.assertEqual(json.load(r)["carried"], 2)
             bank = json.dumps({"item": "T7_RELIC", "city": "4002", "amount": 4}).encode()
             with self.assertRaises(urllib.error.HTTPError) as result:
                 urllib.request.urlopen(urllib.request.Request(url + "/api/bank", data=bank))
