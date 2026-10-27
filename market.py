@@ -46,7 +46,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261027.13"
+BUILD = "20261028.1"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -656,12 +656,13 @@ class Store:
         """Per item, the weekday cycle and the weekend sweep of the trading plan, from the last 28
         days in the trading cities that sell at least a third of the busiest city's pace on those
         days. Weekday cycle, two ways: a buy order at the buy city's bid, or an instant buy at its
-        ask (another city), then a sell order at the sell city's ask; units a day = the
-        cycle_share setting of the sales that fill those orders (sell orders: the instant-buy
-        share of the sell city's sales; buy orders: the rest of the buy city's). Weekend: an
-        instant buy at a city's weekday ask, a sell order at the sell city's weekend ask, over
-        HOT_DAYS. Each picks the city pair with the most profit. Prices from plan_quote; swing:
-        spread of the weekend sell city's daily average prices over their median."""
+        ask, then sell orders at the asks of every city that makes money (the buy city too, for a
+        buy order); each city takes the cycle_share setting of its sell-order sales (the
+        instant-buy share of its sales), a buy order buys at most cycle_share of the rest of the
+        buy city's. Weekend: an instant buy at a city's weekday ask, sold the same way at the
+        weekend asks over HOT_DAYS. Each picks the buy city and way with the most profit. Prices
+        from plan_quote; swing: spread of the main weekend sell city's daily average prices over
+        their median."""
         cfg = self.cfg
         last = self.db.execute("SELECT MAX(id) FROM packets").fetchone()[0]
         key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(cfg["excluded_cities"]),
@@ -692,29 +693,45 @@ class Store:
             ask = {c: quote(c, "sell", BUY_DAYS) for c in weekday}
             ask_weekend = {c: quote(c, "sell", SELL_DAYS) for c in weekend}
             share = {c: PLAN_INSTANT_SHARE if measured.get((item, c)) is None else measured[(item, c)] for c in days}
-            def plan(method, buy_city, sell_city, buy, sell, fee_in, units):
-                cost = buy[0] * (1 + fee_in) + (cfg["transport_per_unit"] if buy_city != sell_city else 0)
-                net = sell[0] * keep
-                return {"method": method, "buy_city": buy_city, "sell_city": sell_city, "buy": buy[0], "sell": sell[0],
-                        "buy_basis": buy[1], "sell_basis": sell[1], "cost": cost, "net": net, "margin": net - cost,
-                        "roi": net / cost - 1, "units": units, "profit": (net - cost) * units,
-                        "share_measured": measured.get((item, sell_city)) is not None}
-            cycles = []
+            def plan(method, buy_city, buy, fee_in, limit, outlets):
+                """Units bought in one city, sold across the outlets (city, quote, units it takes)
+                that make money, best margin first, until limit (None: no limit) runs out. Selling
+                in one city only would pile the units up there."""
+                base = buy[0] * (1 + fee_in)
+                legs, left = [], limit
+                for city, sell, room in outlets:
+                    cost = base + (cfg["transport_per_unit"] if city != buy_city else 0)
+                    legs.append({"sell_city": city, "sell": sell[0], "sell_basis": sell[1], "cost": cost, "net": sell[0] * keep,
+                                 "margin": sell[0] * keep - cost, "units": room, "share_measured": measured.get((item, city)) is not None})
+                legs = sorted((leg for leg in legs if leg["margin"] > 0), key=lambda leg: -leg["margin"])
+                for leg in legs:
+                    leg["units"] = leg["units"] if left is None else min(leg["units"], left)
+                    left = None if left is None else left - leg["units"]
+                legs = [leg for leg in legs if leg["units"] > 0]
+                if not legs:
+                    return None
+                units, profit = sum(leg["units"] for leg in legs), sum(leg["margin"] * leg["units"] for leg in legs)
+                cost = sum(leg["cost"] * leg["units"] for leg in legs) / units
+                for leg in legs:
+                    leg["profit"] = leg["margin"] * leg["units"]
+                main = legs[0]
+                return {"method": method, "buy_city": buy_city, "buy": buy[0], "buy_basis": buy[1], "legs": legs,
+                        "sell_city": main["sell_city"], "sell": main["sell"], "sell_basis": main["sell_basis"],
+                        "cost": cost, "margin": profit / units, "roi": profit / (cost * units), "units": units, "profit": profit,
+                        "share_measured": main["share_measured"]}
+            weekday_outlets = [(c, ask[c], cfg["cycle_share"] * share[c] * days[c]["weekday"]["per_day"]) for c in weekday if ask[c][0] is not None]
+            weekend_outlets = [(c, ask_weekend[c], cfg["cycle_share"] * share[c] * days[c]["weekend"]["per_day"] * HOT_DAYS)
+                               for c in weekend if ask_weekend[c][0] is not None]
+            cycles, sweeps = [], []
             for b in weekday:
-                for s in weekday:
-                    if ask[s][0] is None:
-                        continue
-                    sells = share[s] * days[s]["weekday"]["per_day"]
-                    if bid[b][0] is not None:
-                        buys = (1 - share[b]) * days[b]["weekday"]["per_day"]
-                        cycles.append(plan("order", b, s, bid[b], ask[s], cfg["setup_fee"], cfg["cycle_share"] * min(sells, buys)))
-                    if b != s and ask[b][0] is not None:
-                        cycles.append(plan("instant", b, s, ask[b], ask[s], 0, cfg["cycle_share"] * sells))
-            sweeps = [plan("instant", b, s, ask[b], ask_weekend[s], 0, cfg["cycle_share"] * share[s] * days[s]["weekend"]["per_day"] * HOT_DAYS)
-                      for s in weekend if ask_weekend[s][0] is not None for b in weekday if ask[b][0] is not None]
-            best = lambda options: max((o for o in options if o["margin"] > 0), key=lambda o: o["profit"], default=None)
+                if bid[b][0] is not None:
+                    cycles.append(plan("order", b, bid[b], cfg["setup_fee"], cfg["cycle_share"] * (1 - share[b]) * days[b]["weekday"]["per_day"], weekday_outlets))
+                if ask[b][0] is not None:
+                    cycles.append(plan("instant", b, ask[b], 0, None, [o for o in weekday_outlets if o[0] != b]))
+                    sweeps.append(plan("instant", b, ask[b], 0, None, weekend_outlets))
+            best = lambda options: max((o for o in options if o), key=lambda o: o["profit"], default=None)
             cycle, sweep = best(cycles), best(sweeps)
-            other = best([o for o in cycles if cycle and o["method"] != cycle["method"]])
+            other = best([o for o in cycles if o and cycle and o["method"] != cycle["method"]])
             swing = None
             if sweep:
                 daily = defaultdict(lambda: [0, 0])

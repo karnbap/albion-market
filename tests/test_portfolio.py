@@ -36,10 +36,11 @@ class TradingPlanTests(unittest.TestCase):
         at = datetime(2026, 10, day, 9, tzinfo=UTC)
         self.store.db.execute("INSERT OR REPLACE INTO book_stats VALUES(?,?,?,?,?,?,?)", ("T7_RELIC", city, side, at.isoformat(), price, 50, 3))
 
-    def test_weekday_cycle_and_weekend_sweep(self):
+    def test_weekday_cycle_and_weekend_sweep_sell_across_cities(self):
         for day in range(19, 26):
-            for city in ("3008", "1002", "5003"):    # Brecilien (5003) is not a trading city
-                self.sold(city, day, 100, 100)
+            self.sold("3008", day, 300, 100)         # busy Martlock: 7,200 a day
+            for city in ("1002", "5003"):            # Brecilien (5003) is not a trading city
+                self.sold(city, day, 100, 100)       # 2,400 a day
             self.sold("2004", day, 5, 100)           # too quiet to pick
         for day in (19, 20, 21):                     # weekday quotes
             self.best("3008", "buy", day, 80); self.best("3008", "sell", day, 95)
@@ -50,18 +51,37 @@ class TradingPlanTests(unittest.TestCase):
         row = next(r for r in self.store.state()["portfolio"]["rows"] if r["item"] == "T7_RELIC")
         keep = 1 - .08 - .025
         w = row["weekday"]
-        # Buy order at Martlock's bid, sell order at Lymhurst's ask; 20% of the half of 2,400 a day.
-        self.assertEqual((w["method"], w["buy_city"], w["sell_city"], w["buy"], w["sell"], w["buy_basis"]), ("order", "3008", "1002", 80, 120, "호가 기록"))
-        self.assertAlmostEqual(w["margin"], 120 * keep - 80 * 1.025)
-        self.assertAlmostEqual(w["units"], .2 * .5 * 2400)
-        self.assertEqual((w["turn_units"], w["turns"]), (120, 2))
-        self.assertAlmostEqual(w["profit_week"], w["margin"] * 240 * 4)
+        # Buy orders at Martlock's bid take 20% of the half of its 7,200 a day (720). Lymhurst takes
+        # 20% of the half of its 2,400 (240) at the best margin; the rest is sold in Martlock.
+        self.assertEqual((w["method"], w["buy_city"], w["buy"], w["buy_basis"]), ("order", "3008", 80, "호가 기록"))
+        self.assertEqual([(l["sell_city"], l["sell"], l["units"]) for l in w["legs"]], [("1002", 120, 240), ("3008", 95, 480)])
+        self.assertAlmostEqual(w["legs"][0]["margin"], 120 * keep - 80 * 1.025)
+        self.assertAlmostEqual(w["profit"], 240 * (120 * keep - 82) + 480 * (95 * keep - 82))
+        self.assertEqual((w["units"], w["turn_units"], w["turns"]), (720, 360, 2))
+        self.assertAlmostEqual(w["profit_week"], w["profit"] * 4)
         other = row["weekday_other"]
-        self.assertEqual((other["method"], other["buy_city"], other["sell_city"], other["buy"]), ("instant", "3008", "1002", 95))
-        # Weekend: buy at Martlock's weekday ask, sell at Lymhurst's weekend ask over 2.25 days.
+        self.assertEqual((other["method"], other["buy_city"], [l["sell_city"] for l in other["legs"]]), ("instant", "3008", ["1002"]))
+        # Weekend: buy at Martlock's weekday ask, sell at the weekend asks over 2.25 days in both cities.
         k = row["weekend"]
-        self.assertEqual((k["buy_city"], k["sell_city"], k["buy"], k["sell"], k["units"]), ("3008", "1002", 95, 150, 540))
-        self.assertAlmostEqual(k["margin"], 150 * keep - 95)
+        self.assertEqual((k["buy_city"], k["buy"]), ("3008", 95))
+        self.assertEqual([(l["sell_city"], l["sell"], l["units"]) for l in k["legs"]], [("1002", 150, 540), ("3008", 110, 1620)])
+        self.assertEqual(k["units"], 2160)
+
+    def test_transport_cost_keeps_sales_in_the_buy_city(self):
+        self.store.save_config({"transport_per_unit": 30})
+        for day in range(19, 26):
+            for city in ("3008", "1002"):
+                self.sold(city, day, 100, 100)
+        for day in (19, 20, 21):
+            self.best("3008", "buy", day, 80); self.best("3008", "sell", day, 110)
+            self.best("1002", "buy", day, 85); self.best("1002", "sell", day, 120)
+        w = next(r for r in self.store.state()["portfolio"]["rows"] if r["item"] == "T7_RELIC")["weekday"]
+        # Carrying costs 30 a unit, more than either price gap: every unit is sold where it was bought.
+        self.assertEqual([l["sell_city"] for l in w["legs"]], [w["buy_city"]])
+        self.store.save_config({"transport_per_unit": 0})
+        self.store._plan_key = None
+        w = next(r for r in self.store.state()["portfolio"]["rows"] if r["item"] == "T7_RELIC")["weekday"]
+        self.assertEqual((w["buy_city"], [l["sell_city"] for l in w["legs"]]), ("3008", ["1002"]))   # free to carry: buy cheap, sell dear
 
     def test_silver_per_plan_fills_best_return_first_and_stock_goes_first(self):
         plan = lambda units, cost, margin: {"method": "order", "units": units, "cost": cost, "margin": margin, "profit": units * margin, "roi": margin / cost}
