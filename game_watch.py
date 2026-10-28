@@ -66,6 +66,10 @@ class WindowsPlatform:
         image = ctypes.create_unicode_buffer(32768); size = wintypes.DWORD(len(image))
         if not self.k.GetExitCodeProcess(handle,ctypes.byref(code)):
             raise ctypes.WinError(ctypes.get_last_error())
+        # An exited process can still be opened, but asking its image name then fails
+        # (WinError 31, seen 2026-10-28) and left a crashed capture never restarted.
+        if code.value != 259:
+            return False
         if not self.k.QueryFullProcessImageNameW(handle,0,image,ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
         # start.ps1 runs the local fork instead of the official client when it is present.

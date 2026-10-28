@@ -168,5 +168,16 @@ class GameWatchTests(unittest.TestCase):
             self.assertEqual(arguments['stderr'],subprocess.STDOUT)
             self.assertNotIn('capture_output',arguments)
 
+    def test_exited_capture_is_not_asked_for_its_image_name(self):
+        platform=WindowsPlatform.__new__(WindowsPlatform)
+        platform.root=self.root
+        def exited(handle,code):
+            code._obj.value=0
+            return True
+        def fail(*args):
+            raise AssertionError('image name asked for an exited process')
+        platform.k=SimpleNamespace(GetExitCodeProcess=exited,QueryFullProcessImageNameW=fail)
+        self.assertFalse(platform.identity(1))
+
 
 if __name__=='__main__': unittest.main()

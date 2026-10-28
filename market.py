@@ -46,7 +46,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261028.3"
+BUILD = "20261028.4"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -56,6 +56,8 @@ CARRIED = "carried"
 BANK_CITIES = {"0006": "7", "4001": "4002", "1001": "1002"}
 # Average purchase prices are shown for this many recent days next to all-time ones.
 PURCHASE_WINDOW_DAYS = 30
+# The same sell order and amount again within this many seconds is one instant buy heard twice.
+INSTANT_BUY_REPEAT = 5
 # An own sell order that sold nothing for STALE_DAYS gets wait-or-relist advice (the user's
 # rule); waiting is advised when the queue ahead should clear within SOON_DAYS.
 STALE_DAYS, SOON_DAYS = 3, 3
@@ -328,7 +330,7 @@ class Store:
         for table, name, kind in (("my_orders", "remaining", "INTEGER"), ("my_orders", "checked", "TEXT"),
                                   ("my_orders", "source", "TEXT NOT NULL DEFAULT 'manual'"), ("my_orders", "moved", "TEXT"),
                                   ("personal_sales", "mailed", "TEXT"), ("personal_mails", "mailed", "TEXT"),
-                                  ("finished_lists", "identity", "TEXT")):
+                                  ("finished_lists", "identity", "TEXT"), ("purchases", "auction", "TEXT")):
             if name not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         self.db.commit()
@@ -905,6 +907,31 @@ class Store:
             return self.db.execute("INSERT INTO purchases(item,city,kind,price,amount,bought,created) VALUES(?,?,?,?,?,?,?)",
                                    (item, city, kind, price, amount, bought.isoformat(), now.isoformat())).lastrowid
 
+    def ingest_instant_buy(self, payload):
+        """One instant buy from a market sell order (the fork's private topic
+        marketorders.instantbuy, local.5): the units bought and the order they took, its price
+        x10000 as the game sends it. A tracked item bought at a city market goes into purchases
+        as kind instant with the order's id, so it can be removed like a hand-entered one."""
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object required")
+        item, city, auction = payload.get("ItemTypeId"), location(payload.get("LocationId", "")), str(payload.get("AuctionId") or "")
+        amount, price = payload.get("Amount"), payload.get("UnitPriceSilver")
+        if not auction or isinstance(amount, bool) or not isinstance(amount, int) or not 0 < amount <= 10**9:
+            raise ValueError("AuctionId and a positive Amount required")
+        if isinstance(price, bool) or not isinstance(price, int) or price <= 0:
+            raise ValueError("UnitPriceSilver must be a positive integer")
+        if item not in self.cfg["items"] or city not in CITIES or int(payload.get("QualityLevel") or 1) != 1 or int(payload.get("EnchantmentLevel") or 0):
+            return {"accepted": 0, "ignored": True}
+        now = self.clock()
+        with self.lock, self.db:
+            # The capture client can listen on more than one network device.
+            for r in self.db.execute("SELECT created FROM purchases WHERE auction=? AND amount=? AND removed IS NULL", (auction, amount)):
+                if abs((now - parse_time(r["created"])).total_seconds()) <= INSTANT_BUY_REPEAT:
+                    return {"accepted": 0, "duplicate": True}
+            added = self.db.execute("INSERT INTO purchases(item,city,kind,price,amount,bought,created,auction) VALUES(?,?,?,?,?,?,?,?)",
+                                    (item, city, "instant", price / 10000, amount, now.isoformat(), now.isoformat(), auction)).lastrowid
+        return {"accepted": 1, "id": added}
+
     def remove_purchase(self, purchase):
         with self.lock, self.db:
             if not self.db.execute("UPDATE purchases SET removed=? WHERE id=? AND removed IS NULL", (self.clock().isoformat(), int(purchase))).rowcount:
@@ -927,10 +954,10 @@ class Store:
                 elif r["amount"] and r["price"]:
                     rows.append({"source": "expired_mail", "kind": "order", "item": r["item"], "city": r["city"], "amount": r["amount"],
                                  "silver": r["price"] * r["amount"], "order_price": r["price"], "at": r["at"]})
-            for r in self.db.execute("SELECT id,item,city,kind,price,amount,bought FROM purchases WHERE removed IS NULL"):
-                rows.append({"source": "manual", "id": r["id"], "kind": r["kind"], "item": r["item"], "city": r["city"], "amount": r["amount"],
+            for r in self.db.execute("SELECT id,item,city,kind,price,amount,bought,auction FROM purchases WHERE removed IS NULL"):
+                rows.append({"source": "instant_buy" if r["auction"] else "manual", "id": r["id"], "kind": r["kind"], "item": r["item"], "city": r["city"], "amount": r["amount"],
                              "silver": r["price"] * r["amount"], "order_price": None, "at": r["bought"]})
-        mails = [(r["item"], r["city"], r["order_price"], parse_time(r["at"])) for r in rows if r["source"] != "manual"]
+        mails = [(r["item"], r["city"], r["order_price"], parse_time(r["at"])) for r in rows if r["source"] not in ("manual", "instant_buy")]
         for o in open_orders:
             if o["side"] != "buy" or o["filled"] <= 0:
                 continue
@@ -2457,6 +2484,8 @@ def handler_class(store, token):
                         result = store.ingest_finished(payload)
                     elif topic == "holdings.containers":
                         result = store.ingest_holdings(payload)
+                    elif topic == "marketorders.instantbuy":
+                        result = store.ingest_instant_buy(payload)
                     else:
                         result = {"accepted": 0, "ignored": True}
                 elif path.startswith("/ingest/europe/"):
