@@ -111,6 +111,47 @@ class PurchaseTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def instant_buy(self, **fields):
+        return {"CharacterId": "character-a", "LocationId": "0007", "AuctionId": 41, "Amount": 12, "ItemTypeId": "T8_SOUL",
+                "QualityLevel": 1, "EnchantmentLevel": 0, "UnitPriceSilver": 95000000, **fields}
+
+    def test_instant_buys_from_the_fork_become_purchases(self):
+        self.assertEqual(self.store.ingest_instant_buy(self.instant_buy())["accepted"], 1)
+        # The same buy heard on a second network device is not counted twice.
+        self.now += timedelta(seconds=2)
+        self.assertTrue(self.store.ingest_instant_buy(self.instant_buy())["duplicate"])
+        # A second buy from the same order a little later is.
+        self.now += timedelta(seconds=30)
+        self.store.ingest_instant_buy(self.instant_buy(Amount=3))
+        self.now += timedelta(seconds=30)
+        self.store.ingest_instant_buy(self.instant_buy(AuctionId=42, LocationId="0301", UnitPriceSilver=100000000, Amount=5))
+        for ignored in ({"ItemTypeId": "T4_BAG"}, {"EnchantmentLevel": 1}, {"LocationId": "0006"}):
+            self.assertTrue(self.store.ingest_instant_buy(self.instant_buy(**ignored))["ignored"], ignored)
+        for bad in ({"Amount": 0}, {"Amount": True}, {"AuctionId": None}, {"UnitPriceSilver": 0}, {"UnitPriceSilver": 1.5}):
+            with self.assertRaises(ValueError, msg=bad):
+                self.store.ingest_instant_buy(self.instant_buy(**bad))
+        p = self.purchases()
+        self.assertEqual([(r["source"], r["kind"], r["city"], r["amount"], r["unit"]) for r in p["recent"]],
+                         [("instant_buy", "instant", "7", 5, 10000), ("instant_buy", "instant", "7", 3, 9500), ("instant_buy", "instant", "7", 12, 9500)])
+        soul = p["summary"][0]
+        self.assertEqual(soul["all"]["units"], 20)
+        # Instant buys pay no setup fee.
+        self.assertAlmostEqual(soul["all"]["cost_average"], (15 * 9500 + 5 * 10000) / 20)
+        self.store.remove_purchase(p["recent"][0]["id"])
+        self.assertEqual(self.purchases()["summary"][0]["all"]["units"], 15)
+
+    def test_instant_buys_arrive_on_the_private_path(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class(self.store, "test-token"))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_port}/private/europe/marketorders.instantbuy"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(self.instant_buy()).encode())) as r:
+                self.assertEqual(json.load(r)["accepted"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(self.purchases()["summary"][0]["all"]["units"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

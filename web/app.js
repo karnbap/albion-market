@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261028.2';
+  const legacy=next.build!=='20261028.4';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -267,10 +267,10 @@ function renderPurchases(){
  if(!p){updateHtml('purchases',empty('매수 기록을 쓰려면 분석 프로그램을 다시 실행해 주세요.'));return}
  if(!$('buy-item').options.length){$('buy-item').innerHTML=Object.entries(state.items).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('');$('buy-city').innerHTML=Object.entries(state.cities).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('')}
  $('purchases-context').textContent=`원가 = 매수 주문 수수료 ${n(p.setup_fee*100,1)}% 포함${state.settings.fees_confirmed?'':' · 수수료 설정 미확인'}`;
- const source={mail:'구매 주문 완료 메일',expired_mail:'구매 주문 만료 메일 (산 만큼)',open_order:'진행 중 매수 주문 (채워진 만큼)'};
+ const source={instant_buy:'자동 · 바로 사기 (게임에서 읽음)',mail:'구매 주문 완료 메일',expired_mail:'구매 주문 만료 메일 (산 만큼)',open_order:'진행 중 매수 주문 (채워진 만큼)'};
  const how=r=>r.source==='manual'?(r.kind==='instant'?'직접 입력 · 바로 사기':'직접 입력 · 매수 주문'):source[r.source]||esc(r.source);
  const summary=p.summary.length?table(['품목',`최근 ${p.window_days}일 수량`,'평균 매수가','원가 (수수료 포함)','전체 수량','전체 평균 매수가','전체 원가'],p.summary.map(s=>`<tr><td>${esc(state.items[s.item]||s.item)}</td><td>${n(s.recent.units)}개</td><td>${n(s.recent.average)}</td><td>${n(s.recent.cost_average)}</td><td>${n(s.all.units)}개</td><td>${n(s.all.average)}</td><td>${n(s.all.cost_average)}</td></tr>`),'purchase-summary'):'';
- const rows=p.recent.map(r=>`<tr><td>${date(r.at)}</td><td>${esc(state.items[r.item]||r.item)} · ${esc(state.cities[r.city]||r.city)}</td><td>${how(r)}</td><td>${n(r.unit)}${r.order_price!=null&&Math.round(r.order_price)!==Math.round(r.unit)?`<small>주문 단가 ${n(r.order_price)}</small>`:''}</td><td>${n(r.amount)}개</td><td>${n(r.silver)}</td><td>${r.source==='manual'?`<button type="button" class="secondary small-button" data-remove-purchase="${r.id}">삭제</button>`:''}</td></tr>`);
+ const rows=p.recent.map(r=>`<tr><td>${date(r.at)}</td><td>${esc(state.items[r.item]||r.item)} · ${esc(state.cities[r.city]||r.city)}</td><td>${how(r)}</td><td>${n(r.unit)}${r.order_price!=null&&Math.round(r.order_price)!==Math.round(r.unit)?`<small>주문 단가 ${n(r.order_price)}</small>`:''}</td><td>${n(r.amount)}개</td><td>${n(r.silver)}</td><td>${r.id!=null?`<button type="button" class="secondary small-button" data-remove-purchase="${r.id}">삭제</button>`:''}</td></tr>`);
  updateHtml('purchases',rows.length?`<h3 class="sub-head">품목별 평균</h3>${summary}<h3 class="sub-head">최근 기록 ${n(rows.length)}개</h3>${table(['산 때','품목 · 도시','어디서','단가','수량','지출',''],rows,'purchases')}`:empty('매수 기록이 아직 없습니다. 구매 주문 완료 메일을 열거나, 바로 산 것을 위에 적으면 쌓입니다.'));
 }
 function renderNow(){
