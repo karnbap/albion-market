@@ -18,7 +18,7 @@ class TradingPlanTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         shutil.copy(ROOT / "config.json", self.root / "config.json")
         cfg = json.loads((self.root / "config.json").read_text(encoding="utf-8-sig"))
-        cfg.update(sales_tax=.08, setup_fee=.025, transport_per_unit=0, timezone="Europe/Paris", cycle_share=.2, weekday_cycles=2)
+        cfg.update(sales_tax=.08, setup_fee=.025, minimum_margin=.1, transport_per_unit=0, timezone="Europe/Paris", cycle_share=.2, weekday_cycles=2)
         (self.root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
         self.now = datetime(2026, 10, 27, 12, tzinfo=UTC)  # a Tuesday
         self.store = Store(self.root, clock=lambda: self.now)
