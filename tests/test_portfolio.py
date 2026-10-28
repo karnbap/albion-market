@@ -145,5 +145,36 @@ class TradingPlanTests(unittest.TestCase):
         self.assertAlmostEqual(mine["roi"], 130 * (1 - .08 - .025) / 100 - 1)
 
 
+    def test_units_under_the_buy_target_per_city(self):
+        seen = self.now.isoformat()
+        def book(*levels, single=False):
+            return {"levels": [{"price": p, "amount": a} for p, a in levels], "single_only": single, "seen": seen if levels else None, "fresh": bool(levels)}
+        empty = book()
+        books = {item: {c: {"sell": empty, "buy": empty} for c in ("7", "4002", "1002", "3008", "2004", "5003")} for item in ("T7_RELIC", "T8_SOUL", "T8_RELIC", "T8_RUNE")}
+        soul = books["T8_SOUL"]
+        soul["4002"]["sell"] = book((14000, 3), (15000, 9))            # the dearest lowest ask: sell here
+        soul["1002"]["sell"] = book((9500, 4), (10000, 6), (10500, 20))
+        soul["7"]["sell"] = book((9000, 1), single=True)                # a clicked order: not a list
+        soul["5003"]["sell"] = book((5000, 99))                         # Brecilien is not a trading city
+        self.store.save_config({"buy_targets": {"T8_SOUL": 10000}, "transport_per_unit": 50})
+        u = next(r for r in self.store.buy_under(books) if r["item"] == "T8_SOUL")
+        keep = 1 - .08 - .025
+        self.assertEqual((u["target"], u["chosen"], u["sell_city"], u["sell"]), (10000, 10000, "4002", 14000))
+        self.assertEqual(u["suggested"], int(14000 * keep / 1.1 - 50))
+        rows = {r["city"]: r for r in u["rows"]}
+        self.assertNotIn("5003", rows)
+        self.assertEqual((rows["1002"]["units"], rows["1002"]["cost"], rows["1002"]["lowest"]), (10, 9500 * 4 + 10000 * 6, 9500))
+        self.assertAlmostEqual(rows["1002"]["profit"], 10 * (14000 * keep - 50) - (9500 * 4 + 10000 * 6))
+        self.assertFalse(rows["7"]["known"])
+        self.assertEqual((rows["4002"]["units"], u["units"]), (0, 10))
+        # No target set: the suggestion is used.
+        self.store.save_config({"buy_targets": {}})
+        u = next(r for r in self.store.buy_under(books) if r["item"] == "T8_SOUL")
+        self.assertEqual((u["chosen"], u["target"]), (None, u["suggested"]))
+        for bad in ({"buy_targets": {"NOPE": 1}}, {"buy_targets": {"T8_SOUL": 0}}, {"buy_targets": {"T8_SOUL": 1.5}}, {"buy_targets": []}):
+            with self.assertRaises(ValueError, msg=bad):
+                self.store.save_config(bad)
+
+
 if __name__ == "__main__":
     unittest.main()
