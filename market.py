@@ -1228,7 +1228,22 @@ class Store:
         collected), valued at the average cost from purchases. A finished-trades entry counts
         when its buyer is the uploader and HasBuyerFetched is false (seen on the live server,
         2026-10-27: buy-order fills waiting in the tab); entries the player sold are skipped.
-        Each market's tab is as of its latest list."""
+        Each market's tab is as of its latest list. Units are also priced the dearest way to sell
+        them (best_listing): a sell order one silver under the lowest ask, at my own price when
+        the lowest ask is mine, in the trading city where that comes highest, less sales tax and
+        setup fee, and transport for units held in another city (carried units are with me)."""
+        keep = 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"]
+        best_listing = {}
+        for item in self.cfg["items"]:
+            for c in self.trade_cities():
+                book = (books or {}).get(item, {}).get(c, {}).get("sell")
+                if not book or not book["levels"] or book.get("single_only"):
+                    continue
+                low = book["levels"][0]["price"]
+                own = any(o["side"] == "sell" and o["remaining"] and (o["item"], o["city"], o["price"]) == (item, c, low) for o in open_orders)
+                price = low if own else low - 1
+                if item not in best_listing or price > best_listing[item]["price"]:
+                    best_listing[item] = {"city": c, "price": price, "own": own, "seen": book["seen"], "fresh": book["fresh"], "net": price * keep}
         costs = {s["item"]: s["recent"]["cost_average"] or s["all"]["cost_average"] for s in purchases["summary"]}
         cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None, "bank_source": None, "finished": 0, "finished_seen": None, "carried": 0})
         for o in open_orders:
@@ -1288,13 +1303,17 @@ class Store:
                 if levels:
                     sell_now, sell_now_amount = levels[0]["price"], levels[0]["amount"]
             net = sell_now * (1 - self.cfg["sales_tax"]) if sell_now is not None else None
+            best = best_listing.get(item)
+            listed_net = best["net"] - (self.cfg["transport_per_unit"] if city not in (best["city"], CARRIED) else 0) if best else None
             rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost,
+                         "list_city": best and best["city"], "list_net": listed_net,
+                         "list_value": total * listed_net if listed_net is not None else None,
                          "value": total * cost if cost is not None else None,
                          "sell_now": sell_now, "sell_now_amount": sell_now_amount,
                          "net_now": net,
                          "value_now": total * net if net is not None else None,
                          "profit_now": total * (net - cost) if net is not None and cost is not None else None})
-        return {"rows": rows, "finished": finished, "unmapped_banks": unmapped}
+        return {"rows": rows, "finished": finished, "unmapped_banks": unmapped, "best_listing": best_listing}
 
     def ingest_holdings(self, payload):
         """Units per item the fork read from the inventory and from each bank opened this

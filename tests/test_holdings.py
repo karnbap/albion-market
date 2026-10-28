@@ -71,6 +71,29 @@ class HoldingsTests(unittest.TestCase):
         self.assertAlmostEqual(relic["profit_now"], 10 * (net - relic["cost"]))
         self.assertEqual((rows["T8_SOUL"]["sell_now"], rows["T8_SOUL"]["value_now"], rows["T8_SOUL"]["profit_now"]), (None, None, None))
 
+    def test_priced_at_the_dearest_sell_order_i_could_place(self):
+        self.store.save_config({"transport_per_unit": 5, "excluded_cities": ["5003"]})
+        martlock = lambda oid, price, amount: dict(self.order(oid, price, amount), LocationId="3008")
+        self.store.ingest("marketorders.ingest", {"Orders": [self.order(21, 150, 2), self.order(22, 170, 3),
+                                                             martlock(23, 200, 1), martlock(24, 210, 4),
+                                                             dict(self.order(25, 300, 6), LocationId="5003"), dict(self.order(26, 310, 6), LocationId="5003")]})
+        self.store.ingest_my_orders({"Kind": "sell", "LocationId": "4002", "Orders": [self.order(21, 150, 2)]})
+        self.store.add_purchase({"item": "T7_RELIC", "city": "4002", "kind": "instant", "price": 100, "amount": 10})
+        self.store.set_bank({"item": "T7_RELIC", "city": "4002", "amount": 10})
+        h = self.holdings()
+        keep = 1 - self.store.cfg["sales_tax"] - self.store.cfg["setup_fee"]
+        # Fort Sterling's lowest ask is mine (150, kept as is); Martlock's is someone's 200, so 199
+        # there is the dearest. Brecilien (300) is not a trading city.
+        best = h["best_listing"]["T7_RELIC"]
+        self.assertEqual((best["city"], best["price"], best["own"]), ("3008", 199, False))
+        self.assertAlmostEqual(best["net"], 199 * keep)
+        row = next(r for r in h["rows"] if r["city"] == "4002" and r["item"] == "T7_RELIC")
+        self.assertEqual((row["total"], row["list_city"]), (12, "3008"))
+        self.assertAlmostEqual(row["list_net"], 199 * keep - 5)          # carried to Martlock
+        self.store.ingest("marketorders.ingest", {"Orders": [martlock(27, 140, 1), martlock(28, 145, 1)]})
+        best = self.holdings()["best_listing"]["T7_RELIC"]
+        self.assertEqual((best["city"], best["price"], best["own"]), ("4002", 150, True))
+
     def test_finished_tab_counts_what_i_bought_and_have_not_collected(self):
         me, them = "00000000-0000-0000-0000-00000000000a", "00000000-0000-0000-0000-00000000000b"
         bought = {"Id": 5, "Amount": 2, "IsFinished": True, "AuctionType": "request", "HasBuyerFetched": False, "HasSellerFetched": True,
