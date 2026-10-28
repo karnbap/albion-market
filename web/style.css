@@ -101,3 +101,4 @@ section[id]{scroll-margin-top:20px}.personal-section{border-left:3px solid #c3ac
 /* Narrow screens: wide tables keep readable columns and scroll sideways instead of squeezing. */
 @media(max-width:760px){.table-wrap>table{min-width:640px}}
 .capital-grid{grid-template-columns:repeat(4,minmax(0,1fr))}@media(max-width:760px){.capital-grid{grid-template-columns:1fr 1fr}}
+.buy-target-form{margin:0}.buy-target-form input{width:110px;margin:0;padding:6px 8px;text-align:right}td.muted b{color:var(--muted);font-weight:400}#buy-under td{vertical-align:top}#buy-under-status:empty{display:none}
