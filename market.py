@@ -46,7 +46,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261029.1"
+BUILD = "20261029.2"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -267,6 +267,10 @@ class Store:
             self.cfg.setdefault(key, value)
         # Trial items (테스트·보류): collected and shown, but kept out of the picks and the plan.
         self.cfg["trial_items"] = [i for i in self.cfg.get("trial_items", []) if i in self.cfg["items"]]
+        # Per item, excluded cities still traded for that item (e.g. Brecilien for siphoned energy).
+        extra = self.cfg.get("item_cities", {})
+        self.cfg["item_cities"] = {i: [c for c in cs if c in CITIES] for i, cs in (extra if isinstance(extra, dict) else {}).items()
+                                   if i in self.cfg["items"] and isinstance(cs, list)}
         ZoneInfo(self.cfg["timezone"])
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lock = threading.RLock()
@@ -619,7 +623,7 @@ class Store:
         last = self.db.execute("SELECT MAX(id) FROM packets").fetchone()[0]
         key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(self.cfg["excluded_cities"]), self.cfg["sales_tax"], self.cfg["setup_fee"])
         if getattr(self, "_study_key", None) != key:
-            self._studies = [self.market_study(i, c, cache) for i in self.cfg["items"] for c in self.trade_cities()]
+            self._studies = [self.market_study(i, c, cache) for i in self.cfg["items"] for c in self.trade_cities(i)]
             self._study_key = key
         return self._studies
 
@@ -689,7 +693,7 @@ class Store:
         out = {}
         for item in self.plan_items():
             days = {}
-            for city in self.trade_cities():
+            for city in self.trade_cities(item):
                 p = cache.setdefault(("patterns", item, city), self.patterns(item, city))
                 g = {}
                 for name, keys in (("weekday", BUY_DAYS), ("weekend", SELL_DAYS), ("all", range(7))):
@@ -1237,7 +1241,7 @@ class Store:
         keep = 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"]
         best_listing = {}
         for item in self.cfg["items"]:
-            for c in self.trade_cities():
+            for c in self.trade_cities(item):
                 book = (books or {}).get(item, {}).get(c, {}).get("sell")
                 if not book or not book["levels"] or book.get("single_only"):
                     continue
@@ -1784,8 +1788,8 @@ class Store:
         cache = {} if cache is None else cache
         for item in cfg["items"]:
             rows = []
-            for source in self.trade_cities():
-                for dest in self.trade_cities():
+            for source in self.trade_cities(item):
+                for dest in self.trade_cities(item):
                     rows.extend(self.route_scenarios(item, source, dest, books[item], cache))
             out.extend(sorted(rows, key=lambda r: (r["mode"] == "depth", -r["roi"])))
         return out
@@ -1793,9 +1797,11 @@ class Store:
     def plan_items(self):
         return [i for i in self.cfg["items"] if i not in self.cfg["trial_items"]]
 
-    def trade_cities(self):
-        """Cities trading analysis may buy in or sell to; the rest stay visible as prices only."""
-        return [c for c in CITIES if c not in self.cfg["excluded_cities"]]
+    def trade_cities(self, item=None):
+        """Cities trading analysis may buy in or sell to; the rest stay visible as prices only.
+        With an item, its item_cities come back in even when excluded_cities drops them."""
+        extra = self.cfg.get("item_cities", {}).get(item, ())
+        return [c for c in CITIES if c not in self.cfg["excluded_cities"] or c in extra]
 
     def route_scenarios(self, item, source, dest, books, cache):
         cfg = self.cfg
@@ -1885,10 +1891,11 @@ class Store:
         quotes = {}
         for item in self.cfg["items"]:
             for side in ("buy", "sell"):
-                quotes[item, side] = {city: books[item][city][side]["fresh_levels"][0] for city in self.trade_cities() if books[item][city][side]["fresh"]}
+                quotes[item, side] = {city: books[item][city][side]["fresh_levels"][0] for city in self.trade_cities(item) if books[item][city][side]["fresh"]}
         board = []
         for city in CITIES:
-            if city not in self.trade_cities():
+            here = [item for item in self.cfg["items"] if city in self.trade_cities(item)]
+            if not here:
                 board.append({"city": city, "excluded": True, "routes": [], "sell_here": [], "buy_here": [], "missing": [],
                               "fresh_items": 0, "newest_seen": None})
                 continue
@@ -1900,7 +1907,7 @@ class Store:
                 if key not in picks or c["roi"] > picks[key]["roi"]:
                     picks[key] = c
             routes = []
-            for item in self.cfg["items"]:
+            for item in here:
                 main = max((picks[k] for k in ((item, False), (item, True)) if k in picks), key=lambda c: c["roi"], default=None)
                 if main is None:
                     continue
@@ -1912,7 +1919,7 @@ class Store:
                 routes.append(entry)
             routes.sort(key=lambda r: -r["roi"])
             best_here = {"sell_here": [], "buy_here": []}
-            for item in self.cfg["items"]:
+            for item in here:
                 for side, key, better in (("buy", "sell_here", max), ("sell", "buy_here", min)):
                     pool = quotes[item, side]
                     if city not in pool or len(pool) < 2:
@@ -1925,7 +1932,7 @@ class Store:
                     best_here[key].append({"item": item, "price": price, "amount": pool[city]["amount"], "compared": len(pool),
                                            "lead": abs(price - runner) if runner is not None else 0})
             missing = []
-            for item in self.cfg["items"]:
+            for item in here:
                 pair = books[item][city]
                 if pair["buy"]["fresh"] and pair["sell"]["fresh"]:
                     continue
@@ -1938,10 +1945,10 @@ class Store:
                 else:
                     reason = "지난 자료"
                 missing.append({"item": item, "reason": reason})
-            seen = [books[item][city][side]["seen"] for item in self.cfg["items"] for side in ("buy", "sell")
+            seen = [books[item][city][side]["seen"] for item in here for side in ("buy", "sell")
                     if books[item][city][side]["fresh"]]
             board.append({"city": city, "routes": routes[:3], **best_here, "missing": missing,
-                          "fresh_items": len(self.cfg["items"]) - len(missing), "newest_seen": max(seen, default=None)})
+                          "fresh_items": len(here) - len(missing), "newest_seen": max(seen, default=None)})
         return board
 
     def buy_under(self, books):
@@ -1952,10 +1959,10 @@ class Store:
         average traded price there goes beside it. Lists are each market's last observation,
         fresh or not; a list of one order (a clicked order) does not count."""
         cfg, keep, out = self.cfg, 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"], []
-        cities = self.trade_cities()
-        lists = {(item, c): books[item][c]["sell"] for item in cfg["items"] for c in cities}
         known = lambda book: bool(book["levels"]) and not book["single_only"]
         for item in cfg["items"]:
+            cities = self.trade_cities(item)
+            lists = {(item, c): books[item][c]["sell"] for c in cities}
             asks = {c: lists[item, c]["levels"][0]["price"] for c in cities if known(lists[item, c])}
             sell_city = max(asks, key=asks.get, default=None)
             sell = asks.get(sell_city)
@@ -1992,7 +1999,7 @@ class Store:
         keep = 1 - cfg["sales_tax"] - cfg["setup_fee"]
         out = []
         for item in cfg["items"]:
-            for city in self.trade_cities():
+            for city in self.trade_cities(item):
                 book = books[item][city]["sell"]
                 levels = book["fresh_levels"]
                 if not book["fresh"] or len(levels) < 2:
@@ -2341,7 +2348,7 @@ class Store:
             count = self.db.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
             return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "server": "Europe (게임도 유럽 서버인지 확인)",
                 "timezone": self.cfg["timezone"], "items": {i: name + (" · 테스트·보류" if i in self.cfg["trial_items"] else "") for i, name in self.cfg["items"].items()},
-                "trial_items": self.cfg["trial_items"], "cities": CITIES,
+                "trial_items": self.cfg["trial_items"], "item_cities": self.cfg["item_cities"], "cities": CITIES,
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "past_candidates": past_candidates, "past_buyouts": past_buyouts, "city_board": board,

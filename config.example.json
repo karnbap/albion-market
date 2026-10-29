@@ -28,6 +28,11 @@
   "trial_items": [
     "UNIQUE_GVGTOKEN_GENERIC"
   ],
+  "item_cities": {
+    "UNIQUE_GVGTOKEN_GENERIC": [
+      "5003"
+    ]
+  },
   "email": {
     "enabled": false,
     "to": "",
