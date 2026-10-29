@@ -13,7 +13,7 @@ class FakePlatform:
     def __init__(self):
         self.names = set()
         self.running = False
-        self.starts = self.stops = self.receiver_starts = 0
+        self.starts = self.stops = self.receiver_starts = self.windows = 0
         self.success = True
         self.receiver = True
     def processes(self): return self.names
@@ -31,6 +31,7 @@ class FakePlatform:
         self.receiver_starts += 1
         self.receiver = self.success
         return self.success
+    def open_dashboard(self): self.windows += 1
 
 
 class GameWatchTests(unittest.TestCase):
@@ -157,6 +158,22 @@ class GameWatchTests(unittest.TestCase):
         self.platform.names={GAME}
         for _ in range(4): self.step(3)
         self.assertEqual(self.platform.receiver_starts,0)
+
+    def test_dashboard_window_opens_once_per_game_session(self):
+        self.step()
+        self.assertEqual(self.platform.windows,0)
+        self.platform.names={GAME};self.platform.receiver=False
+        self.step();self.step(3)
+        # Not before the receiver answers: the window would show a dead page.
+        self.assertEqual(self.platform.windows,0)
+        self.platform.receiver=True
+        for _ in range(4): self.step(3)
+        self.assertEqual(self.platform.windows,1)
+        self.platform.names=set()
+        for _ in range(5): self.step(3)
+        self.platform.names={GAME}
+        for _ in range(3): self.step(3)
+        self.assertEqual(self.platform.windows,2)
 
     def test_launcher_uses_file_output_not_gui_inherited_pipes(self):
         platform=WindowsPlatform.__new__(WindowsPlatform)

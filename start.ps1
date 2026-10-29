@@ -37,7 +37,11 @@ if (-not $albionRunning) {
     if ($albionProcess.HasExited -and $albionPreviousPid) { Set-Content -LiteralPath $albionPidPath -Value $albionPreviousPid }
     if (-not $albionRunning) { throw 'Receiver did not start. Check data\server-stderr.log.' }
 }
-if (-not $NoBrowser) { Start-Process $albionAddress }
+if (-not $NoBrowser) {
+    # Its own Edge app window (no tabs or address bar); the default browser when that fails.
+    & $albionPython (Join-Path $albionRoot 'dashboard_window.py') $albionAddress
+    if ($LASTEXITCODE) { Start-Process $albionAddress }
+}
 if ($DashboardOnly) { exit }
 if(-not $Automatic) {
     $albionPausePath=Join-Path $albionRoot 'data\game-watch-paused'

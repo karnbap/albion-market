@@ -8,8 +8,10 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 import urllib.request
+import dashboard_window
 
 ROOT = Path(__file__).resolve().parent
 GAME = 'albion-online.exe'
@@ -92,7 +94,7 @@ class WindowsPlatform:
 
     def launch(self, *switches):
         # Automatic mode never installs software, opens a browser, or restarts
-        # an existing receiver. It starts only missing local components.
+        # an existing receiver (the dashboard window is opened separately). It starts only missing local components.
         # A file avoids inherited stdout pipes keeping the launcher wait open
         # after a GUI child has successfully started.
         with (self.root/'data/game-launcher.log').open('ab') as output:
@@ -107,14 +109,17 @@ class WindowsPlatform:
         self.launch()
         return self.capture_running() is True
 
+    def address(self):
+        port = int(json.loads((self.root/'config.json').read_text(encoding='utf-8-sig'))['port'])
+        return f'http://127.0.0.1:{port}'
+
     def receiver_ready(self):
         # The capture client keeps posting to a dead port silently, so the
         # receiver itself must be checked while the game is running.
         try:
-            port = int(json.loads((self.root/'config.json').read_text(encoding='utf-8-sig'))['port'])
             # No proxy: a system proxy must never see or answer the local health check.
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(f'http://127.0.0.1:{port}/api/health',timeout=2) as response:
+            with opener.open(self.address()+'/api/health',timeout=2) as response:
                 return json.load(response).get('app') == 'AlbionLocal'
         except Exception:
             return False
@@ -122,6 +127,16 @@ class WindowsPlatform:
     def start_receiver(self):
         self.launch('-DashboardOnly')
         return self.receiver_ready()
+
+    def open_dashboard(self):
+        # A thread: waiting for the new window to minimize must not stall the watch loop.
+        address = self.address()
+        def run():
+            try:
+                dashboard_window.open_window(address,background=True)
+            except Exception:
+                logging.exception('Dashboard window did not open')
+        threading.Thread(target=run,daemon=True).start()
 
     def stop_capture(self):
         pid = self.capture_pid()
@@ -149,6 +164,7 @@ class Controller:
         self.failures = 0
         self.receiver_misses = 0
         self.next_receiver = 0
+        self.window_opened = False
         self.last_status = None
 
     def status(self, text, game, capture):
@@ -170,6 +186,7 @@ class Controller:
         if not game:
             self.next_start = 0
             self.failures = 0
+            self.window_opened = False
         pause = self.root/'data/game-watch-paused'
         if pause.exists():
             if not game:
@@ -210,6 +227,10 @@ class Controller:
     def check_receiver(self, now):
         if self.platform.receiver_ready():
             self.receiver_misses = 0
+            if not self.window_opened:
+                # Once per game session; closing the window keeps it closed until the next launch.
+                self.window_opened = True
+                self.platform.open_dashboard()
             return self.status('게임 실행 중 · 자동 수집 중',True,True)
         # Three misses (~9 s) so a briefly busy receiver is never started twice.
         self.receiver_misses += 1
