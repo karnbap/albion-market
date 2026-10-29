@@ -7,7 +7,8 @@
 | market.py | 로컬 HTTP 수신, SQLite, 호가·물량·시장 이력·개인 판매 메일 분석 |
 | auto_update.py | 같은 포트에서 코드·웹 파일을 검증하고 교체, 실패 시 기존 화면 유지 |
 | web/ | 한국어 화면. app.js와 app-v2.js는 같은 내용을 유지 |
-| game_watch.py | 실제 Albion-Online.exe 실행 여부를 감시하고 소유한 수집기만 제어. 게임 중 분석 프로그램이 3회 연속 응답하지 않으면 다시 시작 |
+| game_watch.py | 실제 Albion-Online.exe 실행 여부를 감시하고 소유한 수집기만 제어. 게임 중 분석 프로그램이 3회 연속 응답하지 않으면 다시 시작. 게임 세션마다 분석 화면 창을 한 번 최소화로 띄움 |
+| dashboard_window.py | 분석 화면을 Edge `--app` 개별 창으로 열기. 제목이 정확히 같은 창이 있으면 새로 띄우지 않음 |
 | start.ps1 / stop.ps1 | 분석·수집 시작 및 소유 프로세스 종료 |
 | enable-game-watch.ps1 | 현재 사용자 Windows 시작프로그램에 게임 감시 등록 |
 | setup.py | 공식 수집기 다운로드, 숫자 품목 ID 갱신. 전용 수집기(`vendor/albiondata-client-fork.exe`)는 건드리지 않음 |
