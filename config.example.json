@@ -15,13 +15,23 @@
     "T7_RELIC": "T7 유물",
     "T8_SOUL": "T8 영혼",
     "T8_RELIC": "T8 유물",
-    "T8_RUNE": "T8 룬"
+    "T8_RUNE": "T8 룬",
+    "UNIQUE_GVGTOKEN_GENERIC": "착취한 에너지"
   },
   "item_numeric_ids": {
     "2031": "T7_RELIC",
     "2037": "T8_RUNE",
     "2038": "T8_SOUL",
-    "2039": "T8_RELIC"
+    "2039": "T8_RELIC",
+    "9877": "UNIQUE_GVGTOKEN_GENERIC"
+  },
+  "trial_items": [
+    "UNIQUE_GVGTOKEN_GENERIC"
+  ],
+  "item_cities": {
+    "UNIQUE_GVGTOKEN_GENERIC": [
+      "5003"
+    ]
   },
   "email": {
     "enabled": false,

@@ -354,7 +354,7 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(board['3008']['sell_here'][0], {'item': 'T7_RELIC', 'price': 130, 'amount': 20, 'compared': 2, 'lead': 40})
         self.assertEqual(board['1002']['buy_here'][0]['price'], 100)
         self.assertEqual(board['1002']['fresh_items'], 1)
-        self.assertEqual({m['item']: m['reason'] for m in board['1002']['missing']}, {'T8_SOUL': '미조회', 'T8_RELIC': '미조회', 'T8_RUNE': '미조회'})
+        self.assertEqual({m['item']: m['reason'] for m in board['1002']['missing']}, {i: '미조회' for i in self.store.cfg['items'] if i != 'T7_RELIC'})
         self.assertEqual(board['3008']['routes'], [])
         self.now += timedelta(minutes=16)
         board = {c['city']: c for c in self.store.state()['city_board']}
@@ -441,6 +441,51 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(pick['cost'], 4080)
         self.assertEqual(pick['profit'], round(20 * 130 * .92 + 20 * 120 * .92 - 4080))
 
+    def test_trial_items_are_shown_but_left_out_of_picks_and_the_plan(self):
+        cfg = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+        cfg["items"]["UNIQUE_GVGTOKEN_GENERIC"] = "착취한 에너지"
+        cfg["trial_items"] = ["UNIQUE_GVGTOKEN_GENERIC", "T1_NOT_TRACKED"]
+        (self.root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        self.store.db.close()
+        self.store = Store(self.root, clock=lambda: self.now)
+        self.assertEqual(self.store.cfg["trial_items"], ["UNIQUE_GVGTOKEN_GENERIC"])
+        self.market('1002', 10, asks=[100], item='UNIQUE_GVGTOKEN_GENERIC')
+        self.market('3008', 20, bids=[130], item='UNIQUE_GVGTOKEN_GENERIC')
+        state = self.store.state()
+        self.assertEqual(state['items']['UNIQUE_GVGTOKEN_GENERIC'], '착취한 에너지 · 테스트·보류')
+        self.assertEqual(state['trial_items'], ['UNIQUE_GVGTOKEN_GENERIC'])
+        self.assertIn('UNIQUE_GVGTOKEN_GENERIC', {c['item'] for c in state['candidates']})
+        self.assertEqual(state['now'], [])
+        self.assertNotIn('UNIQUE_GVGTOKEN_GENERIC', {r['item'] for r in state['portfolio']['rows']})
+        # The same trade on a regular item is picked.
+        self.market('1002', 30, asks=[100])
+        self.market('3008', 40, bids=[130])
+        self.assertEqual({p['item'] for p in self.store.state()['now']}, {'T7_RELIC'})
+
+    def test_item_cities_bring_an_excluded_city_back_for_that_item_only(self):
+        cfg = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+        cfg["items"]["UNIQUE_GVGTOKEN_GENERIC"] = "착취한 에너지"
+        cfg["excluded_cities"] = ["3005", "5003"]
+        cfg["item_cities"] = {"UNIQUE_GVGTOKEN_GENERIC": ["5003", "9999"], "T1_NOT_TRACKED": ["5003"]}
+        (self.root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        self.store.db.close()
+        self.store = Store(self.root, clock=lambda: self.now)
+        self.assertEqual(self.store.cfg["item_cities"], {"UNIQUE_GVGTOKEN_GENERIC": ["5003"]})
+        self.assertIn("5003", self.store.trade_cities("UNIQUE_GVGTOKEN_GENERIC"))
+        self.assertNotIn("5003", self.store.trade_cities("T7_RELIC"))
+        self.assertNotIn("3005", self.store.trade_cities("UNIQUE_GVGTOKEN_GENERIC"))
+        for item, base in (("UNIQUE_GVGTOKEN_GENERIC", 10), ("T7_RELIC", 30)):
+            self.market("1002", base, asks=[100], item=item)
+            self.market("5003", base + 10, bids=[130], item=item)
+        state = self.store.state()
+        routes = {(c["item"], c["buy_city"], c["sell_city"]) for c in state["candidates"]}
+        self.assertIn(("UNIQUE_GVGTOKEN_GENERIC", "1002", "5003"), routes)
+        self.assertNotIn(("T7_RELIC", "1002", "5003"), routes)
+        board = {c["city"]: c for c in state["city_board"]}
+        self.assertNotIn("excluded", board["5003"])
+        self.assertNotIn("T7_RELIC", {m["item"] for m in board["5003"]["missing"]})
+        self.assertTrue(board["3005"]["excluded"])
+
     def test_now_stays_within_the_trade_budget(self):
         self.store.save_config({'trade_budget': 2500})
         self.market('1002', 10, asks=[100, 104])
@@ -472,7 +517,9 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(state['now'], [])
         self.assertFalse(any('3005' in (c['buy_city'], c['sell_city']) for c in state['candidates']))
         self.assertEqual(state['buyouts'], [])
-        self.assertEqual([c['city'] for c in state['city_board'] if c.get('excluded')], ['3005', '5003'])
+        # Brecilien stays on the board only when some item (siphoned energy) brings it back.
+        brecilien = any('5003' in cs for cs in self.store.cfg['item_cities'].values())
+        self.assertEqual([c['city'] for c in state['city_board'] if c.get('excluded')], ['3005'] if brecilien else ['3005', '5003'])
         self.assertEqual(next(c for c in state['city_board'] if c['city'] == '1002')['buy_here'], [])
         self.store.save_config({'excluded_cities': []})
         pick = next(p for p in self.store.state()['now'] if p['sell_city'] == '3005')

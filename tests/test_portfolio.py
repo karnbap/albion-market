@@ -150,7 +150,7 @@ class TradingPlanTests(unittest.TestCase):
         def book(*levels, single=False):
             return {"levels": [{"price": p, "amount": a} for p, a in levels], "single_only": single, "seen": seen if levels else None, "fresh": bool(levels)}
         empty = book()
-        books = {item: {c: {"sell": empty, "buy": empty} for c in ("7", "4002", "1002", "3008", "2004", "5003")} for item in ("T7_RELIC", "T8_SOUL", "T8_RELIC", "T8_RUNE")}
+        books = {item: {c: {"sell": empty, "buy": empty} for c in ("7", "4002", "1002", "3008", "2004", "5003")} for item in self.store.cfg["items"]}
         soul = books["T8_SOUL"]
         soul["4002"]["sell"] = book((14000, 3), (15000, 9))            # the dearest lowest ask: sell here
         soul["1002"]["sell"] = book((9500, 4), (10000, 6), (10500, 20))
