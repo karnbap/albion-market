@@ -354,7 +354,7 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(board['3008']['sell_here'][0], {'item': 'T7_RELIC', 'price': 130, 'amount': 20, 'compared': 2, 'lead': 40})
         self.assertEqual(board['1002']['buy_here'][0]['price'], 100)
         self.assertEqual(board['1002']['fresh_items'], 1)
-        self.assertEqual({m['item']: m['reason'] for m in board['1002']['missing']}, {'T8_SOUL': '미조회', 'T8_RELIC': '미조회', 'T8_RUNE': '미조회'})
+        self.assertEqual({m['item']: m['reason'] for m in board['1002']['missing']}, {i: '미조회' for i in self.store.cfg['items'] if i != 'T7_RELIC'})
         self.assertEqual(board['3008']['routes'], [])
         self.now += timedelta(minutes=16)
         board = {c['city']: c for c in self.store.state()['city_board']}
@@ -440,6 +440,27 @@ class MarketTests(unittest.TestCase):
         self.assertEqual((pick['units'], pick['buy_low'], pick['buy_high'], pick['sell_high'], pick['sell_low']), (40, 100, 104, 130, 120))
         self.assertEqual(pick['cost'], 4080)
         self.assertEqual(pick['profit'], round(20 * 130 * .92 + 20 * 120 * .92 - 4080))
+
+    def test_trial_items_are_shown_but_left_out_of_picks_and_the_plan(self):
+        cfg = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+        cfg["items"]["UNIQUE_GVGTOKEN_GENERIC"] = "착취한 에너지"
+        cfg["trial_items"] = ["UNIQUE_GVGTOKEN_GENERIC", "T1_NOT_TRACKED"]
+        (self.root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        self.store.db.close()
+        self.store = Store(self.root, clock=lambda: self.now)
+        self.assertEqual(self.store.cfg["trial_items"], ["UNIQUE_GVGTOKEN_GENERIC"])
+        self.market('1002', 10, asks=[100], item='UNIQUE_GVGTOKEN_GENERIC')
+        self.market('3008', 20, bids=[130], item='UNIQUE_GVGTOKEN_GENERIC')
+        state = self.store.state()
+        self.assertEqual(state['items']['UNIQUE_GVGTOKEN_GENERIC'], '착취한 에너지 · 테스트·보류')
+        self.assertEqual(state['trial_items'], ['UNIQUE_GVGTOKEN_GENERIC'])
+        self.assertIn('UNIQUE_GVGTOKEN_GENERIC', {c['item'] for c in state['candidates']})
+        self.assertEqual(state['now'], [])
+        self.assertNotIn('UNIQUE_GVGTOKEN_GENERIC', {r['item'] for r in state['portfolio']['rows']})
+        # The same trade on a regular item is picked.
+        self.market('1002', 30, asks=[100])
+        self.market('3008', 40, bids=[130])
+        self.assertEqual({p['item'] for p in self.store.state()['now']}, {'T7_RELIC'})
 
     def test_now_stays_within_the_trade_budget(self):
         self.store.save_config({'trade_budget': 2500})

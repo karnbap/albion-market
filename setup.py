@@ -51,7 +51,7 @@ def main():
         if match and match[2] in cfg["items"]:
             mapping[match[1]] = match[2]
     if set(mapping.values()) != set(cfg["items"]):
-        raise ValueError("Could not map all four target items; config not changed")
+        raise ValueError("Could not map every target item; config not changed")
     cfg["item_numeric_ids"] = mapping
     cfg["item_mapping_checked"] = datetime.now(timezone.utc).isoformat()
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")

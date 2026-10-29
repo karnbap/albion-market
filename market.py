@@ -46,7 +46,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261028.4"
+BUILD = "20261029.1"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -265,6 +265,8 @@ class Store:
         self.cfg = json.loads((self.root / "config.json").read_text(encoding="utf-8-sig"))
         for key, value in SETTING_DEFAULTS.items():
             self.cfg.setdefault(key, value)
+        # Trial items (테스트·보류): collected and shown, but kept out of the picks and the plan.
+        self.cfg["trial_items"] = [i for i in self.cfg.get("trial_items", []) if i in self.cfg["items"]]
         ZoneInfo(self.cfg["timezone"])
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lock = threading.RLock()
@@ -685,7 +687,7 @@ class Store:
         measured = {(s["item"], s["city"]): s["instant_buy_share"] for s in self.market_studies(cache)}
         keep = 1 - cfg["sales_tax"] - cfg["setup_fee"]
         out = {}
-        for item in cfg["items"]:
+        for item in self.plan_items():
             days = {}
             for city in self.trade_cities():
                 p = cache.setdefault(("patterns", item, city), self.patterns(item, city))
@@ -792,7 +794,7 @@ class Store:
         costs = {s["item"]: s["all"]["cost_average"] for s in purchases["summary"]}
         share = lambda silver: silver / total if total else None
         rows = []
-        for item in cfg["items"]:
+        for item in self.plan_items():
             x, held = inputs[item], capital["items"].get(item)
             units_held = held["held"] if held else 0
             weekday = weekend = mine = None
@@ -1788,6 +1790,9 @@ class Store:
             out.extend(sorted(rows, key=lambda r: (r["mode"] == "depth", -r["roi"])))
         return out
 
+    def plan_items(self):
+        return [i for i in self.cfg["items"] if i not in self.cfg["trial_items"]]
+
     def trade_cities(self):
         """Cities trading analysis may buy in or sell to; the rest stay visible as prices only."""
         return [c for c in CITIES if c not in self.cfg["excluded_cities"]]
@@ -2174,6 +2179,7 @@ class Store:
                           "buy_high": best["top_price"], "sell_high": best["relist"], "sell_low": best["relist"], "certainty": certainty,
                           "score": best["profit"] * weight, "sell_per_day": self.volume_guide(cache, b["item"], b["city"])["per_day"],
                           "floor_after": best["floor"], "warnings": [r for r in b["reasons"] if r != FEES_UNCONFIRMED]})
+        plans = [p for p in plans if p["item"] not in self.cfg["trial_items"]]
         heavy_days = self.cfg["inventory_heavy_days"]
         for plan in plans:
             # Stock already worth more than heavy_days of sales: picks that add stock buy only the
@@ -2334,7 +2340,8 @@ class Store:
             last = self.db.execute("SELECT received,topic FROM packets ORDER BY id DESC LIMIT 1").fetchone()
             count = self.db.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
             return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "server": "Europe (게임도 유럽 서버인지 확인)",
-                "timezone": self.cfg["timezone"], "items": self.cfg["items"], "cities": CITIES,
+                "timezone": self.cfg["timezone"], "items": {i: name + (" · 테스트·보류" if i in self.cfg["trial_items"] else "") for i, name in self.cfg["items"].items()},
+                "trial_items": self.cfg["trial_items"], "cities": CITIES,
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "past_candidates": past_candidates, "past_buyouts": past_buyouts, "city_board": board,
