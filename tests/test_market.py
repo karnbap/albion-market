@@ -375,8 +375,9 @@ class MarketTests(unittest.TestCase):
             self.save_history(end=self.now - timedelta(hours=h), amount=2)
         guide = self.store.volume_guide({}, 'T7_RELIC', '1002')
         self.assertEqual(guide['windows'][0]['per_day'], 48)
-        self.assertEqual((guide['per_day'], guide['caution_above'], guide['danger_above']), (48, 48, 144))
-        self.assertEqual([volume_risk(n, guide) for n in (48, 49, 145)], ['ok', 'caution', 'danger'])
+        # My part of a day is cycle_share (20%) of the slowest pace: 9.6 units.
+        self.assertEqual((guide['per_day'], guide['caution_above'], guide['danger_above']), (48, 9, 28))
+        self.assertEqual([volume_risk(n, guide) for n in (9, 10, 29)], ['ok', 'caution', 'danger'])
         self.assertEqual(volume_risk(1, self.store.volume_guide({}, 'T8_RUNE', '1002')), 'unknown')
 
     def test_last_candidates_and_buyouts_stay_readable_after_the_window(self):
@@ -408,7 +409,9 @@ class MarketTests(unittest.TestCase):
         row = state['buyouts'][0]
         best = row['best']
         self.assertEqual((row['item'], row['city'], row['floor_now']), ('T7_RELIC', '1002', 100))
-        self.assertEqual((best['units'], best['cost'], best['floor'], best['relist'], best['risk']), (60, 7020, 160, 159, 'ok'))
+        # 100 sold a day, my part 20 a day: 60 units is three days of it.
+        self.assertEqual((best['units'], best['cost'], best['floor'], best['relist'], best['risk']), (60, 7020, 160, 159, 'caution'))
+        self.assertIn('내 몫(하루 판매량의 20%) 20개보다 많이 삼 · 다 팔려면 약 3.0일', row['reasons'])
         self.assertAlmostEqual(best['profit'], round(60 * 159 * (1 - .08 - .025) - 7020, 2))
         self.assertAlmostEqual(best['lift'], .6)
         self.assertEqual([s['units'] for s in row['steps']], [20, 40, 60])
@@ -417,6 +420,7 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(next(c for c in state['city_board'] if c['city'] == '1002')['buyout']['best']['units'], 60)
 
     def test_buyout_never_exceeds_three_days_of_slowest_sales(self):
+        self.store.cfg['cycle_share'] = 1  # the whole market as my part keeps this fixture small
         self.market('1002', 10, asks=[100, 130, 131, 200])
         self.six_hour_history(3, 3, 2, 2)
         best = self.store.state()['buyouts'][0]['best']
@@ -501,7 +505,10 @@ class MarketTests(unittest.TestCase):
         self.market('3008', 20, asks=[200])
         self.six_hour_history(3, 3, 2, 2, city='3008')
         picks = self.store.state()['now']
-        self.assertEqual([(p['kind'], p['units']) for p in picks], [('instant_list', 10)])
+        # 10 sold a day, my part (20%) is 2.
+        self.assertEqual([(p['kind'], p['units']) for p in picks], [('instant_list', 2)])
+        self.store.cfg['cycle_share'] = 1
+        self.assertEqual([(p['kind'], p['units']) for p in self.store.state()['now']], [('instant_list', 10)])
 
     def test_now_never_sends_two_picks_to_the_same_buyers(self):
         self.market('1002', 10, asks=[100])
@@ -593,6 +600,7 @@ class MarketTests(unittest.TestCase):
         self.assertIsNone(self.store.demand_outlook({}, 'T7_RELIC', '1002'))
 
     def test_waiting_trades_are_capped_by_coming_demand_and_split_from_instant(self):
+        self.store.cfg['cycle_share'] = 1  # the whole market as my part keeps this fixture small
         self.hourly_profile(lambda t: 1)
         self.market('1002', 10, asks=[100, 101])
         self.market('3008', 20, asks=[200], bids=[130])
@@ -629,6 +637,7 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(len(c['daily']), 2)
 
     def test_heavy_stock_cuts_picks_that_add_stock_but_not_instant_round_trips(self):
+        self.store.cfg['cycle_share'] = 1  # the whole market as my part keeps this fixture small
         self.hourly_profile(lambda t: 1)  # 24 a day in Martlock
         self.market('1002', 10, asks=[100, 101])
         self.market('3008', 20, asks=[200], bids=[130])
@@ -703,6 +712,7 @@ class MarketTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.store.add_my_order(bad)
 
     def test_own_open_sell_orders_cut_waiting_quantity_and_warn_on_undercutting_myself(self):
+        self.store.cfg['cycle_share'] = 1  # the whole market as my part keeps this fixture small
         self.hourly_profile(lambda t: 1)
         self.market('1002', 10, asks=[100, 101])
         self.market('3008', 20, asks=[200], bids=[130])

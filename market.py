@@ -46,7 +46,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261029.2"
+BUILD = "20261030.1"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -1764,7 +1764,8 @@ class Store:
 
     def volume_guide(self, cache, item, city):
         """Units this market sold per day over the last 24 h, 7 d and 28 d. The slowest pace
-        is the basis: buying more than one day of it to resell here is a caution, more than
+        is the basis and my part of it is the cycle_share setting, since other sellers take
+        the rest: buying more than one day of my part to resell here is a caution, more than
         three days a risk, because unsold stock waits while other sellers undercut."""
         key = ("guide", item, city)
         if key not in cache:
@@ -1776,9 +1777,10 @@ class Store:
                 windows.append({"days": days, "amount": h["amount"], "covered_hours": h["covered_hours"], "coverage": h["coverage"],
                                 "per_day": h["amount"] / h["covered_hours"] * 24 if enough else None})
             per_day = min((w["per_day"] for w in windows if w["per_day"] is not None), default=None)
-            cache[key] = {"windows": windows, "per_day": per_day,
-                          "caution_above": math.floor(per_day) if per_day is not None else None,
-                          "danger_above": math.floor(per_day * 3) if per_day is not None else None}
+            mine = per_day * self.cfg["cycle_share"] if per_day is not None else None
+            cache[key] = {"windows": windows, "per_day": per_day, "share": self.cfg["cycle_share"], "my_per_day": mine,
+                          "caution_above": math.floor(mine) if mine is not None else None,
+                          "danger_above": math.floor(mine * 3) if mine is not None else None}
         return cache[key]
 
     def candidates(self, books, cache=None):
@@ -2035,7 +2037,7 @@ class Store:
                 h = self.summary(cache, item, city, 7)
                 reasons = []
                 if best["risk"] == "caution":
-                    reasons.append(f"하루 판매량 {guide['per_day']:,.0f}개보다 많이 삼 · 다 팔려면 약 {best['units'] / guide['per_day']:.1f}일")
+                    reasons.append(f"내 몫(하루 판매량의 {guide['share']:.0%}) {guide['my_per_day']:,.0f}개보다 많이 삼 · 다 팔려면 약 {best['units'] / guide['my_per_day']:.1f}일")
                 if best["risk"] == "unknown":
                     reasons.append("24시간·7일·28일 판매 이력 부족 · 다 팔린다는 근거 없음")
                 if h["highest_bucket_average"] is not None and best["relist"] > h["highest_bucket_average"]:
@@ -2132,9 +2134,9 @@ class Store:
                 buy_high, sell_low = ask, price
         elif mode == "best":
             buy_guide = self.volume_guide(cache, item, source)
-            # A buy order competes with every other bid for the source's sellers; count on a quarter day.
-            units = min(self.waiting_cap(cache, item, source, buy_guide["caution_above"], "buy") // 4,
-                        self.waiting_cap(cache, item, dest, sell_guide["caution_above"]) // 4,
+            # Both caps are already my part of each market's day (cycle_share).
+            units = min(self.waiting_cap(cache, item, source, buy_guide["caution_above"], "buy"),
+                        self.waiting_cap(cache, item, dest, sell_guide["caution_above"]),
                         int(budget // (c["buy_price"] * (1 + cfg["setup_fee"]))))
             cost = c["buy_price"] * (1 + cfg["setup_fee"]) * units
             revenue = cost + c["net_per_unit"] * units + transport * units
@@ -2158,7 +2160,7 @@ class Store:
                 "sell_per_day": sell_guide["per_day"], "warnings": warnings}
 
     def waiting_cap(self, cache, item, city, caution, side="sell"):
-        """Units a waiting trade may hold in this market: one day at the slowest recent pace,
+        """Units a waiting trade may hold in this market: one day of my part of the slowest recent pace,
         and no more than the hourly profile expects to sell over the next 24 hours, minus what
         the player's own open orders on that side already wait for."""
         outlook = self.demand_outlook(cache, item, city)
