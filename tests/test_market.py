@@ -842,6 +842,14 @@ class MarketTests(unittest.TestCase):
         self.capture(here(1, 100, 5), here(2, 120, 3))
         self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
 
+    def test_lymhurst_city_zone_market_is_lymhurst(self):
+        # 1000 is the Lymhurst city zone; the fork can report it for a Lymhurst market window.
+        here = lambda *args: dict(self.order(*args), LocationId='1000')
+        self.capture(here(1, 100, 5), here(2, 120, 3))
+        self.assertEqual(len(self.store.book('T7_RELIC', '1002', 'sell')['levels']), 2)
+        self.store.ingest('markethistories.ingest', dict(self.history(hours=6, end=self.now, amount=4, avg=100), LocationId='1000'))
+        self.assertEqual(self.store.db.execute("SELECT city, amount FROM history WHERE item='T7_RELIC'").fetchall()[0][:], ('1002', 4))
+
     def test_full_fork_page_never_closes_orders_it_may_not_show(self):
         self.store.ingest_my_orders({'Kind': 'sell', 'LocationId': '1002', 'Orders': [self.order(1, 500, 1)]})
         page = [dict(self.order(100 + i, 130, 1), ItemTypeId='T4_BAG') for i in range(50)]
