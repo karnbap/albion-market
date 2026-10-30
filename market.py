@@ -43,10 +43,10 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # the item's market-wide daily sales, picks that add stock buy less.
 # cycle_share / weekday_cycles: the trading plan's part of a market's daily sales and weekday turns.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3,
-                    "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}}
+                    "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261030.1"
+BUILD = "20261030.3"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -387,15 +387,16 @@ class Store:
             if not math.isfinite(turns) or not turns.is_integer() or not 1 <= turns <= 12:
                 raise ValueError("weekday_cycles must be a whole number from 1 to 12")
             cfg["weekday_cycles"] = int(turns)
-            targets = cfg["buy_targets"]
-            if not isinstance(targets, dict) or any(item not in cfg["items"] for item in targets):
-                raise ValueError("buy_targets must map tracked items to prices")
-            cfg["buy_targets"] = {}
-            for item, price in targets.items():
-                price = float(price) if not isinstance(price, bool) else math.nan
-                if not math.isfinite(price) or not price.is_integer() or not 1 <= price <= 10**9:
-                    raise ValueError("buy_targets prices must be whole numbers from 1")
-                cfg["buy_targets"][item] = int(price)
+            for key in ("buy_targets", "sell_targets"):
+                targets = cfg[key]
+                if not isinstance(targets, dict) or any(item not in cfg["items"] for item in targets):
+                    raise ValueError(f"{key} must map tracked items to prices")
+                cfg[key] = {}
+                for item, price in targets.items():
+                    price = float(price) if not isinstance(price, bool) else math.nan
+                    if not math.isfinite(price) or not price.is_integer() or not 1 <= price <= 10**9:
+                        raise ValueError(f"{key} prices must be whole numbers from 1")
+                    cfg[key][item] = int(price)
             for key in ("wall_multiple", "depth_price_band"):
                 cfg[key] = float(cfg[key])
             if cfg["large_quantity_min"] <= cfg["small_quantity_max"] or cfg["wall_quantity_min"] < cfg["large_quantity_min"]:
@@ -1235,21 +1236,9 @@ class Store:
         when its buyer is the uploader and HasBuyerFetched is false (seen on the live server,
         2026-10-27: buy-order fills waiting in the tab); entries the player sold are skipped.
         Each market's tab is as of its latest list. Units are also priced the dearest way to sell
-        them (best_listing): a sell order one silver under the lowest ask, at my own price when
-        the lowest ask is mine, in the trading city where that comes highest, less sales tax and
-        setup fee, and transport for units held in another city (carried units are with me)."""
+        them (best_listing, see listing_options) in the trading city where all my units come
+        to the most, less transport for units held in another city (carried units are with me)."""
         keep = 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"]
-        best_listing = {}
-        for item in self.cfg["items"]:
-            for c in self.trade_cities(item):
-                book = (books or {}).get(item, {}).get(c, {}).get("sell")
-                if not book or not book["levels"] or book.get("single_only"):
-                    continue
-                low = book["levels"][0]["price"]
-                own = any(o["side"] == "sell" and o["remaining"] and (o["item"], o["city"], o["price"]) == (item, c, low) for o in open_orders)
-                price = low if own else low - 1
-                if item not in best_listing or price > best_listing[item]["price"]:
-                    best_listing[item] = {"city": c, "price": price, "own": own, "seen": book["seen"], "fresh": book["fresh"], "net": price * keep}
         costs = {s["item"]: s["recent"]["cost_average"] or s["all"]["cost_average"] for s in purchases["summary"]}
         cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None, "bank_source": None, "finished": 0, "finished_seen": None, "carried": 0})
         for o in open_orders:
@@ -1295,6 +1284,22 @@ class Store:
             finished.append({"location": r["location"], "city": r["city"], "received": r["received"], "entries": len(entries),
                              "tracked": sum(1 for e in entries if e.get("ItemTypeId") in self.cfg["items"]),
                              "waiting": waiting, "identity_known": bool(r["identity"])})
+        held = defaultdict(int)
+        for (city, item), cell in cells.items():
+            held[item] += cell["listed"] + cell["bank"] + cell["finished"] + cell["carried"]
+        best_listing = {}
+        for item in self.cfg["items"]:
+            for c in self.trade_cities(item):
+                book = (books or {}).get(item, {}).get(c, {}).get("sell")
+                if not book or not book["levels"] or book.get("single_only"):
+                    continue
+                own = defaultdict(int)
+                for o in open_orders:
+                    if o["side"] == "sell" and o["remaining"] and (o["item"], o["city"]) == (item, c):
+                        own[o["price"]] += o["remaining"]
+                for option in self.listing_options(book["levels"], own, held[item], keep):
+                    if item not in best_listing or (option["value"], option["net"]) > (best_listing[item]["value"], best_listing[item]["net"]):
+                        best_listing[item] = {"city": c, "seen": book["seen"], "fresh": book["fresh"], "held": held[item], **option}
         rows = []
         for (city, item), cell in sorted(cells.items(), key=lambda kv: (list(CITIES).index(kv[0][0]) if kv[0][0] in CITIES else 99, kv[0][1])):
             total, cost = cell["listed"] + cell["bank"] + cell["finished"] + cell["carried"], costs.get(item)
@@ -1320,6 +1325,30 @@ class Store:
                          "value_now": total * net if net is not None else None,
                          "profit_now": total * (net - cost) if net is not None and cost is not None else None})
         return {"rows": rows, "finished": finished, "unmapped_banks": unmapped, "best_listing": best_listing}
+
+    def listing_options(self, levels, own, held, keep):
+        """Ways to sell `held` units with a sell order in one market: one silver under the
+        lowest ask (at my own price when the lowest ask is mine), or one silver under another
+        seller's higher ask after buying every other seller's listing below it (up to
+        trade_budget silver, however many price levels that takes). My own listings are counted in
+        `held` and simply listed again at the new price. value = what all units, bought ones
+        included, bring after sales tax and setup fee, less the silver spent buying; net =
+        value per held unit. Only prices seen in the list are targets."""
+        low = levels[0]["price"]
+        price = low if own.get(low) else low - 1
+        options = [{"price": price, "own": bool(own.get(low)), "sweep": None, "value": held * price * keep}]
+        others = [(l["price"], l["amount"] - own.get(l["price"], 0)) for l in levels if l["amount"] > own.get(l["price"], 0)]
+        units = cost = 0
+        for k, (floor, amount) in enumerate(others):
+            if not held or cost > self.cfg["trade_budget"]:
+                break
+            if floor - 1 > price:
+                options.append({"price": floor - 1, "own": False, "value": (held + units) * (floor - 1) * keep - cost,
+                                "sweep": {"units": units, "cost": cost, "levels": k, "floor_before": low, "plain_price": price}})
+            units, cost = units + amount, cost + floor * amount
+        for o in options:
+            o["net"] = o["value"] / held if held else o["price"] * keep
+        return options
 
     def ingest_holdings(self, payload):
         """Units per item the fork read from the inventory and from each bank opened this
@@ -1993,6 +2022,73 @@ class Store:
                         "profit": sum(r["profit"] for r in rows if r["profit"] is not None) if units and sell else None})
         return out
 
+    def sell_targets(self, books, open_orders, holdings, cache):
+        """Per item, what lies under the price I want to sell at (the sell_targets setting, else
+        my average cost plus minimum_margin after sales tax and setup fee): in each trading
+        city's last sell list, other sellers' units priced under it, the silver to buy them all,
+        and how many days the market's own instant buys (slowest daily pace × instant-buy share,
+        half when unmeasured) take to clear them. Few units or few days: I, or anyone, can
+        easily lift the floor there. If I bought them, all my units plus the bought ones listed
+        one silver under the target bring `value` after fees, less the silver spent."""
+        cfg, keep, out = self.cfg, 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"], []
+        held, cost_silver, costed = defaultdict(int), defaultdict(float), defaultdict(int)
+        for r in holdings["rows"]:
+            held[r["item"]] += r["total"]
+            if r["cost"] is not None:
+                cost_silver[r["item"]] += r["total"] * r["cost"]; costed[r["item"]] += r["total"]
+        measured = {(s["item"], s["city"]): s["instant_buy_share"] for s in self.market_studies(cache)}
+        for item in cfg["items"]:
+            average = cost_silver[item] / costed[item] if costed[item] else None
+            suggested = math.ceil(average * (1 + cfg["minimum_margin"]) / keep) if average else None
+            target = cfg["sell_targets"].get(item) or suggested
+            rows = []
+            for c in self.trade_cities(item):
+                book = books[item][c]["sell"]
+                row = {"city": c, "seen": book["seen"], "fresh": book["fresh"], "known": bool(book["levels"]) and not book["single_only"],
+                       "lowest": None, "units": 0, "cost": 0, "average": None, "days": None, "value": None,
+                       "covered_to": None, "partial": False, "mine": []}
+                own = defaultdict(int)
+                for o in open_orders:
+                    if o["side"] == "sell" and o["remaining"] and (o["item"], o["city"]) == (item, c):
+                        own[o["price"]] += o["remaining"]
+                row["mine"] = [{"price": p, "amount": a} for p, a in sorted(own.items())]
+                if row["known"] and target is not None:
+                    levels = [(l["price"], l["amount"]) for l in book["levels"]]
+                    if levels[-1][0] < target:
+                        # The last view may be one page (e.g. a clicked order or the first 50 rows);
+                        # use the newest list from the last day that reaches the target instead.
+                        wider = self.wide_sell_list(item, c, target)
+                        if wider:
+                            levels, row["seen"], row["fresh"] = wider["levels"], wider["seen"], False
+                    row["covered_to"] = levels[-1][0]
+                    row["partial"] = levels[-1][0] < target
+                    under = [(p, a - own.get(p, 0)) for p, a in levels if p < target and a > own.get(p, 0)]
+                    row.update(lowest=levels[0][0], units=sum(a for _, a in under), cost=sum(p * a for p, a in under))
+                    if row["units"]:
+                        row["average"] = row["cost"] / row["units"]
+                    pace = self.volume_guide(cache, item, c)["per_day"]
+                    share = measured.get((item, c))
+                    demand = pace * (PLAN_INSTANT_SHARE if share is None else share) if pace else None
+                    row["days"] = row["units"] / demand if demand else None
+                    row["value"] = (held[item] + row["units"]) * (target - 1) * keep - row["cost"]
+                rows.append(row)
+            out.append({"item": item, "target": target, "chosen": cfg["sell_targets"].get(item), "suggested": suggested,
+                        "held": held[item], "average_cost": average, "rows": rows})
+        return out
+
+    def wide_sell_list(self, item, city, target):
+        """The newest sell list of the last 24 hours whose dearest order reaches `target`,
+        as (price, amount) levels, or None."""
+        since = (self.clock() - timedelta(hours=24)).isoformat()
+        with self.lock:
+            session = self.db.execute("""SELECT s.id, s.last_seen FROM sessions s WHERE s.item=? AND s.city=? AND s.side='sell' AND s.last_seen>=?
+                AND (SELECT MAX(price) FROM orders o WHERE o.session=s.id AND o.amount>0)>=? ORDER BY s.id DESC LIMIT 1""",
+                                          (item, city, since, target)).fetchone()
+            if session is None:
+                return None
+            levels = self.db.execute("SELECT price, SUM(amount) FROM orders WHERE session=? AND amount>0 GROUP BY price ORDER BY price", (session["id"],)).fetchall()
+        return {"levels": [(p, a) for p, a in levels], "seen": session["last_seen"]}
+
     def buyouts(self, books, cache):
         """Buying the cheapest sell orders lifts the floor to the next observed price. For each
         fresh sell list: silver and units per step, and what relisting the bought units one
@@ -2318,6 +2414,11 @@ class Store:
             for card in board:
                 card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
             holdings = self.holdings(mine_rows, purchases, books)
+            sell_targets = self.sell_targets(books, mine_rows, holdings, cache)
+            for item, b in holdings["best_listing"].items():
+                # Days my part of that market needs to sell everything listed there, bought units included.
+                mine = self.volume_guide(cache, item, b["city"])["my_per_day"]
+                b["sell_days"] = (b["held"] + (b["sweep"] or {}).get("units", 0)) / mine if mine and b["held"] else None
             capital = self.capital(cache, mine_rows, holdings)
             cache["inventory"] = capital["items"]
             now_groups = self.recommendations(books, every, buyouts, cache)
@@ -2354,7 +2455,7 @@ class Store:
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "past_candidates": past_candidates, "past_buyouts": past_buyouts, "city_board": board,
-                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "buy_under": self.buy_under(books), "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
+                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "buy_under": self.buy_under(books), "sell_targets": sell_targets, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
                 "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": holdings, "capital": capital, "portfolio": self.portfolio(cache, books, capital, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},

@@ -30,7 +30,7 @@ const outlookText=o=>`파는 곳 앞으로 6시간 예상 판매 ${n(o.next6)}�
 const hourRanges=hours=>{const out=[];for(const h of hours){const last=out[out.length-1];if(last&&(last[1]+1)%24===h)last[1]=h;else out.push([h,h])}return out.map(([a,b])=>a===b?`${String(a).padStart(2,'0')}시`:`${String(a).padStart(2,'0')}~${String(b).padStart(2,'0')}시`).join(', ')};
 const settingsWarnings=()=>[!state.settings.fees_confirmed&&'수수료 설정 미확인',!state.settings.transport_confirmed&&'운송비 설정 미확인'].filter(Boolean);
 const empty=text=>`<div class="empty">${esc(text)}</div>`;
-const editing=()=>!!document.activeElement?.closest('#my-order-form,#purchase-form,#bank-form,.bank-city-form,.buy-target-form')&&document.activeElement.matches('select,input');
+const editing=()=>!!document.activeElement?.closest('#my-order-form,#purchase-form,#bank-form,.bank-city-form,.buy-target-form,.sell-target-form')&&document.activeElement.matches('select,input');
 function table(headers,rows,key){return `<div class="table-wrap" data-scroll-key="${esc(key)}" tabindex="0" aria-label="${esc(key)} 표 스크롤"><table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`}
 function rememberView(){storage.set('view',{item:selectedItem,city:selectedCity,period:$('period').value,bookFilter:$('book-filter').value,scrollY:window.scrollY})}
 function updateHtml(id,html){
@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261030.1';
+  const legacy=next.build!=='20261030.3';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -239,8 +239,8 @@ function renderHoldings(){
  const unmapped=(h.unmapped_banks||[]).length?`<div><p class="warn">어느 도시 은행인지 모르는 은행이 있습니다. 빠른 이동 도착지처럼 도시가 아닌 곳에서 은행에 들어가면 이렇게 됩니다. 도시를 한 번 골라 주면 기억합니다.</p>${h.unmapped_banks.map(b=>`<form class="bank-city-form my-order-form" data-location="${esc(b.location)}"><span>은행 구역 ${esc(b.location)} · ${Object.entries(b.items).map(([k,v])=>`${esc(state.items[k]||k)} ${n(v)}개`).join(', ')||'추적 품목 없음'} · ${ago(b.seen)} 연 은행</span><label>도시<select name="city">${Object.entries(state.cities).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label><button type="submit">이 도시로 정하기</button></form>`).join('')}<p class="help" id="bank-city-status"></p></div>`:'';
  // 품목별 한 줄 요약: 얼마에 사서 몇 개 들고 있고, 지금 팔면 얼마가 되는가.
  const byItem={};
- for(const r of h.rows){const g=byItem[r.item]??={total:0,cost_silver:0,costed:0,value_now:0,priced:0,unpriced:0,instant:0,instant_units:0,cities:new Set()};
-  g.total+=r.total; if(r.city!=='carried')g.cities.add(r.city);
+ for(const r of h.rows){const g=byItem[r.item]??={total:0,cost_silver:0,costed:0,value_now:0,priced:0,unpriced:0,instant:0,instant_units:0,cities:{}};
+  g.total+=r.total; if(r.total){const c=g.cities[r.city]??={total:0,bank:0,listed:0,finished:0};c.total+=r.total;c.bank+=r.bank;c.listed+=r.listed;c.finished+=r.finished}
   if(r.cost!=null&&r.total){g.cost_silver+=r.total*r.cost; g.costed+=r.total}
   if(r.list_net!=null&&r.total){g.value_now+=r.total*r.list_net; g.priced+=r.total} else if(r.total) g.unpriced+=r.total;
   if(r.net_now!=null&&r.total){g.instant+=r.total*r.net_now; g.instant_units+=r.total}}
@@ -253,14 +253,16 @@ function renderHoldings(){
      const avg=g.costed?g.cost_silver/g.costed:null, unit=g.priced?g.value_now/g.priced:null;
      const profit=(avg!=null&&unit!=null)?g.value_now-(g.priced*avg):null;
      const warn=g.unpriced?`<small class="warn">${n(g.unpriced)}개는 팔 곳 호가 없음</small>`:'',b=h.best_listing?.[item];
-     const where=b?`${esc(state.cities[b.city]||b.city)} <b>${n(b.price)}</b><small>${b.own?'내 주문이 최저가 · 같은 값':'최저 매도가보다 1 싸게'}</small><small>${b.fresh?'유효':'지난 자료'} · ${ago(b.seen)}</small>`:'—';
+     const s=b?.sweep,how=!b?'':s?(s.units?`앞 매물 ${n(s.units)}개(${n(s.levels)}개 가격대 · ${n(s.cost)} 실버)를 사들이고 다음 매도가보다 1 싸게 · 산 것도 같이 팔기`:'내 매도 주문을 다음 매도가보다 1 싸게 다시 올림')+` · 그냥 걸면 ${n(s.plain_price)}`:b.own?'내 주문이 최저가 · 같은 값':'최저 매도가보다 1 싸게';
+     const where=b?`${esc(state.cities[b.city]||b.city)} <b>${n(b.price)}</b><small>${how}</small>${b.sell_days!=null?`<small class="${b.sell_days>3?'warn':''}">내 몫(하루 판매량 ${n(state.settings.cycle_share*100)}%)으로 다 팔려면 약 ${n(b.sell_days,1)}일</small>`:''}<small>${b.fresh?'유효':'지난 자료'} · ${ago(b.seen)}</small>`:'—';
+     const parts=c=>[['은행',c.bank],['시장',c.listed],['완료 탭',c.finished]].filter(([,v])=>v),banks=Object.entries(g.cities).map(([city,c])=>{const p=parts(c);return `<small>${esc(place(city))} ${n(c.total)}개${p.length>1||(p.length===1&&city!=='carried')?` (${p.map(([k,v])=>`${k} ${n(v)}`).join(' · ')})`:''}</small>`}).join('');
      const instant=g.instant_units?`<small>바로 팔면 ${money(g.instant/g.instant_units)}</small>`:'';
-     return `<tr><td>${esc(state.items[item]||item)}<small>${n(g.cities.size)}개 도시</small></td>`
+     return `<tr><td>${esc(state.items[item]||item)}${banks}</td>`
        +`<td><b>${n(g.total)}개</b></td><td>${money(avg)}</td><td>${money(g.cost_silver||null)}</td>`
        +`<td>${where}</td><td>${money(unit)}${instant}${warn}</td><td>${money(g.value_now||null)}</td>`
        +`<td class="${profit==null?'':profit>=0?'positive':'warn'}">${money(profit)}</td></tr>`}),
    'holdings-by-item')
-   +`<p class="help"><b>제일 비싸게 팔 곳</b> = 거래 분석 도시 중 매도 주문을 가장 비싸게 걸 수 있는 곳입니다. 마지막으로 연 매도 목록의 최저 매도가보다 1 싸게 걸고, 최저가가 내 주문이면 같은 값으로 봅니다. <b>팔면 단가</b> = 그 값에서 판매세 ${n(state.settings.sales_tax*100,1)}%와 설치 수수료 ${n(state.settings.setup_fee*100,1)}%를 빼고, 다른 도시에 있는 물량은 개당 운송비(설정)를 뺀 값입니다. 그 값에 다 팔린다는 보장은 없습니다. 작은 글씨 '바로 팔면'은 매수 요청서에 즉시 팔 때(최고 매수가 − 판매세)입니다. 총수익은 원가를 아는 수량만 셉니다.</p>`
+   +`<p class="help"><b>제일 비싸게 팔 곳</b> = 거래 분석 도시 중 매도 주문을 가장 비싸게 걸 수 있는 곳입니다. 마지막으로 연 매도 목록의 최저 매도가보다 1 싸게 걸고, 최저가가 내 주문이면 같은 값으로 봅니다. 앞에 다른 판매자 매물이 적게 깔려 있으면 그것을 먼저 사들이고(본 매도 목록 안, 가격대 수 제한 없이 한 거래 최대 실버까지) 다음 매도가보다 1 싸게 거는 것도 계산해, 산 물량 값까지 넣어 총액이 더 크면 그 방법으로 보여 줍니다. 그만큼 팔 물량이 늘어납니다. <b>팔면 단가</b> = 그 값에서 판매세 ${n(state.settings.sales_tax*100,1)}%와 설치 수수료 ${n(state.settings.setup_fee*100,1)}%를 빼고, 다른 도시에 있는 물량은 개당 운송비(설정)를 뺀 값입니다. 그 값에 다 팔린다는 보장은 없습니다. 사들이는 경우 사는 데 쓴 실버를 빼고 내 보유 수량으로 나눈 값입니다. 작은 글씨 '바로 팔면'은 매수 요청서에 즉시 팔 때(최고 매수가 − 판매세)입니다. 총수익은 원가를 아는 수량만 셉니다.</p>`
    +`<p class="help">합계 — 매수 ${money(sum.buy||null)} → 제일 비싸게 팔면 ${money(sum.now||null)} (차액 <b class="${sum.now-sum.buy>=0?'positive':'warn'}">${money(sum.now-sum.buy)}</b>)</p>`:'';
  updateHtml('holdings',(items.length?`<h3 class="sub-head">품목별 — 사서 들고 있는 것과 지금 가치</h3>${summary}`:'')
    +(rows.length?`<h3 class="sub-head">도시별 자세히</h3>`+table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','인벤토리','합계','원가 기준 금액','바로 팔면 (최고 매수가)'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭, 은행을 열거나, 위에 은행 수량을 적어 주세요.'))+unmapped+finished);
@@ -340,6 +342,19 @@ function renderBuyUnder(){
  const line=u=>`<tr><th scope="row">${esc(state.items[u.item])}</th><td><form class="buy-target-form" data-item="${esc(u.item)}"><input type="number" name="price" min="1" step="1" inputmode="numeric" aria-label="${esc(state.items[u.item])} 목표가" value="${u.chosen??''}" placeholder="${u.suggested??''}"></form><small>${u.chosen?'직접 정함':u.suggested?'자동 제안':'팔 곳 호가 없음'}${u.chosen&&u.suggested?` · 제안 ${n(u.suggested)}`:''}</small></td>${u.rows.map(cell).join('')}<td><b>${n(u.units)}개</b>${u.units?`<small>${n(u.cost)} 실버</small>`:''}${u.profit!=null?`<small class="${u.profit>0?'positive':'warn'}">예상 ${u.profit>0?'+':''}${n(u.profit)}</small>`:''}</td><td>${u.sell_city?`${city(u.sell_city)} <b>${n(u.sell)}</b><small>7일 평균 체결 ${u.sell_average!=null?n(u.sell_average):'-'}</small>`:'-'}</td></tr>`;
  updateHtml('buy-under',rows.length?table(['품목','목표가 (바로 사기)',...cities.map(c=>state.cities[c]),'합계','팔 곳 · 지금 최저 매도'],rows.map(line),'buy-under'):empty('추적 품목이 없습니다.'));
 }
+function renderSellTargets(){
+ const rows=state.sell_targets;if(!rows){updateHtml('sell-target',empty('분석 프로그램을 다시 실행하면 나옵니다.'));return}
+ const cities=rows[0]?.rows.map(r=>r.city)||[],city=c=>esc(state.cities[c]||c);
+ $('sell-target-context').textContent=`${cities.map(c=>state.cities[c]).join(', ')} · 각 시장의 마지막 매도 목록`;
+ const ease=d=>d==null?'':d<1?'<small class="positive">하루 안에 소화 · 쉽게 올라감</small>':d<3?'<small>며칠이면 소화</small>':'<small class="warn">소화 오래 걸림 · 잘 안 올라감</small>';
+ const cell=(u,r)=>!r.known?`<td><small>${r.seen?'단일 주문만 봄':'미조회'}</small></td>`:u.target==null?'<td>—</td>':`<td><b>${n(r.units)}개</b><small>${r.units?`${n(r.cost)} 실버 · 평균 ${n(r.average)}`:'희망가 아래 매물 없음'}</small>${!r.units?'<small class="positive">최저가가 이미 희망가 이상</small>':r.days!=null?`<small>시장 소화 약 ${n(r.days,1)}일</small>${r.partial?'':ease(r.days)}`:'<small>판매량 미확인</small>'}<small>최저 ${n(r.lowest)} · ${r.fresh?'유효':'지난 자료'} · ${ago(r.seen)}</small>${r.partial?`<small class="warn">본 목록이 ${n(r.covered_to)}까지만 · 실제 물량은 더 많을 수 있음</small>`:''}${r.mine?.length?`<small>내 매물 ${r.mine.map(m=>`${n(m.price)}에 ${n(m.amount)}개`).join(' · ')}</small>`:''}</td>`;
+ const mine=u=>{const best=u.rows.filter(r=>r.value!=null&&!r.partial).sort((a,b)=>b.value-a.value)[0];if(!best||!u.held)return '<td>—</td>';
+   const profit=u.average_cost!=null?best.value-u.held*u.average_cost:null;
+   return `<td>${city(best.city)}<small>${n(best.units)}개 ${n(best.cost)} 실버 사고 ${n(u.target-1)}에 ${n(u.held+best.units)}개 걸기</small><small>받을 돈 ${n(Math.round(best.value))}</small>${profit!=null?`<small class="${profit>=0?'positive':'warn'}">원가 대비 ${profit>=0?'+':''}${n(Math.round(profit))}</small>`:''}</td>`};
+ const line=u=>`<tr><th scope="row">${esc(state.items[u.item])}<small>보유 ${n(u.held)}개${u.average_cost!=null?` · 평균 원가 ${n(Math.round(u.average_cost))}`:''}</small></th><td><form class="sell-target-form" data-item="${esc(u.item)}"><input type="number" name="price" min="1" step="1" inputmode="numeric" aria-label="${esc(state.items[u.item])} 희망 판매가" value="${u.chosen??''}" placeholder="${u.suggested??''}"></form><small>${u.chosen?'직접 정함':u.suggested?'원가 + 최소 수익률':'원가 미확인 · 직접 적기'}</small></td>${u.rows.map(r=>cell(u,r)).join('')}${mine(u)}</tr>`;
+ updateHtml('sell-target',rows.length?table(['품목','희망 판매가',...cities.map(c=>state.cities[c]),'내가 다 사면 (가장 나은 도시)'],rows.map(line),'sell-target'):empty('추적 품목이 없습니다.'));
+}
+function saveSellTargets(){const targets={};for(const f of document.querySelectorAll('.sell-target-form')){const v=f.price.value.trim();if(v!=='')targets[f.dataset.item]=Number(v)}return post('/api/settings',{sell_targets:targets})}
 function saveBuyTargets(){const targets={};for(const f of document.querySelectorAll('.buy-target-form')){const v=f.price.value.trim();if(v!=='')targets[f.dataset.item]=Number(v)}return post('/api/settings',{buy_targets:targets})}
 function renderVolumeGuide(){
  const g=guideFor(selectedItem,selectedCity),labels={1:'최근 24시간',7:'최근 7일',28:'최근 28일'};
@@ -352,7 +367,7 @@ function renderOverview(){
  updateHtml('all-items',items.map(item=>{const b=state.books[item][selectedCity];return `<article class="panel item-summary"><h3>${esc(state.items[item])}</h3><div class="extremes-pair">${extremeSummary(item,'buy')}${extremeSummary(item,'sell')}</div><div class="item-city-table"><table><thead><tr><th>도시</th><th>최고 매수</th><th>최저 매도</th></tr></thead><tbody>${Object.entries(state.cities).map(([city,name])=>{const pair=state.books[item][city];return `<tr><th scope="row">${esc(name)}</th>${['buy','sell'].map(side=>{const q=quote(pair[side]),best=state.city_extremes?.[item]?.[side]?.observations?.some(o=>o.city===city);return `<td class="quote-cell ${side} ${best?'best-'+side:''}">${n(q?.price)}<small>${n(q?.amount)}개</small><small class="quote-status">${pair[side].single_only?'미확인':q?.stale||pair[side].stale?'지난 자료':q?'유효 관측':'미조회'}</small></td>`}).join('')}</tr>`}).join('')}</tbody></table></div><h4 class="selected-city-label">${esc(state.cities[selectedCity])} 물량 상세</h4>${['buy','sell'].map(side=>{const book=b[side],d=book.fresh?book.analysis_depth:book.depth;return `<div class="item-side ${side}"><p>${quoteText(book,side)}</p><small>${d?.reference?.large?'대량 기준':'소량 제외 기준'} ${n(d?.reference?.price)} · ${n(d?.reference?.amount)}개</small><small>앞쪽 소량 ${n(d?.leading_small_levels)}호가 · ${n(d?.leading_small_amount)}개</small><div class="wall-list">${(d?.large_levels||[]).slice(0,3).map(r=>`<span class="pill ${r.wall?'wall-badge':''}">${r.wall?'벽':'대량'} ${n(r.price)} · ${n(r.amount)}개</span>`).join('')||'대량 관측 없음'}</div></div>`}).join('')}</article>`}).join(''));
 }
 function render(){
- renderNow();renderPickHistory();renderMyOrders();renderStale();renderCapital();renderHoldings();renderPurchases();renderPortfolio();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderBuyUnder();renderPersonal();renderPersonalMails();renderMailDiagnosis();renderVolumeGuide();
+ renderNow();renderPickHistory();renderMyOrders();renderStale();renderCapital();renderHoldings();renderPurchases();renderPortfolio();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderBuyUnder();renderSellTargets();renderPersonal();renderPersonalMails();renderMailDiagnosis();renderVolumeGuide();
  $('detail-context').textContent=state.cities[selectedCity]+' · '+state.items[selectedItem];
  const books=state.books[selectedItem];
  updateHtml('cities',Object.entries(state.cities).map(([id,name])=>{
@@ -427,6 +442,8 @@ $('my-orders').onclick=async e=>{const b=e.target.closest('[data-close]');if(!b)
 $('bank-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/bank',{item:f.item.value,city:f.city.value,amount:Number(f.amount.value)});f.amount.value='';$('bank-status').textContent='은행 수량을 저장했습니다.';await refresh()}catch(err){$('bank-status').textContent='저장 실패: '+err.message}};
 $('buy-under').onchange=async e=>{if(!e.target.closest('.buy-target-form'))return;const s=$('buy-under-status');try{await saveBuyTargets();s.textContent='목표가 저장됨';await refresh()}catch(err){s.textContent='저장 실패: '+err.message}};
 $('buy-under').onsubmit=e=>{if(!e.target.closest('.buy-target-form'))return;e.preventDefault();document.activeElement?.blur()};
+$('sell-target').onchange=async e=>{if(!e.target.closest('.sell-target-form'))return;const s=$('sell-target-status');try{await saveSellTargets();s.textContent='희망 판매가 저장됨';await refresh()}catch(err){s.textContent='저장 실패: '+err.message}};
+$('sell-target').onsubmit=e=>{if(!e.target.closest('.sell-target-form'))return;e.preventDefault();document.activeElement?.blur()};
 $('holdings').onsubmit=async e=>{const f=e.target.closest('.bank-city-form');if(!f)return;e.preventDefault();try{await post('/api/bank-city',{location:f.dataset.location,city:f.city.value});document.activeElement?.blur();await refresh()}catch(err){const s=$('bank-city-status');if(s)s.textContent='저장 실패: '+err.message}};
 $('purchase-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/purchases',{item:f.item.value,city:f.city.value,kind:f.kind.value,price:Number(f.price.value),amount:Number(f.amount.value),bought:f.bought.value||null});f.price.value='';f.amount.value='';f.bought.value='';$('purchase-status').textContent='매수 기록을 추가했습니다.';await refresh()}catch(err){$('purchase-status').textContent='추가 실패: '+err.message}};
 $('purchases').onclick=async e=>{const b=e.target.closest('[data-remove-purchase]');if(!b)return;try{await post('/api/purchases',{action:'remove',id:Number(b.dataset.removePurchase)});await refresh()}catch(err){$('purchase-status').textContent='삭제 실패: '+err.message}};
