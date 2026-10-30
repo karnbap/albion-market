@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261030.1';
+  const legacy=next.build!=='20261030.2';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -239,8 +239,8 @@ function renderHoldings(){
  const unmapped=(h.unmapped_banks||[]).length?`<div><p class="warn">어느 도시 은행인지 모르는 은행이 있습니다. 빠른 이동 도착지처럼 도시가 아닌 곳에서 은행에 들어가면 이렇게 됩니다. 도시를 한 번 골라 주면 기억합니다.</p>${h.unmapped_banks.map(b=>`<form class="bank-city-form my-order-form" data-location="${esc(b.location)}"><span>은행 구역 ${esc(b.location)} · ${Object.entries(b.items).map(([k,v])=>`${esc(state.items[k]||k)} ${n(v)}개`).join(', ')||'추적 품목 없음'} · ${ago(b.seen)} 연 은행</span><label>도시<select name="city">${Object.entries(state.cities).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('')}</select></label><button type="submit">이 도시로 정하기</button></form>`).join('')}<p class="help" id="bank-city-status"></p></div>`:'';
  // 품목별 한 줄 요약: 얼마에 사서 몇 개 들고 있고, 지금 팔면 얼마가 되는가.
  const byItem={};
- for(const r of h.rows){const g=byItem[r.item]??={total:0,cost_silver:0,costed:0,value_now:0,priced:0,unpriced:0,instant:0,instant_units:0,cities:new Set()};
-  g.total+=r.total; if(r.city!=='carried')g.cities.add(r.city);
+ for(const r of h.rows){const g=byItem[r.item]??={total:0,cost_silver:0,costed:0,value_now:0,priced:0,unpriced:0,instant:0,instant_units:0,cities:{}};
+  g.total+=r.total; if(r.total){const c=g.cities[r.city]??={total:0,bank:0,listed:0,finished:0};c.total+=r.total;c.bank+=r.bank;c.listed+=r.listed;c.finished+=r.finished}
   if(r.cost!=null&&r.total){g.cost_silver+=r.total*r.cost; g.costed+=r.total}
   if(r.list_net!=null&&r.total){g.value_now+=r.total*r.list_net; g.priced+=r.total} else if(r.total) g.unpriced+=r.total;
   if(r.net_now!=null&&r.total){g.instant+=r.total*r.net_now; g.instant_units+=r.total}}
@@ -253,14 +253,16 @@ function renderHoldings(){
      const avg=g.costed?g.cost_silver/g.costed:null, unit=g.priced?g.value_now/g.priced:null;
      const profit=(avg!=null&&unit!=null)?g.value_now-(g.priced*avg):null;
      const warn=g.unpriced?`<small class="warn">${n(g.unpriced)}개는 팔 곳 호가 없음</small>`:'',b=h.best_listing?.[item];
-     const where=b?`${esc(state.cities[b.city]||b.city)} <b>${n(b.price)}</b><small>${b.own?'내 주문이 최저가 · 같은 값':'최저 매도가보다 1 싸게'}</small><small>${b.fresh?'유효':'지난 자료'} · ${ago(b.seen)}</small>`:'—';
+     const s=b?.sweep,how=!b?'':s?(s.units?`앞 매물 ${n(s.units)}개(${n(s.levels)}개 가격대 · ${n(s.cost)} 실버)를 사들이고 다음 매도가보다 1 싸게 · 산 것도 같이 팔기`:'내 매도 주문을 다음 매도가보다 1 싸게 다시 올림')+` · 그냥 걸면 ${n(s.plain_price)}`:b.own?'내 주문이 최저가 · 같은 값':'최저 매도가보다 1 싸게';
+     const where=b?`${esc(state.cities[b.city]||b.city)} <b>${n(b.price)}</b><small>${how}</small>${b.sell_days!=null?`<small class="${b.sell_days>3?'warn':''}">내 몫(하루 판매량 ${n(state.settings.cycle_share*100)}%)으로 다 팔려면 약 ${n(b.sell_days,1)}일</small>`:''}<small>${b.fresh?'유효':'지난 자료'} · ${ago(b.seen)}</small>`:'—';
+     const parts=c=>[['은행',c.bank],['시장',c.listed],['완료 탭',c.finished]].filter(([,v])=>v),banks=Object.entries(g.cities).map(([city,c])=>{const p=parts(c);return `<small>${esc(place(city))} ${n(c.total)}개${p.length>1||(p.length===1&&city!=='carried')?` (${p.map(([k,v])=>`${k} ${n(v)}`).join(' · ')})`:''}</small>`}).join('');
      const instant=g.instant_units?`<small>바로 팔면 ${money(g.instant/g.instant_units)}</small>`:'';
-     return `<tr><td>${esc(state.items[item]||item)}<small>${n(g.cities.size)}개 도시</small></td>`
+     return `<tr><td>${esc(state.items[item]||item)}${banks}</td>`
        +`<td><b>${n(g.total)}개</b></td><td>${money(avg)}</td><td>${money(g.cost_silver||null)}</td>`
        +`<td>${where}</td><td>${money(unit)}${instant}${warn}</td><td>${money(g.value_now||null)}</td>`
        +`<td class="${profit==null?'':profit>=0?'positive':'warn'}">${money(profit)}</td></tr>`}),
    'holdings-by-item')
-   +`<p class="help"><b>제일 비싸게 팔 곳</b> = 거래 분석 도시 중 매도 주문을 가장 비싸게 걸 수 있는 곳입니다. 마지막으로 연 매도 목록의 최저 매도가보다 1 싸게 걸고, 최저가가 내 주문이면 같은 값으로 봅니다. <b>팔면 단가</b> = 그 값에서 판매세 ${n(state.settings.sales_tax*100,1)}%와 설치 수수료 ${n(state.settings.setup_fee*100,1)}%를 빼고, 다른 도시에 있는 물량은 개당 운송비(설정)를 뺀 값입니다. 그 값에 다 팔린다는 보장은 없습니다. 작은 글씨 '바로 팔면'은 매수 요청서에 즉시 팔 때(최고 매수가 − 판매세)입니다. 총수익은 원가를 아는 수량만 셉니다.</p>`
+   +`<p class="help"><b>제일 비싸게 팔 곳</b> = 거래 분석 도시 중 매도 주문을 가장 비싸게 걸 수 있는 곳입니다. 마지막으로 연 매도 목록의 최저 매도가보다 1 싸게 걸고, 최저가가 내 주문이면 같은 값으로 봅니다. 앞에 다른 판매자 매물이 적게 깔려 있으면 그것을 먼저 사들이고(본 매도 목록 안, 한 거래 최대 실버까지) 다음 매도가보다 1 싸게 거는 것도 계산해, 산 물량 값까지 넣어 총액이 더 크면 그 방법으로 보여 줍니다. 그만큼 팔 물량이 늘어납니다. <b>팔면 단가</b> = 그 값에서 판매세 ${n(state.settings.sales_tax*100,1)}%와 설치 수수료 ${n(state.settings.setup_fee*100,1)}%를 빼고, 다른 도시에 있는 물량은 개당 운송비(설정)를 뺀 값입니다. 그 값에 다 팔린다는 보장은 없습니다. 사들이는 경우 사는 데 쓴 실버를 빼고 내 보유 수량으로 나눈 값입니다. 작은 글씨 '바로 팔면'은 매수 요청서에 즉시 팔 때(최고 매수가 − 판매세)입니다. 총수익은 원가를 아는 수량만 셉니다.</p>`
    +`<p class="help">합계 — 매수 ${money(sum.buy||null)} → 제일 비싸게 팔면 ${money(sum.now||null)} (차액 <b class="${sum.now-sum.buy>=0?'positive':'warn'}">${money(sum.now-sum.buy)}</b>)</p>`:'';
  updateHtml('holdings',(items.length?`<h3 class="sub-head">품목별 — 사서 들고 있는 것과 지금 가치</h3>${summary}`:'')
    +(rows.length?`<h3 class="sub-head">도시별 자세히</h3>`+table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','인벤토리','합계','원가 기준 금액','바로 팔면 (최고 매수가)'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭, 은행을 열거나, 위에 은행 수량을 적어 주세요.'))+unmapped+finished);

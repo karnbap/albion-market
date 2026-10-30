@@ -82,17 +82,30 @@ class HoldingsTests(unittest.TestCase):
         self.store.set_bank({"item": "T7_RELIC", "city": "4002", "amount": 10})
         h = self.holdings()
         keep = 1 - self.store.cfg["sales_tax"] - self.store.cfg["setup_fee"]
-        # Fort Sterling's lowest ask is mine (150, kept as is); Martlock's is someone's 200, so 199
-        # there is the dearest. Brecilien (300) is not a trading city.
-        best = h["best_listing"]["T7_RELIC"]
-        self.assertEqual((best["city"], best["price"], best["own"]), ("3008", 199, False))
+        # With buying capped at 100 silver: Fort Sterling's lowest ask is mine (150), the next
+        # seller asks 170, so 169 there; Martlock's lowest is someone's 200, so 199 there is the
+        # dearest. Brecilien (300) is not a trading city.
+        self.store.save_config({"trade_budget": 100})
+        best = self.holdings()["best_listing"]["T7_RELIC"]
+        self.assertEqual((best["city"], best["price"], best["own"], best["sweep"]), ("3008", 199, False, None))
         self.assertAlmostEqual(best["net"], 199 * keep)
+        fs = self.store.listing_options([{"price": 150, "amount": 2}, {"price": 170, "amount": 3}], {150: 2}, 12, keep)
+        self.assertEqual([(o["price"], o["own"]) for o in fs], [(150, True), (169, False)])
+        self.assertEqual(fs[1]["sweep"]["units"], 0)                      # only my own listing is raised
+        # With the default budget, buying Martlock's single 200 and listing everything at 209 pays more.
+        self.store.save_config({"trade_budget": 10_000_000})
+        h = self.holdings()
+        best = h["best_listing"]["T7_RELIC"]
+        self.assertEqual((best["city"], best["price"], best["held"]), ("3008", 209, 12))
+        self.assertEqual({k: best["sweep"][k] for k in ("units", "cost", "levels", "plain_price")}, {"units": 1, "cost": 200, "levels": 1, "plain_price": 199})
+        self.assertAlmostEqual(best["net"], (13 * 209 * keep - 200) / 12)
         row = next(r for r in h["rows"] if r["city"] == "4002" and r["item"] == "T7_RELIC")
         self.assertEqual((row["total"], row["list_city"]), (12, "3008"))
-        self.assertAlmostEqual(row["list_net"], 199 * keep - 5)          # carried to Martlock
-        self.store.ingest("marketorders.ingest", {"Orders": [martlock(27, 140, 1), martlock(28, 145, 1)]})
+        self.assertAlmostEqual(row["list_net"], best["net"] - 5)          # carried to Martlock
+        # Cheap single listings below: buying all three (140, 145, 200) and listing at 209 is best.
+        self.store.ingest("marketorders.ingest", {"Orders": [martlock(27, 140, 1), martlock(28, 145, 1), martlock(23, 200, 1), martlock(24, 210, 4)]})
         best = self.holdings()["best_listing"]["T7_RELIC"]
-        self.assertEqual((best["city"], best["price"], best["own"]), ("4002", 150, True))
+        self.assertEqual((best["city"], best["price"], best["sweep"]["units"], best["sweep"]["cost"], best["sweep"]["plain_price"]), ("3008", 209, 3, 485, 139))
 
     def test_finished_tab_counts_what_i_bought_and_have_not_collected(self):
         me, them = "00000000-0000-0000-0000-00000000000a", "00000000-0000-0000-0000-00000000000b"

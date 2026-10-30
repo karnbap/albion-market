@@ -46,7 +46,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261030.1"
+BUILD = "20261030.2"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -1235,21 +1235,9 @@ class Store:
         when its buyer is the uploader and HasBuyerFetched is false (seen on the live server,
         2026-10-27: buy-order fills waiting in the tab); entries the player sold are skipped.
         Each market's tab is as of its latest list. Units are also priced the dearest way to sell
-        them (best_listing): a sell order one silver under the lowest ask, at my own price when
-        the lowest ask is mine, in the trading city where that comes highest, less sales tax and
-        setup fee, and transport for units held in another city (carried units are with me)."""
+        them (best_listing, see listing_options) in the trading city where all my units come
+        to the most, less transport for units held in another city (carried units are with me)."""
         keep = 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"]
-        best_listing = {}
-        for item in self.cfg["items"]:
-            for c in self.trade_cities(item):
-                book = (books or {}).get(item, {}).get(c, {}).get("sell")
-                if not book or not book["levels"] or book.get("single_only"):
-                    continue
-                low = book["levels"][0]["price"]
-                own = any(o["side"] == "sell" and o["remaining"] and (o["item"], o["city"], o["price"]) == (item, c, low) for o in open_orders)
-                price = low if own else low - 1
-                if item not in best_listing or price > best_listing[item]["price"]:
-                    best_listing[item] = {"city": c, "price": price, "own": own, "seen": book["seen"], "fresh": book["fresh"], "net": price * keep}
         costs = {s["item"]: s["recent"]["cost_average"] or s["all"]["cost_average"] for s in purchases["summary"]}
         cells = defaultdict(lambda: {"listed": 0, "bank": 0, "bank_updated": None, "bank_source": None, "finished": 0, "finished_seen": None, "carried": 0})
         for o in open_orders:
@@ -1295,6 +1283,22 @@ class Store:
             finished.append({"location": r["location"], "city": r["city"], "received": r["received"], "entries": len(entries),
                              "tracked": sum(1 for e in entries if e.get("ItemTypeId") in self.cfg["items"]),
                              "waiting": waiting, "identity_known": bool(r["identity"])})
+        held = defaultdict(int)
+        for (city, item), cell in cells.items():
+            held[item] += cell["listed"] + cell["bank"] + cell["finished"] + cell["carried"]
+        best_listing = {}
+        for item in self.cfg["items"]:
+            for c in self.trade_cities(item):
+                book = (books or {}).get(item, {}).get(c, {}).get("sell")
+                if not book or not book["levels"] or book.get("single_only"):
+                    continue
+                own = defaultdict(int)
+                for o in open_orders:
+                    if o["side"] == "sell" and o["remaining"] and (o["item"], o["city"]) == (item, c):
+                        own[o["price"]] += o["remaining"]
+                for option in self.listing_options(book["levels"], own, held[item], keep):
+                    if item not in best_listing or (option["value"], option["net"]) > (best_listing[item]["value"], best_listing[item]["net"]):
+                        best_listing[item] = {"city": c, "seen": book["seen"], "fresh": book["fresh"], "held": held[item], **option}
         rows = []
         for (city, item), cell in sorted(cells.items(), key=lambda kv: (list(CITIES).index(kv[0][0]) if kv[0][0] in CITIES else 99, kv[0][1])):
             total, cost = cell["listed"] + cell["bank"] + cell["finished"] + cell["carried"], costs.get(item)
@@ -1320,6 +1324,30 @@ class Store:
                          "value_now": total * net if net is not None else None,
                          "profit_now": total * (net - cost) if net is not None and cost is not None else None})
         return {"rows": rows, "finished": finished, "unmapped_banks": unmapped, "best_listing": best_listing}
+
+    def listing_options(self, levels, own, held, keep):
+        """Ways to sell `held` units with a sell order in one market: one silver under the
+        lowest ask (at my own price when the lowest ask is mine), or one silver under another
+        seller's higher ask after buying every other seller's listing below it (up to
+        BUYOUT_LEVELS price levels and trade_budget silver). My own listings are counted in
+        `held` and simply listed again at the new price. value = what all units, bought ones
+        included, bring after sales tax and setup fee, less the silver spent buying; net =
+        value per held unit. Only prices seen in the list are targets."""
+        low = levels[0]["price"]
+        price = low if own.get(low) else low - 1
+        options = [{"price": price, "own": bool(own.get(low)), "sweep": None, "value": held * price * keep}]
+        others = [(l["price"], l["amount"] - own.get(l["price"], 0)) for l in levels if l["amount"] > own.get(l["price"], 0)]
+        units = cost = 0
+        for k, (floor, amount) in enumerate(others[:BUYOUT_LEVELS + 1]):
+            if not held or cost > self.cfg["trade_budget"]:
+                break
+            if floor - 1 > price:
+                options.append({"price": floor - 1, "own": False, "value": (held + units) * (floor - 1) * keep - cost,
+                                "sweep": {"units": units, "cost": cost, "levels": k, "floor_before": low, "plain_price": price}})
+            units, cost = units + amount, cost + floor * amount
+        for o in options:
+            o["net"] = o["value"] / held if held else o["price"] * keep
+        return options
 
     def ingest_holdings(self, payload):
         """Units per item the fork read from the inventory and from each bank opened this
@@ -2318,6 +2346,10 @@ class Store:
             for card in board:
                 card["buyout"] = next((b for b in buyouts if b["city"] == card["city"]), None)
             holdings = self.holdings(mine_rows, purchases, books)
+            for item, b in holdings["best_listing"].items():
+                # Days my part of that market needs to sell everything listed there, bought units included.
+                mine = self.volume_guide(cache, item, b["city"])["my_per_day"]
+                b["sell_days"] = (b["held"] + (b["sweep"] or {}).get("units", 0)) / mine if mine and b["held"] else None
             capital = self.capital(cache, mine_rows, holdings)
             cache["inventory"] = capital["items"]
             now_groups = self.recommendations(books, every, buyouts, cache)
