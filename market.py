@@ -31,7 +31,10 @@ CITIES = {"1002": "Lymhurst", "2004": "Bridgewatch", "3005": "Caerleon", "3008":
 # Portal markets are merged by the source project; keep these explicit and sourced.
 # 1000-HellDen: its market listed the same order IDs as Lymhurst's, public buy orders and the
 # player's own (live server, 2026-10-27), so it is Lymhurst's order book.
-PORTALS = {"1301": "1002", "2301": "2004", "3301": "3008", "4301": "4002", "301": "7", "1000-HellDen": "1002"}
+# 1000 is the Lymhurst city zone (ao-bin-dumps world.txt; 1002 is "Lymhurst Market"). On the
+# live server (2026-10-30) the fork sent location 1000 for a market window titled Lymhurst,
+# whose siphoned energy orders matched that window, so it is Lymhurst's order book too.
+PORTALS = {"1301": "1002", "2301": "2004", "3301": "3008", "4301": "4002", "301": "7", "1000-HellDen": "1002", "1000": "1002"}
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quantity_min": 500,
                   "wall_multiple": 3.0, "depth_price_band": 0.20}
@@ -46,7 +49,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261030.3"
+BUILD = "20261030.4"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
