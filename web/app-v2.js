@@ -16,8 +16,8 @@ const date=v=>{if(!v)return '미조회';const zone=state?.timezone||'Europe/Pari
 const ago=v=>{const minutes=Math.max(0,Math.round((Date.now()-Date.parse(v))/60000));return minutes<1?'방금':minutes<60?`${minutes}분 전`:date(v)};
 const riskText={ok:'무난',caution:'조금 위험',danger:'위험',unknown:'판매량 미확인'};
 const guideFor=(item,city)=>state.volume_guides?.[item+'/'+city];
-const guideLine=g=>!g||g.per_day==null?'판매량 이력 부족 · 몇 개까지 괜찮은지 모름':g.per_day<1?'최근 하루 1개도 안 팔림 · 되팔 목적이면 위험':`하루 ${n(g.per_day)}개 팔림 · ${n(g.caution_above)}개 넘게 사면 조금 위험 · ${n(g.danger_above)}개 넘으면 위험`;
-const shortGuide=g=>!g||g.per_day==null?'파는 곳 판매량 미확인':`파는 곳 하루 ${n(g.per_day)}개 팔림 · ${n(g.caution_above)}개까지 무난`;
+const guideLine=g=>!g||g.per_day==null?'판매량 이력 부족 · 몇 개까지 괜찮은지 모름':g.per_day<1?'최근 하루 1개도 안 팔림 · 되팔 목적이면 위험':`하루 ${n(g.per_day)}개 팔림 · 내 몫 ${n(g.share*100)}% 기준 ${n(g.caution_above)}개 넘게 사면 조금 위험 · ${n(g.danger_above)}개 넘으면 위험`;
+const shortGuide=g=>!g||g.per_day==null?'파는 곳 판매량 미확인':`파는 곳 하루 ${n(g.per_day)}개 팔림 · 내 몫 ${n(g.share*100)}% ${n(g.caution_above)}개까지 무난`;
 const WEEK=['월','화','수','목','금','토','일'];
 const pct=v=>(v>0?'+':'')+n(v*100,0)+'%';
 const timingText=t=>{if(!t)return '';const wd=WEEK[t.weekday],parts=[];
@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261029.2';
+  const legacy=next.build!=='20261030.1';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -343,7 +343,7 @@ function renderBuyUnder(){
 function saveBuyTargets(){const targets={};for(const f of document.querySelectorAll('.buy-target-form')){const v=f.price.value.trim();if(v!=='')targets[f.dataset.item]=Number(v)}return post('/api/settings',{buy_targets:targets})}
 function renderVolumeGuide(){
  const g=guideFor(selectedItem,selectedCity),labels={1:'최근 24시간',7:'최근 7일',28:'최근 28일'};
- updateHtml('volume-guide',g?`<div class="volume-guide"><h3>사서 되팔 때 수량 경고 · ${esc(state.cities[selectedCity])} ${esc(state.items[selectedItem])}</h3><div class="guide-windows">${g.windows.map(w=>`<div><small>${labels[w.days]} 판매량</small><b>${w.amount==null?'—':n(w.amount)+'개'}</b><span>${w.per_day==null?'하루 평균 계산 불가':'하루 '+n(w.per_day)+'개'} · 관측 ${n(w.covered_hours)}시간</span></div>`).join('')}</div><p class="${g.per_day==null||g.per_day<1?'warn':'guide-line'}">${esc(guideLine(g))}</p>${state.outlook?`<p class="${state.outlook.low_window?'warn':'guide-line'}">앞으로 6시간 예상 판매 ${n(state.outlook.next6)}개(평소 ${n(state.outlook.usual6)}개) · 24시간 ${n(state.outlook.next24)}개 · ${state.outlook.weekend?'주말':'평일'} 시간대 기준${state.outlook.low_window?' · 지금부터 수요가 적은 시간대라 주문을 한꺼번에 쌓지 마세요':''}</p>${state.outlook.quiet_hours.length?`<p class="help">앞으로 24시간 중 수요가 평소 절반 아래인 시간: ${esc(hourRanges(state.outlook.quiet_hours))}</p>`:''}`:'<p class="help">시간대별 판매 기록(24시간 시장 이력)이 부족해 앞으로의 예상 판매량을 계산하지 못했습니다.</p>'}<p class="help">세 기간 중 가장 느린 하루 판매량이 기준입니다. 하루치보다 많이 사면 다 팔 때까지 하루 넘게 걸려 그사이 다른 판매자가 더 싸게 올릴 수 있고, 3일치를 넘기면 재고가 오래 묶일 위험이 큽니다. 관측 시간이 짧은 기간(24시간은 6시간 미만, 7일·28일은 24시간 미만)은 계산에서 뺍니다.</p></div>`:'');
+ updateHtml('volume-guide',g?`<div class="volume-guide"><h3>사서 되팔 때 수량 경고 · ${esc(state.cities[selectedCity])} ${esc(state.items[selectedItem])}</h3><div class="guide-windows">${g.windows.map(w=>`<div><small>${labels[w.days]} 판매량</small><b>${w.amount==null?'—':n(w.amount)+'개'}</b><span>${w.per_day==null?'하루 평균 계산 불가':'하루 '+n(w.per_day)+'개'} · 관측 ${n(w.covered_hours)}시간</span></div>`).join('')}</div><p class="${g.per_day==null||g.per_day<1?'warn':'guide-line'}">${esc(guideLine(g))}</p>${state.outlook?`<p class="${state.outlook.low_window?'warn':'guide-line'}">앞으로 6시간 예상 판매 ${n(state.outlook.next6)}개(평소 ${n(state.outlook.usual6)}개) · 24시간 ${n(state.outlook.next24)}개 · ${state.outlook.weekend?'주말':'평일'} 시간대 기준${state.outlook.low_window?' · 지금부터 수요가 적은 시간대라 주문을 한꺼번에 쌓지 마세요':''}</p>${state.outlook.quiet_hours.length?`<p class="help">앞으로 24시간 중 수요가 평소 절반 아래인 시간: ${esc(hourRanges(state.outlook.quiet_hours))}</p>`:''}`:'<p class="help">시간대별 판매 기록(24시간 시장 이력)이 부족해 앞으로의 예상 판매량을 계산하지 못했습니다.</p>'}<p class="help">세 기간 중 가장 느린 하루 판매량에서 내 몫(설정의 '내 몫', 기본 20%)만 내가 팔 수 있다고 봅니다. 나머지는 다른 판매자 몫입니다. 내 몫 하루치보다 많이 사면 다 팔 때까지 하루 넘게 걸려 그사이 다른 판매자가 더 싸게 올릴 수 있고, 3일치를 넘기면 재고가 오래 묶일 위험이 큽니다. 관측 시간이 짧은 기간(24시간은 6시간 미만, 7일·28일은 24시간 미만)은 계산에서 뺍니다.</p></div>`:'');
 }
 function renderOverview(){
  const items=Object.keys(state.items);
