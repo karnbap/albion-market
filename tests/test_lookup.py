@@ -25,9 +25,12 @@ class LookupTests(unittest.TestCase):
         (self.root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
         self.now = datetime(2026, 11, 1, 12, tzinfo=UTC)
         self.store = Store(self.root, clock=lambda: self.now)
-        lookup.catalog.items = [{"id": "T6_2H_CLAYMORE", "ko": "장인의 대검", "en": "Master's Claymore"},
-                                {"id": "T6_2H_CLAYMORE@1", "ko": "장인의 대검", "en": "Master's Claymore"},
-                                {"id": "T4_BAG", "ko": "숙련자의 가방", "en": "Adept's Bag"}]
+        lookup.catalog.items = [{"id": "T6_2H_CLAYMORE", "ko": "마스터의 클레이모어", "en": "Master's Claymore"},
+                                {"id": "T6_2H_CLAYMORE@1", "ko": "마스터의 클레이모어", "en": "Master's Claymore"},
+                                {"id": "T4_2H_CLAYMORE", "ko": "숙련자의 클레이모어", "en": "Adept's Claymore"},
+                                {"id": "T3_BAG", "ko": "장인의 가방", "en": "Journeyman's Bag"},
+                                {"id": "T4_BAG", "ko": "숙련자의 가방", "en": "Adept's Bag"},
+                                {"id": "UNIQUE_HIDEOUT", "ko": "은신처 건설 키트", "en": "Hideout Construction Kit"}]
 
     def tearDown(self):
         self.store.db.close()
@@ -54,6 +57,10 @@ class LookupTests(unittest.TestCase):
         sell, buy = book["1002"]["sell"], book["1002"]["buy"]
         self.assertEqual((sell["price"], sell["amount"], sell["units"], sell["mine"]), (190_000, 1, 2, True))
         self.assertEqual((buy["price"], buy["amount"], buy["units"]), (160_000, 1, 5))
+        # Any quality: the quality-2 order at 100 is now the cheapest and says which quality it is.
+        with self.db() as db:
+            anyq = lookup.markets(db, "T6_2H_CLAYMORE@1", lookup.ANY_QUALITY, lambda loc: location(loc) if location(loc) != "3005" else None, self.now)
+        self.assertEqual((anyq["1002"]["sell"]["price"], anyq["1002"]["sell"]["quality"], anyq["1002"]["sell"]["units"]), (100, 2, 3))
 
     def test_old_and_expired_orders_are_purged(self):
         with self.db() as db:
@@ -83,16 +90,18 @@ class LookupTests(unittest.TestCase):
         with self.db() as db:
             lookup.add_orders(db, [self.order(1, 200_000, 2)], "stream", (self.now - timedelta(minutes=5)).isoformat())
         day = (self.now - timedelta(days=1)).replace(tzinfo=None, hour=0).isoformat()
-        lookup.public.cache[("T6_2H_CLAYMORE@1", 1)] = {"fetched": time.time(), "error": "", "prices": [
-            {"city": "Lymhurst", "sell_price_min": 210_000, "sell_price_min_date": "2026-11-01T06:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"},
-            {"city": "Martlock", "sell_price_min": 205_000, "sell_price_min_date": "2026-11-01T11:00:00", "buy_price_max": 150_000, "buy_price_max_date": "2026-11-01T11:30:00"},
-            {"city": "Caerleon", "sell_price_min": 1, "sell_price_min_date": "2026-11-01T11:00:00"}],
+        lookup.public.cache["T6_2H_CLAYMORE@1"] = {"fetched": time.time(), "error": "", "prices": [
+            {"city": "Lymhurst", "quality": 1, "sell_price_min": 210_000, "sell_price_min_date": "2026-11-01T06:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"},
+            {"city": "Martlock", "quality": 1, "sell_price_min": 205_000, "sell_price_min_date": "2026-11-01T11:00:00", "buy_price_max": 150_000, "buy_price_max_date": "2026-11-01T11:30:00"},
+            {"city": "Martlock", "quality": 3, "sell_price_min": 199_000, "sell_price_min_date": "2026-11-01T10:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"},
+            {"city": "Thetford", "quality": 3, "sell_price_min": 230_000, "sell_price_min_date": "2026-11-01T09:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"},
+            {"city": "Caerleon", "quality": 1, "sell_price_min": 1, "sell_price_min_date": "2026-11-01T11:00:00"}],
             "history": [{"location": "Martlock", "quality": 3, "data": [{"item_count": 6, "avg_price": 200_000, "timestamp": day},
                                                           {"item_count": 1, "avg_price": 100, "timestamp": "2026-10-01T00:00:00"}]}]}
         view = self.store.lookup_item("T6_2H_CLAYMORE@1", 1)
         rows = {r["city"]: r for r in view["cities"]}
         self.assertNotIn("3005", rows)
-        self.assertEqual(view["name"], "장인의 대검")
+        self.assertEqual(view["name"], "마스터의 클레이모어")
         self.assertFalse(view["public_loading"])
         self.assertEqual(rows["1002"]["local"]["sell"]["price"], 200_000)
         self.assertEqual(rows["1002"]["public"]["sell_seen"], "2026-11-01T06:00:00+00:00")
@@ -100,6 +109,15 @@ class LookupTests(unittest.TestCase):
         self.assertEqual(rows["3008"]["public"]["buy"], 150_000)
         # No quality-1 history in Martlock, so every quality stands in and says so.
         self.assertEqual((rows["3008"]["history"]["average"], rows["3008"]["history"]["last_count"], rows["3008"]["history"]["all_qualities"]), (200_000, 6, True))
+        # Quality 1 alone: Thetford only has quality 3, so nothing there; Martlock keeps its quality-1 price.
+        self.assertIsNone(rows["7"]["public"])
+        self.assertEqual(rows["3008"]["public"]["sell"], 205_000)
+        # Any quality: the cheapest of every quality, with the quality named; the history is not flagged.
+        rows = {r["city"]: r for r in self.store.lookup_item("T6_2H_CLAYMORE@1", lookup.ANY_QUALITY)["cities"]}
+        self.assertEqual((rows["3008"]["public"]["sell"], rows["3008"]["public"]["sell_quality"]), (199_000, 3))
+        self.assertEqual((rows["3008"]["public"]["buy"], rows["3008"]["public"]["buy_quality"]), (150_000, 1))
+        self.assertEqual(rows["7"]["public"]["sell"], 230_000)
+        self.assertFalse(rows["3008"]["history"]["all_qualities"])
 
     def test_item_view_rejects_ids_outside_the_item_id_shape(self):
         for bad in ("", "T6_2H_CLAYMORE@9", "../x", "t4_bag"):
@@ -108,10 +126,16 @@ class LookupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.lookup_item("T4_BAG", 7)
 
-    def test_search_finds_korean_and_english_names_and_lists_enchant_levels(self):
-        hits = self.store.lookup_search("대검")["items"]
-        self.assertEqual([(h["id"], h["enchants"]) for h in hits], [("T6_2H_CLAYMORE", [0, 1])])
-        self.assertEqual(self.store.lookup_search("adept bag")["items"][0]["id"], "T4_BAG")
+    def test_search_returns_item_families_with_tiers_as_a_filter(self):
+        hits = self.store.lookup_search("클레이모어")["items"]
+        self.assertEqual([(h["family"], h["ko"], h["tiers"], h["tier"]) for h in hits],
+                         [("2H_CLAYMORE", "클레이모어", [{"tier": 4, "enchants": [0]}, {"tier": 6, "enchants": [0, 1]}], None)])
+        # A tier word in the query opens the family on that tier.
+        self.assertEqual(self.store.lookup_search("마스터의 클레이모어")["items"][0]["tier"], 6)
+        bag = self.store.lookup_search("adept bag")["items"][0]
+        self.assertEqual((bag["family"], bag["en"], bag["tier"]), ("BAG", "Bag", 4))
+        kit = self.store.lookup_search("은신처")["items"][0]
+        self.assertEqual((kit["family"], kit["tiers"]), ("UNIQUE_HIDEOUT", [{"tier": None, "enchants": [0]}]))
 
     def test_stream_parser_answers_ping_and_keeps_partial_messages(self):
         sent = []
@@ -133,7 +157,7 @@ class LookupRobustnessTests(LookupTests):
     # Runs only its own tests; the inherited fixture is all it needs.
     test_book_merges_a_city_zone_and_keeps_cheapest_sell_and_dearest_buy = test_old_and_expired_orders_are_purged = None
     test_markets_i_open_feed_the_lookup_but_my_order_lists_do_not = test_item_view_joins_local_orders_with_the_cached_public_answer = None
-    test_item_view_rejects_ids_outside_the_item_id_shape = test_search_finds_korean_and_english_names_and_lists_enchant_levels = None
+    test_item_view_rejects_ids_outside_the_item_id_shape = test_search_returns_item_families_with_tiers_as_a_filter = None
     test_stream_parser_answers_ping_and_keeps_partial_messages = None
 
     def test_a_failing_lookup_write_does_not_lose_the_tracked_market(self):
