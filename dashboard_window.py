@@ -12,7 +12,7 @@ import sys
 import time
 
 # web/index.html <title>; Edge app windows are titled by the page alone.
-TITLE = '알비온 · 나의 시장 기록'
+TITLE = 'Albion Trade Master'
 SW_MINIMIZE, SW_RESTORE = 6, 9
 
 

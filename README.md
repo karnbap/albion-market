@@ -1,4 +1,4 @@
-# Albion Market · 알비온 시장 기록
+# Albion Trade Master · 알비온 시장 기록
 
 알비온 **Europe** 서버에서 직접 조회한 품목(T7 유물, T8 영혼, T8 유물, T8 룬, 테스트 중인 착취한 에너지)의 호가·잔량과 시장 이력을 로컬에 저장하는 Windows 도구입니다. 시간대는 Europe/Paris입니다.
 
