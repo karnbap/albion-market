@@ -127,3 +127,11 @@ details.more-help{margin:-12px 0 16px}details.more-help summary{font-size:13px;c
 .section-head .inline-filter+.inline-filter{margin-left:0}
 .market-pick{margin:4px 0 0}.market-pick+.help{margin-top:8px}
 .number-hint{color:var(--green);margin-top:4px;min-height:1.2em}
+/* Any-item lookup. */
+.lookup-form{display:grid;grid-template-columns:minmax(0,1fr) 120px 150px;gap:12px;align-items:end;margin:8px 0 12px}
+.lookup-hits{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.lookup-hits button{white-space:normal;text-align:left}.lookup-hits button small{display:block;font-size:11px;font-weight:400}
+.lookup-label{font-size:13px;color:var(--muted);align-self:center;margin-right:4px}
+.lk-price{display:block;font-size:17px}.lk-price.sell{color:#f5d598}.lk-price.buy{color:#a2e2c5}
+.lk-src.public{color:#94a5a9}.lk-src.me{color:#dbc6fb}.lk-cheapest td:first-child{box-shadow:inset 3px 0 var(--gold)}
+[data-scroll-key="lookup"] td:first-child small{display:block}
+@media(max-width:760px){.lookup-form{grid-template-columns:1fr 1fr}.lookup-form label:first-child{grid-column:1/-1}}

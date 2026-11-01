@@ -16,6 +16,8 @@ from http.server import ThreadingHTTPServer
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import lookup
+
 ASSETS = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css',
           '/app-v2.js': 'app-v2.js', '/v2.css': 'v2.css'}
 
@@ -191,6 +193,8 @@ def run(source_root, data_root, port=None):
     handler = RotatingFileHandler(data_root/'data/server.log', maxBytes=5_000_000, backupCount=3, encoding='utf-8')
     logging.basicConfig(handlers=[handler], level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     runtime = Runtime(source_root, data_root)
+    # The any-item lookup listens to the public order stream; one listener outlives code revisions.
+    lookup.start_stream(data_root, runtime.store.cfg.get('server', 'europe'))
     server = ThreadingHTTPServer(('127.0.0.1', port or runtime.store.cfg['port']), runtime.handle)
     server.daemon_threads = True
     threading.Thread(target=runtime.watch, daemon=True).start()

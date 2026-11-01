@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +25,8 @@ from pathlib import Path
 from statistics import median
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
+
+import lookup
 
 ROOT = Path(__file__).resolve().parent
 UTC = timezone.utc
@@ -49,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261101.2"
+BUILD = "20261101.3"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -454,6 +457,9 @@ class Store:
                 if mine:
                     self.sync_my_orders(normalized, received)
                     topic = "marketorders.mine"
+                else:
+                    with closing(lookup.connect(self.root)) as ldb:
+                        lookup.add_orders(ldb, payload.get("Orders"), "me", received)
                 sessions, groups = {}, {}
                 for row in ([] if mine else normalized):
                     r, city, price, amount, expiry = row
@@ -2464,6 +2470,63 @@ class Store:
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
                 "limits": ["개별 최고 체결가·가격별 체결량은 제공되지 않음", "호가는 마지막 조회 묶음의 일부 주문이며 미조회·소멸 주문을 체결로 간주하지 않음", "이력 timestamp는 구간 끝으로 해석 · 구간 경계 밖은 비례 배분하지 않음", "모바일·아이패드는 Windows 자동 수집 대상이 아님", "수집 클라이언트 수신 데이터에는 서버 식별자가 없어 유럽 서버 접속을 직접 확인해야 함"]}
 
+    def lookup_cities(self):
+        return {c: n for c, n in CITIES.items() if c not in self.cfg["excluded_cities"]}
+
+    def lookup_search(self, query):
+        lookup.catalog.ensure(self.root)
+        c = lookup.catalog
+        return {"items": c.search(query[:60]), "loading": c.loading, "error": c.error, "ready": c.items is not None}
+
+    def lookup_item(self, item, quality):
+        """Any item, every trade city: the newest orders we heard (stream or this PC) beside the public API."""
+        if not re.fullmatch(r"[A-Z0-9_]{2,80}(@[1-4])?", item or "") or quality not in lookup.QUALITIES:
+            raise ValueError("Unknown item")
+        cities = self.lookup_cities()
+
+        def city_of(loc):
+            city = location(loc)
+            return city if city in cities else None
+
+        with closing(lookup.connect(self.root)) as ldb:
+            local, stream = lookup.markets(ldb, item, quality, city_of, self.clock()), lookup.get_meta(ldb)
+        public, loading = lookup.public.get(item, quality, list(cities.values()))
+        by_name = {n: c for c, n in cities.items()}
+
+        def utc(value):
+            return None if not value or value.startswith("0001") else value + "+00:00"
+        rows = {c: {"city": c, "local": local.get(c, {}), "public": None, "history": None} for c in cities}
+        for r in (public or {}).get("prices", []):
+            c = by_name.get(r.get("city"))
+            if c:
+                rows[c]["public"] = {"sell": r.get("sell_price_min") or None, "sell_seen": utc(r.get("sell_price_min_date")),
+                                     "buy": r.get("buy_price_max") or None, "buy_seen": utc(r.get("buy_price_max_date"))}
+        week = (self.clock() - timedelta(days=7)).replace(tzinfo=None).isoformat()
+        # Daily trade history: the chosen quality when it has any, otherwise every quality together.
+        history = defaultdict(lambda: defaultdict(list))
+        for r in (public or {}).get("history", []):
+            c = by_name.get(r.get("location"))
+            if c:
+                history[c][r.get("quality")].extend(d for d in r.get("data", []) if d.get("timestamp", "") >= week)
+        for c, by_quality in history.items():
+            days = by_quality.get(quality) or [d for ds in by_quality.values() for d in ds]
+            if not days:
+                continue
+            merged = defaultdict(lambda: [0, 0])
+            for d in days:
+                merged[d["timestamp"]][0] += d["item_count"]
+                merged[d["timestamp"]][1] += d["avg_price"] * d["item_count"]
+            count, silver = sum(v[0] for v in merged.values()), sum(v[1] for v in merged.values())
+            last = max(merged)
+            rows[c]["history"] = {"average": silver / count if count else None, "per_day": count / 7,
+                                  "last": merged[last][1] / merged[last][0] if merged[last][0] else None,
+                                  "last_count": merged[last][0], "last_day": utc(last), "all_qualities": not by_quality.get(quality)}
+        lookup.catalog.ensure(self.root)
+        return {"item": item, "quality": quality, "name": lookup.catalog.name(item), "cities": list(rows.values()),
+                "public_loading": loading, "public_error": (public or {}).get("error", ""),
+                "public_fetched": datetime.fromtimestamp(public["fetched"], UTC).isoformat() if public else None,
+                "stream": stream}
+
     def export_csv(self):
         with self.lock:
             output = io.StringIO(newline="")
@@ -2567,6 +2630,14 @@ def handler_class(store, token):
                 return self.respond(result)
             if parts.path == "/api/health":
                 return self.respond({"app": "AlbionLocal", "ready": True, "auto_update": getattr(store, "auto_update", {"enabled": False}), "capture_verified": bool(store.db.execute("SELECT 1 FROM packets WHERE topic='marketorders.ingest' LIMIT 1").fetchone())})
+            if parts.path == "/api/lookup/search":
+                return self.respond(store.lookup_search(parse_qs(parts.query).get("q", [""])[0]))
+            if parts.path == "/api/lookup/item":
+                params = parse_qs(parts.query)
+                try:
+                    return self.respond(store.lookup_item(params.get("id", [""])[0], int(params.get("quality", ["1"])[0])))
+                except ValueError as exc:
+                    return self.respond({"error": str(exc)}, 400)
             if parts.path == "/api/export.csv":
                 return self.respond(store.export_csv(), content_type="text/csv; charset=utf-8")
             if parts.path in ("/", "/app.js", "/app-v2.js", "/style.css", "/v2.css"):
