@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261101.5"
+BUILD = "20261102.1"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -2484,8 +2484,9 @@ class Store:
         return {"items": c.search(query[:60]), "loading": c.loading, "error": c.error, "ready": c.items is not None}
 
     def lookup_item(self, item, quality):
-        """Any item, every trade city: the newest orders we heard (stream or this PC) beside the public API."""
-        if not re.fullmatch(r"[A-Z0-9_]{2,80}(@[1-4])?", item or "") or quality not in lookup.QUALITIES:
+        """Any item, every trade city: the newest orders we heard (stream or this PC) beside the public API.
+        quality 0 means any quality: the cheapest sell and dearest buy of all, each with its quality."""
+        if not re.fullmatch(r"[A-Z0-9_]{2,80}(@[1-4])?", item or "") or quality not in (lookup.ANY_QUALITY, *lookup.QUALITIES):
             raise ValueError("Unknown item")
         cities = self.lookup_cities()
 
@@ -2495,7 +2496,7 @@ class Store:
 
         with closing(lookup.connect(self.root)) as ldb:
             local, stream = lookup.markets(ldb, item, quality, city_of, self.clock()), lookup.get_meta(ldb)
-        public, loading = lookup.public.get(item, quality, list(cities.values()))
+        public, loading = lookup.public.get(item, list(cities.values()))
         by_name = {n: c for c, n in cities.items()}
 
         def utc(value):
@@ -2503,9 +2504,14 @@ class Store:
         rows = {c: {"city": c, "local": local.get(c, {}), "public": None, "history": None} for c in cities}
         for r in (public or {}).get("prices", []):
             c = by_name.get(r.get("city"))
-            if c:
-                rows[c]["public"] = {"sell": r.get("sell_price_min") or None, "sell_seen": utc(r.get("sell_price_min_date")),
-                                     "buy": r.get("buy_price_max") or None, "buy_seen": utc(r.get("buy_price_max_date"))}
+            if not c or (quality and r.get("quality") != quality):
+                continue
+            p = rows[c]["public"] = rows[c]["public"] or {"sell": None, "sell_seen": None, "sell_quality": None, "buy": None, "buy_seen": None, "buy_quality": None}
+            sell, buy = r.get("sell_price_min") or None, r.get("buy_price_max") or None
+            if sell and (p["sell"] is None or sell < p["sell"]):
+                p.update(sell=sell, sell_seen=utc(r.get("sell_price_min_date")), sell_quality=r.get("quality"))
+            if buy and (p["buy"] is None or buy > p["buy"]):
+                p.update(buy=buy, buy_seen=utc(r.get("buy_price_max_date")), buy_quality=r.get("quality"))
         week = (self.clock() - timedelta(days=7)).replace(tzinfo=None).isoformat()
         # Daily trade history: the chosen quality when it has any, otherwise every quality together.
         history = defaultdict(lambda: defaultdict(list))
@@ -2525,7 +2531,7 @@ class Store:
             last = max(merged)
             rows[c]["history"] = {"average": silver / count if count else None, "per_day": count / 7,
                                   "last": merged[last][1] / merged[last][0] if merged[last][0] else None,
-                                  "last_count": merged[last][0], "last_day": utc(last), "all_qualities": not by_quality.get(quality)}
+                                  "last_count": merged[last][0], "last_day": utc(last), "all_qualities": bool(quality) and not by_quality.get(quality)}
         lookup.catalog.ensure(self.root)
         return {"item": item, "quality": quality, "name": lookup.catalog.name(item), "cities": list(rows.values()),
                 "public_loading": loading, "public_error": (public or {}).get("error", ""),

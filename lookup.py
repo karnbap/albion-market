@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import re
 import socket
 import sqlite3
 import threading
@@ -31,6 +32,9 @@ KEEP = timedelta(hours=24)
 MAX_ROWS = 1_000_000
 PUBLIC_TTL = 300
 QUALITIES = (1, 2, 3, 4, 5)
+ANY_QUALITY = 0
+# The tier word in front of each item name (ao-bin-dumps KO-KR and EN-US), so a family reads as one item.
+TIER_WORDS = re.compile(r"^(입문자의|초심자의|장인의|숙련자의|전문가의|그랜드 마스터의|마스터의|장로의|Beginner's|Novice's|Journeyman's|Adept's|Expert's|Master's|Grandmaster's|Elder's)\s+")
 
 
 def utcnow():
@@ -85,17 +89,20 @@ def purge(db, now=None):
 
 
 def markets(db, item, quality, city_of, now=None):
-    """Per city: cheapest sell and dearest buy with their amounts, total units, newest sighting."""
+    """Per city: cheapest sell and dearest buy with their amounts, total units, newest sighting.
+    quality 0 (ANY_QUALITY) takes every quality and says which one the best price is."""
     now = now or utcnow()
     out = {}
-    rows = db.execute("SELECT location, side, price, amount, seen, source FROM orders WHERE item=? AND quality=? AND seen>=? AND amount>0",
-                      (item, quality, (now - KEEP).isoformat())).fetchall()
-    for loc, side, price, amount, seen, source in rows:
+    where, args = ("AND quality=?", (quality,)) if quality else ("", ())
+    rows = db.execute(f"SELECT location, side, price, amount, seen, source, quality FROM orders WHERE item=? {where} AND seen>=? AND amount>0",
+                      (item, *args, (now - KEEP).isoformat())).fetchall()
+    for loc, side, price, amount, seen, source, q in rows:
         city = city_of(loc)
         if city is None:
             continue
-        m = out.setdefault(city, {}).setdefault(side, {"levels": {}, "seen": "", "units": 0, "mine": False})
+        m = out.setdefault(city, {}).setdefault(side, {"levels": {}, "qualities": {}, "seen": "", "units": 0, "mine": False})
         m["levels"][price] = m["levels"].get(price, 0) + amount
+        m["qualities"].setdefault(price, set()).add(q)
         m["units"] += amount
         m["seen"] = max(m["seen"], seen)
         m["mine"] = m["mine"] or source == "me"
@@ -103,9 +110,9 @@ def markets(db, item, quality, city_of, now=None):
         for side, m in sides.items():
             prices = sorted(m.pop("levels").items(), reverse=side == "buy")
             m["price"], m["amount"] = prices[0]
+            m["quality"] = min(m.pop("qualities")[m["price"]])
             m["levels"] = [{"price": p, "amount": a} for p, a in prices[:5]]
     return out
-
 
 def set_meta(db, **values):
     with db:
@@ -253,27 +260,45 @@ class Catalog:
         finally:
             self.loading = False
 
+    @staticmethod
+    def family_of(item):
+        """T6_2H_CLAYMORE@1 -> ("2H_CLAYMORE", 6, 1); items without a tier keep their whole id."""
+        base, _, enchant = item.partition("@")
+        tier, _, rest = base.partition("_")
+        if tier[:1] == "T" and tier[1:].isdigit() and rest:
+            return rest, int(tier[1:]), int(enchant or 0)
+        return base, None, int(enchant or 0)
+
     def search(self, query, limit=30):
+        """Item families (one entry for every tier), each with the tiers and enchant levels that exist.
+        tier is the lowest tier whose own name matched, so "마스터의 클레이모어" opens on T6."""
         words = [w for w in query.lower().split() if w]
         if not words or self.items is None:
             return []
-        found, order = {}, []
+        families, matched, order = {}, {}, []
         for x in self.items:
-            base, _, enchant = x["id"].partition("@")
-            hay = f"{x['ko']} {x['en']} {x['id']}".lower()
-            if all(w in hay for w in words):
-                if base not in found:
-                    found[base] = {"id": base, "ko": x["ko"], "en": x["en"], "enchants": [0]}
-                    order.append(base)
-                if enchant.isdigit():
-                    found[base]["enchants"].append(int(enchant))
-        # Exact id or name hits first; then each item family together, tiers in order (T4, T5, ...).
-        def key(b):
-            tier, _, family = b.partition("_")
-            return (query.lower() not in (b.lower(), found[b]["ko"].lower()), family if tier[1:].isdigit() else b,
-                    int(tier[1:]) if tier[:1] == "T" and tier[1:].isdigit() else 0)
-        order.sort(key=key)
-        return [found[b] for b in order[:limit]]
+            family, tier, enchant = self.family_of(x["id"])
+            f = families.get(family)
+            if f is None:
+                f = families[family] = {"family": family, "ko": TIER_WORDS.sub("", x["ko"]), "en": TIER_WORDS.sub("", x["en"]), "tiers": {}}
+            f["tiers"].setdefault(tier, set()).add(enchant)
+            if all(w in f"{x['ko']} {x['en']} {x['id']}".lower() for w in words):
+                if family not in matched:
+                    matched[family] = set()
+                    order.append(family)
+                matched[family].add(tier)
+        exact = query.lower().strip()
+        order.sort(key=lambda fam: (exact not in (fam.lower(), families[fam]["ko"].lower()), families[fam]["ko"] or fam))
+        out = []
+        for fam in order[:limit]:
+            f = families[fam]
+            tiers = sorted((t for t in f["tiers"] if t is not None))
+            hits = sorted(t for t in matched[fam] if t is not None)
+            out.append({"family": fam, "ko": f["ko"], "en": f["en"],
+                        "tiers": [{"tier": t, "enchants": sorted(f["tiers"][t])} for t in tiers] or
+                                 [{"tier": None, "enchants": sorted(f["tiers"][None])}],
+                        "tier": (hits[0] if len(hits) < len(tiers) else None) if hits else None})
+        return out
 
     def name(self, item):
         base = item.partition("@")[0]
@@ -287,35 +312,32 @@ catalog = Catalog()
 
 
 class PublicPrices:
-    """Public price API answers, fetched in the background and kept five minutes per item and quality."""
+    """Public price API answers for every quality, fetched in the background and kept five minutes per item."""
 
     def __init__(self):
         self.cache, self.running, self.lock = {}, set(), threading.Lock()
 
-    def get(self, item, quality, city_names):
-        key = (item, quality)
+    def get(self, item, city_names):
+        """Every quality comes back at once; the caller picks one or the best of all."""
         with self.lock:
-            hit = self.cache.get(key)
+            hit = self.cache.get(item)
             fresh = hit and time.time() - hit["fetched"] < PUBLIC_TTL
-            if not fresh and key not in self.running:
-                self.running.add(key)
-                threading.Thread(target=self.fetch, args=(key, city_names), daemon=True).start()
-        return hit, key in self.running
+            if not fresh and item not in self.running:
+                self.running.add(item)
+                threading.Thread(target=self.fetch, args=(item, city_names), daemon=True).start()
+        return hit, item in self.running
 
-    def fetch(self, key, city_names):
-        item, quality = key
+    def fetch(self, item, city_names):
         where = urllib.parse.quote(",".join(city_names))
         result = {"fetched": time.time(), "prices": [], "history": [], "error": ""}
         try:
-            result["prices"] = fetch_json(f"{API}/prices/{item}.json?qualities={quality}&locations={where}")
-            # History for one quality is often missing for gear, so every quality comes back and the caller picks.
+            result["prices"] = fetch_json(f"{API}/prices/{item}.json?locations={where}")
             result["history"] = fetch_json(f"{API}/history/{item}.json?time-scale=24&locations={where}")
         except Exception as exc:
             result["error"] = str(exc)[:160]
         with self.lock:
-            self.cache[key] = result
-            self.running.discard(key)
-
+            self.cache[item] = result
+            self.running.discard(item)
 
 public = PublicPrices()
 
