@@ -127,3 +127,49 @@ class LookupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LookupRobustnessTests(LookupTests):
+    # Runs only its own tests; the inherited fixture is all it needs.
+    test_book_merges_a_city_zone_and_keeps_cheapest_sell_and_dearest_buy = test_old_and_expired_orders_are_purged = None
+    test_markets_i_open_feed_the_lookup_but_my_order_lists_do_not = test_item_view_joins_local_orders_with_the_cached_public_answer = None
+    test_item_view_rejects_ids_outside_the_item_id_shape = test_search_finds_korean_and_english_names_and_lists_enchant_levels = None
+    test_stream_parser_answers_ping_and_keeps_partial_messages = None
+
+    def test_a_failing_lookup_write_does_not_lose_the_tracked_market(self):
+        original = lookup.add_orders
+
+        def broken(*args, **kwargs):
+            raise lookup.sqlite3.OperationalError("database is locked")
+        lookup.add_orders = broken
+        try:
+            with self.assertLogs(level="ERROR"):
+                relic = {**self.order(1, 9000, 3, item="T7_RELIC"), "EnchantmentLevel": 0}
+                self.store.ingest("marketorders.ingest", {"Orders": [relic]})
+        finally:
+            lookup.add_orders = original
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 1)
+
+    def test_stream_retry_wait_resets_after_a_long_healthy_connection(self):
+        stream = lookup.Stream(self.root)
+        clock, waits = iter([0, 1, 2, 3, 100, 400]), []
+
+        def listen(db):
+            raise ConnectionError("dropped")
+        stream.listen = listen
+
+        def wait(seconds):
+            waits.append(seconds)
+            if len(waits) == 3:
+                stream.stopped.set()
+            return stream.stopped.is_set()
+        stream.stopped.wait = wait
+        real = lookup.time.monotonic
+        lookup.time.monotonic = lambda: next(clock)
+        try:
+            with self.assertLogs(level="WARNING"):
+                stream.run()
+        finally:
+            lookup.time.monotonic = real
+        # Quick failure: 5; next quick failure: 10; then a 300-second healthy run resets to 5.
+        self.assertEqual(waits, [5, 10, 5])

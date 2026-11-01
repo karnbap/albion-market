@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261101.3"
+BUILD = "20261101.4"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -458,8 +458,13 @@ class Store:
                     self.sync_my_orders(normalized, received)
                     topic = "marketorders.mine"
                 else:
-                    with closing(lookup.connect(self.root)) as ldb:
-                        lookup.add_orders(ldb, payload.get("Orders"), "me", received)
+                    try:
+                        # A short wait: this runs inside the receiver lock, so a busy lookup file must not stall uploads.
+                        with closing(lookup.connect(self.root, timeout=2)) as ldb:
+                            lookup.add_orders(ldb, payload.get("Orders"), "me", received)
+                    except Exception:
+                        # Any lookup problem (even an older lookup.py still loaded before a restart) stays out of tracked data.
+                        logging.exception("Saving opened market for the item lookup failed; tracked data kept")
                 sessions, groups = {}, {}
                 for row in ([] if mine else normalized):
                     r, city, price, amount, expiry = row
