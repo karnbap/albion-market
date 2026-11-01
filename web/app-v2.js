@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261101.2';
+  const legacy=next.build!=='20261101.3';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -460,6 +460,47 @@ $('settings').onsubmit=e=>{e.preventDefault();clearTimeout(saveTimer);saveSettin
 window.addEventListener('scroll',()=>{if(!restorePending){clearTimeout(scrollTimer);scrollTimer=setTimeout(rememberView,120)}},{passive:true});
 window.addEventListener('pagehide',()=>{if(ready){rememberView();if(draft)storage.set('settingsDraft',readDraft())}});
 $('reset').onclick=async()=>{const target=`${state.items[selectedItem]} · ${state.cities[selectedCity]}`;if(!window.confirm(`${target} 시장의 지금 호가를 비울까요? 게임에서 그 시장을 다시 열기 전까지 호가와 매매 후보가 빈칸이 됩니다.`))return;try{await post('/api/reset',{item:selectedItem,city:selectedCity});$('reset-status').textContent=`${target} 호가를 비웠습니다 · 게임에서 그 시장의 매수·매도 목록을 다시 열어 주세요.`;await refresh()}catch(e){$('reset-status').textContent='호가 비우기 실패: '+e.message}};
+// Any-item lookup: search names, pick enchant and quality, then poll that item's city prices while the tab is open.
+const lookupView={item:null,name:'',timer:null,searchTimer:null,data:null};
+const lookupId=()=>lookupView.item&&lookupView.item+(Number($('lookup-enchant').value)?'@'+$('lookup-enchant').value:'');
+const lookupAge=v=>v?ago(v):'—';
+function renderLookupRecent(){const recent=storage.get('lookupRecent',[]);updateHtml('lookup-recent',recent.length?`<span class="lookup-label">최근 본 품목</span>${recent.map(r=>`<button type="button" class="secondary small-button" data-lookup="${esc(r.id)}" data-name="${esc(r.name)}">${esc(r.name)}</button>`).join('')}`:'')}
+async function lookupSearch(){
+ const q=$('lookup-q').value.trim();if(q.length<2){updateHtml('lookup-hits','');return}
+ try{const r=await (await fetch('/api/lookup/search?q='+encodeURIComponent(q))).json();
+  updateHtml('lookup-hits',r.items.length?r.items.map(x=>`<button type="button" class="secondary small-button" data-lookup="${esc(x.id)}" data-name="${esc(x.ko||x.en)}" data-enchants="${esc(x.enchants.join(','))}">${esc(x.ko||x.en)}<small>${esc(x.id)}</small></button>`).join(''):`<p class="help">${r.loading?'아이템 이름 목록을 처음 받는 중입니다(약 24MB, 한 번만). 잠시 뒤 다시 입력해 주세요.':r.error?'이름 목록을 받지 못했습니다: '+esc(r.error):'맞는 품목이 없습니다.'}</p>`);
+  if(r.loading)setTimeout(lookupSearch,3000)}catch(e){updateHtml('lookup-hits',`<p class="warn">검색 실패: ${esc(e.message)}</p>`)}}
+function chooseLookup(id,name,enchants){
+ lookupView.item=id;lookupView.name=name;lookupView.data=null;
+ if(enchants){const have=enchants.split(',').map(Number);for(const o of $('lookup-enchant').options)o.disabled=!have.includes(Number(o.value));if($('lookup-enchant').selectedOptions[0].disabled)$('lookup-enchant').value='0'}
+ storage.set('lookupRecent',[{id,name},...storage.get('lookupRecent',[]).filter(r=>r.id!==id)].slice(0,8));
+ storage.set('lookupLast',{id,name,enchant:$('lookup-enchant').value,quality:$('lookup-quality').value});
+ renderLookupRecent();updateHtml('lookup-hits','');loadLookup()}
+async function loadLookup(){
+ clearTimeout(lookupView.timer);const id=lookupId();if(!id)return;
+ try{const r=await fetch(`/api/lookup/item?id=${encodeURIComponent(id)}&quality=${$('lookup-quality').value}`),data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(id!==lookupId())return;lookupView.data=data;renderLookup()}
+ catch(e){updateHtml('lookup-view',`<p class="warn">시세를 못 불러왔습니다: ${esc(e.message)}</p>`)}
+ // Poll faster while the public answer is still on its way.
+ if(!document.querySelector('.tab-panel[data-tab=lookup]').hidden)lookupView.timer=setTimeout(loadLookup,lookupView.data?.public_loading?2500:15000)}
+function renderLookup(){
+ const d=lookupView.data;if(!d)return;
+ const s=d.stream||{};$('lookup-status').textContent=s.stream_connected?`실시간 공유 받는 중 · 마지막 ${lookupAge(s.stream_last)} · 누적 ${n(s.stream_count)}건`:s.stream_error?`실시간 공유 연결 안 됨 · ${s.stream_error}`:'실시간 공유 꺼짐 · 분석 프로그램을 다시 시작하면 켜집니다';
+ const src={me:'내가 연 시장',stream:'실시간 공유'};
+ // The newer of what we heard and what the public server says wins; both stay visible.
+ const pick=(local,pub,pubSeen,side)=>{const l=local?.[side];if(l&&(!pubSeen||Date.parse(l.seen)>=Date.parse(pubSeen)))return {price:l.price,amount:l.amount,units:l.units,seen:l.seen,source:l.mine?'me':'stream'};return pub?{price:pub,seen:pubSeen,source:'public'}:null};
+ const cell=(q,side)=>q?`<b class="lk-price ${side}">${n(q.price)}</b>${q.amount!=null?`<small>${n(q.amount)}개${q.units>q.amount?` · 전체 ${n(q.units)}개`:''}</small>`:''}<small class="lk-src ${q.source}" title="${esc(date(q.seen))}">${q.source==='public'?'공개 서버':src[q.source]} · ${lookupAge(q.seen)}</small>`:'<small>자료 없음</small>';
+ const rows=d.cities.map(c=>{const sell=pick(c.local,c.public?.sell,c.public?.sell_seen,'sell'),buy=pick(c.local,c.public?.buy,c.public?.buy_seen,'buy'),h=c.history;return {c,sell,buy,h}});
+ const cheapest=Math.min(...rows.map(r=>r.sell?.price??Infinity)),dearest=Math.max(...rows.map(r=>r.buy?.price??-Infinity));
+ const label=`${d.name}${lookupId().includes('@')?' .'+lookupId().split('@')[1]:''} · 품질 ${d.quality}`;
+ updateHtml('lookup-view',`<h3 class="sub-head">${esc(label)} <small>${esc(d.item)}</small></h3>`+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell?.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell?.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy?.price===dearest&&dearest>-Infinity?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
+  +`<p class="help">${d.public_loading?'공개 서버에 묻는 중… ':d.public_error?'공개 서버 조회 실패: '+esc(d.public_error)+' · ':d.public_fetched?`공개 서버 값은 ${lookupAge(d.public_fetched)}에 받음 · `:''}실시간 공유·내가 연 시장 값은 최근 24시간 안에 들은 주문입니다. 그사이 팔렸거나 새 매물이 올라왔을 수 있으니 사고팔기 전에는 게임에서 한 번 확인하세요. 7일 평균·판매량은 공개 서버의 하루 단위 거래 이력입니다.</p>`)}
+$('lookup-form').onsubmit=e=>{e.preventDefault();lookupSearch()};
+$('lookup-q').oninput=()=>{clearTimeout(lookupView.searchTimer);lookupView.searchTimer=setTimeout(lookupSearch,250)};
+for(const id of ['lookup-enchant','lookup-quality'])$(id).onchange=()=>{const last=storage.get('lookupLast',null);if(last)storage.set('lookupLast',{...last,enchant:$('lookup-enchant').value,quality:$('lookup-quality').value});loadLookup()};
+$('lookup-section').addEventListener('click',e=>{const b=e.target.closest('[data-lookup]');if(b)chooseLookup(b.dataset.lookup,b.dataset.name,b.dataset.enchants)});
+{const last=storage.get('lookupLast',null);if(last){lookupView.item=last.id;lookupView.name=last.name;$('lookup-enchant').value=last.enchant||'0';$('lookup-quality').value=last.quality||'1'}renderLookupRecent()}
+document.querySelector('.tabs').addEventListener('click',e=>{if(e.target.closest('[data-tab=lookup]'))loadLookup()});
+if(storage.get('tab','now')==='lookup')loadLookup();
 // A hidden tab does not poll; the server rebuilds every market on each request.
 refresh();setInterval(()=>{if(document.hidden)return;refresh();if(draft&&!saving)scheduleSave()},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});
