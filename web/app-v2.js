@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261030.4';
+  const legacy=next.build!=='20261101.1';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -94,7 +94,6 @@ async function refresh(){
 function quote(book){return (book.fresh_levels?.length?book.fresh_levels:book.levels)[0]}
 function quoteText(book,side){const r=quote(book);return `<span class="quote-label ${side}">${book.single_only?(side==='buy'?'매수 관측 · 최고가 미확인':'매도 관측 · 최저가 미확인'):(side==='buy'?'최고 매수':'최저 매도')}</span><span class="quote-value"><b>${n(r?.price)}</b><span class="quote-quantity">${n(r?.amount)}개</span></span><small class="quote-time">${r?.stale||book.stale?'지난 관측 · ':''}${date(r?.seen||book.seen)}</small>`}
 function extremeMark(item,city,side){const e=state.city_extremes?.[item]?.[side];return e?.observations?.some(r=>r.city===city)?`<span class="extreme-badge ${side}">${side==='buy'?'도시 중 최고 매수':'도시 중 최저 매도'}${e.fresh?'':' · 지난 자료'}</span>`:''}
-function extremeSummary(item,side){const e=state.city_extremes?.[item]?.[side];if(!e?.observations?.length)return `<div class="extreme-summary"><small>${side==='buy'?'도시 중 최고 매수':'도시 중 최저 매도'}</small><b>비교 자료 없음</b></div>`;return `<div class="extreme-summary ${side}"><small>${side==='buy'?'도시 중 최고 매수':'도시 중 최저 매도'} · ${e.fresh?'유효 관측':'지난 자료 비교'}</small><b>${n(e.price)}</b><span>${e.observations.map(r=>`${esc(state.cities[r.city])} · ${n(r.amount)}개`).join('<br>')}</span><small>${n(e.compared_cities)}도시 비교 · ${e.observations.map(r=>date(r.seen)).join(' / ')}</small></div>`}
 function personalMark(item,city){const sale=state.personal_sales?.by_market?.[item+'/'+city];return sale?`<span class="personal-mark">내 판매 메일 · 누적 최고 ${n(sale.highest_price)} / ${n(sale.highest_price_amount)}개<small>체결 시각 미확인 · 최근 메일 ${date(sale.first_read)}</small></span>`:''}
 function renderPersonal(){
  const sales=state.personal_sales;
@@ -363,17 +362,11 @@ function renderVolumeGuide(){
 function renderOverview(){
  const items=Object.keys(state.items);
  updateHtml('overview',table(['도시',...items.map(i=>state.items[i])],Object.entries(state.cities).map(([city,name])=>`<tr><th scope="row">${esc(name)}</th>${items.map(item=>{const b=state.books[item][city];return `<td><button type="button" class="market-cell ${item===selectedItem&&city===selectedCity?'selected':''}" data-item="${esc(item)}" data-city="${esc(city)}" aria-label="${esc(name)} ${esc(state.items[item])} 상세"><span>${extremeMark(item,city,'buy')}${quoteText(b.buy,'buy')}</span><span>${extremeMark(item,city,'sell')}${quoteText(b.sell,'sell')}</span>${personalMark(item,city)}</button></td>`}).join('')}</tr>`),'all-markets'));
- $('quick-city').textContent='도시 비교 + '+state.cities[selectedCity]+' 상세';
- updateHtml('all-items',items.map(item=>{const b=state.books[item][selectedCity];return `<article class="panel item-summary"><h3>${esc(state.items[item])}</h3><div class="extremes-pair">${extremeSummary(item,'buy')}${extremeSummary(item,'sell')}</div><div class="item-city-table"><table><thead><tr><th>도시</th><th>최고 매수</th><th>최저 매도</th></tr></thead><tbody>${Object.entries(state.cities).map(([city,name])=>{const pair=state.books[item][city];return `<tr><th scope="row">${esc(name)}</th>${['buy','sell'].map(side=>{const q=quote(pair[side]),best=state.city_extremes?.[item]?.[side]?.observations?.some(o=>o.city===city);return `<td class="quote-cell ${side} ${best?'best-'+side:''}">${n(q?.price)}<small>${n(q?.amount)}개</small><small class="quote-status">${pair[side].single_only?'미확인':q?.stale||pair[side].stale?'지난 자료':q?'유효 관측':'미조회'}</small></td>`}).join('')}</tr>`}).join('')}</tbody></table></div><h4 class="selected-city-label">${esc(state.cities[selectedCity])} 물량 상세</h4>${['buy','sell'].map(side=>{const book=b[side],d=book.fresh?book.analysis_depth:book.depth;return `<div class="item-side ${side}"><p>${quoteText(book,side)}</p><small>${d?.reference?.large?'대량 기준':'소량 제외 기준'} ${n(d?.reference?.price)} · ${n(d?.reference?.amount)}개</small><small>앞쪽 소량 ${n(d?.leading_small_levels)}호가 · ${n(d?.leading_small_amount)}개</small><div class="wall-list">${(d?.large_levels||[]).slice(0,3).map(r=>`<span class="pill ${r.wall?'wall-badge':''}">${r.wall?'벽':'대량'} ${n(r.price)} · ${n(r.amount)}개</span>`).join('')||'대량 관측 없음'}</div></div>`}).join('')}</article>`}).join(''));
 }
 function render(){
  renderNow();renderPickHistory();renderMyOrders();renderStale();renderCapital();renderHoldings();renderPurchases();renderPortfolio();renderStudies();renderBookPatterns();renderBoard();renderBuyouts();renderOverview();renderBuyUnder();renderSellTargets();renderPersonal();renderPersonalMails();renderMailDiagnosis();renderVolumeGuide();
  $('detail-context').textContent=state.cities[selectedCity]+' · '+state.items[selectedItem];
  const books=state.books[selectedItem];
- updateHtml('cities',Object.entries(state.cities).map(([id,name])=>{
-  const b=books[id],sell=quote(b.sell),buy=quote(b.buy),sr=b.sell.depth?.reference,br=b.buy.depth?.reference;
-  return `<button type="button" class="city-card ${id===selectedCity?'active':''}" data-city="${id}" aria-pressed="${id===selectedCity}"><h3>${esc(name)}</h3><div class="price-pair"><div><span>${b.buy.single_only?'매수 관측 · 최고가 미확인':'최고 매수'}</span><br><b>${n(buy?.price)}</b><small>${n(buy?.amount)}개 ${buy?.stale||b.buy.stale?'· 이전 관측':''}</small></div><div><span>${b.sell.single_only?'매도 관측 · 최저가 미확인':'최저 매도'}</span><br><b>${n(sell?.price)}</b><small>${n(sell?.amount)}개 ${sell?.stale||b.sell.stale?'· 이전 관측':''}</small></div></div><div class="reference-mini">관측 물량 기준 매수 ${n(br?.price)} / 매도 ${n(sr?.price)}</div><div class="age">매수 ${date(b.buy.seen)}<br>매도 ${date(b.sell.seen)}</div></button>`
- }).join(''));
  renderBook('sell',books[selectedCity].sell);renderBook('buy',books[selectedCity].buy);
  updateHtml('history',state.history.map(h=>`<article class="history-card"><h3>최근 ${h.days===1?'24시간':h.days+'일'}</h3><div class="metric">${n(h.amount)} <small>개 · 관측 판매량</small></div><div class="stats"><div><small>수량 가중평균가</small><b>${n(h.weighted_average,2)}</b></div><div><small>최고 구간 평균가</small><b>${n(h.highest_bucket_average,2)}</b></div><div><small>고가 구간 전체 판매량</small><b>${n(h.near_high_amount)}개</b></div><div><small>관측 시간 범위</small><b>${n(h.coverage*100,1)}%</b></div></div><div class="coverage">${n(h.covered_hours)} / ${n(h.requested_hours)}시간 확인 · ${n(h.resolution_hours)}시간 구간<br>최신 구간 끝 ${date(h.newest_bucket_end)}${h.stale?'<br><strong class="warn">최신 구간이 오래됨 · 시장 이력을 다시 열어 주세요.</strong>':''}</div></article>`).join(''));
  renderHigh();renderBars('weekdays',state.patterns.weekdays,x=>['월','화','수','목','금','토','일'][x]);renderBars('hours',state.patterns.hourly,x=>String(x).padStart(2,'0')+'시');$('pattern-note').textContent=state.patterns.note;
@@ -430,11 +423,16 @@ function chooseView(){selectedItem=$('item').value;selectedCity=$('city').value;
 $('item').onchange=chooseView;$('city').onchange=chooseView;
 $('overview').onclick=e=>{const cell=e.target.closest('[data-item][data-city]');if(cell){$('item').value=cell.dataset.item;$('city').value=cell.dataset.city;chooseView()}};
 const tabs=[...document.querySelectorAll('.tabs [data-tab]')];
-function showTab(name){if(!tabs.some(b=>b.dataset.tab===name))name='now';for(const b of tabs){const on=b.dataset.tab===name;b.classList.toggle('active',on);b.setAttribute('aria-selected',String(on))}for(const panel of document.querySelectorAll('.tab-panel'))panel.hidden=panel.dataset.tab!==name;storage.set('tab',name)}
+const movedTabs={cities:'trades',mail:'history'};
+function showTab(name){if(name==='cities')setTradesView('city');name=movedTabs[name]||name;if(!tabs.some(b=>b.dataset.tab===name))name='now';for(const b of tabs){const on=b.dataset.tab===name;b.classList.toggle('active',on);b.setAttribute('aria-selected',String(on))}for(const panel of document.querySelectorAll('.tab-panel'))panel.hidden=panel.dataset.tab!==name;storage.set('tab',name)}
 document.querySelector('.tabs').onclick=e=>{const b=e.target.closest('[data-tab]');if(b)showTab(b.dataset.tab)};
+function setTradesView(view){if(!['list','city'].includes(view))view='list';$('trades-view').value=view;$('candidate-section').hidden=view!=='list';$('board-section').hidden=view!=='city';storage.set('tradesView',view)}
+setTradesView(storage.get('tradesView','list'));
+$('trades-view').onchange=()=>setTradesView($('trades-view').value);
+// Long tabs get a row of jump links built from their sections' data-jump labels.
+for(const panel of document.querySelectorAll('.tab-panel')){const targets=[...panel.querySelectorAll(':scope > section[data-jump]')];if(targets.length<3)continue;const nav=document.createElement('nav');nav.className='section-nav';nav.setAttribute('aria-label','이 화면 바로가기');nav.innerHTML=targets.map(t=>`<a href="#${t.id}">${esc(t.dataset.jump)}</a>`).join('');nav.onclick=e=>{const a=e.target.closest('a');if(!a)return;e.preventDefault();$(a.getAttribute('href').slice(1)).scrollIntoView({block:'start'})};panel.prepend(nav)}
 showTab(storage.get('tab','now'));
 $('city-board').onclick=e=>{const button=e.target.closest('[data-city]');if(button){$('city').value=button.dataset.city;chooseView();showTab('market');document.querySelector('.tabs').scrollIntoView({block:'start'})}};
-$('cities').onclick=e=>{const card=e.target.closest('[data-city]');if(card){$('city').value=card.dataset.city;chooseView()}};
 $('candidate-filter').value=['all','instant','wait'].includes(storage.get('candidateFilter','all'))?storage.get('candidateFilter','all'):'all';
 $('my-order-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/my-orders',{item:f.item.value,city:f.city.value,side:f.side.value,price:Number(f.price.value),amount:Number(f.amount.value)});f.price.value='';f.amount.value='';$('my-order-status').textContent='추가했습니다. 게임에서 그 시장을 열면 자동으로 연결됩니다.';await refresh()}catch(err){$('my-order-status').textContent='추가 실패: '+err.message}};
 $('my-orders-filters').onclick=e=>{const b=e.target.closest('[data-key]');if(!b||!state)return;storage.set('myOrdersFilter',{...myOrderFilter(state.my_orders||[]),[b.dataset.key]:b.dataset.value});preserveViewport(renderMyOrders)};
