@@ -103,3 +103,27 @@ section[id]{scroll-margin-top:20px}.personal-section{border-left:3px solid #c3ac
 .capital-grid{grid-template-columns:repeat(4,minmax(0,1fr))}@media(max-width:760px){.capital-grid{grid-template-columns:1fr 1fr}}
 .buy-target-form{margin:0}.buy-target-form input{width:110px;margin:0;padding:6px 8px;text-align:right}td.muted b{color:var(--muted);font-weight:400}#buy-under td{vertical-align:top}#buy-under-status:empty{display:none}
 .tab-panel>section{scroll-margin-top:64px}
+/* Design polish (2026-11-01): one warning colour, larger table text, text columns read left to right. */
+:root{--warn:#f2a65a}
+.warn,small.warn,.board-warn,strong.warn{color:var(--warn)}
+table{font-size:14px}th{font-size:12.5px}td small{font-size:13px;line-height:1.6}.pill{font-size:12px}.board-sub{font-size:13px}
+.quiet{color:var(--muted)}td.side-sell{color:#f5d598;font-weight:600}td.side-buy{color:#a2e2c5;font-weight:600}
+.icon-button{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:50%;width:28px;height:28px;padding:0;font-size:16px;line-height:1}.icon-button:hover{color:var(--warn);border-color:var(--warn)}
+.more-row{text-align:center;margin:12px 0 0}
+.stale-picks .now-card{opacity:1;background:#141c20}.past-pill{color:var(--muted);border-style:dashed}
+.sell-target-form{margin:0}.sell-target-form input{width:110px;margin:0;padding:6px 8px;text-align:right}
+#sell-target table{table-layout:fixed;min-width:1180px}#sell-target th:first-child{width:170px}#sell-target th:nth-child(2){width:140px}#sell-target th:last-child{width:200px}
+#sell-target td,#sell-target th{vertical-align:top}.st-cell b.st-units{display:block;font-size:17px}.st-cell small{white-space:normal}.st-meta{color:#94a5a9}
+#overview table{min-width:max(960px,calc(125px + var(--cols,7) * 165px))}#overview thead th{white-space:normal;line-height:1.35;vertical-align:bottom}
+.trial-tag{display:block;font-size:11px;font-weight:400;color:var(--muted)}
+.extreme-badge{font-size:11px!important}.quote-time.old{color:#94a5a9}
+[data-scroll-key^="candidates"] td:last-child,[data-scroll-key^="candidates"] th:last-child,
+[data-scroll-key^="buyouts"] td:nth-child(4),[data-scroll-key^="buyouts"] th:nth-child(4),
+[data-scroll-key^="buyouts"] td:last-child,[data-scroll-key^="buyouts"] th:last-child,
+[data-scroll-key="holdings-by-item"] td:nth-child(5),[data-scroll-key="holdings-by-item"] th:nth-child(5),
+[data-scroll-key="my-orders"] td:nth-child(7),[data-scroll-key="my-orders"] th:nth-child(7){text-align:left}
+.reason-list{justify-content:flex-start}
+details.more-help{margin:-12px 0 16px}details.more-help summary{font-size:13px;color:var(--muted)}details.more-help[open] summary{color:var(--gold)}.help-lead{margin-bottom:14px}
+.section-head .inline-filter+.inline-filter{margin-left:0}
+.market-pick{margin:4px 0 0}.market-pick+.help{margin-top:8px}
+.number-hint{color:var(--green);margin-top:4px;min-height:1.2em}
