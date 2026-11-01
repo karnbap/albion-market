@@ -37,8 +37,8 @@ def utcnow():
     return datetime.now(timezone.utc)
 
 
-def connect(directory):
-    db = sqlite3.connect(Path(directory) / "data" / "lookup.sqlite3", check_same_thread=False, timeout=10)
+def connect(directory, timeout=10):
+    db = sqlite3.connect(Path(directory) / "data" / "lookup.sqlite3", check_same_thread=False, timeout=timeout)
     db.executescript("""
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, item TEXT NOT NULL, location TEXT NOT NULL,
@@ -136,14 +136,26 @@ class Stream(threading.Thread):
 
     def run(self):
         db, backoff = connect(self.directory), 5
-        purge(db)
+        try:
+            self.loop(db, backoff)
+        finally:
+            db.close()
+
+    def loop(self, db, backoff):
         while not self.stopped.is_set():
+            started = time.monotonic()
             try:
+                purge(db)
                 self.listen(db)
-                backoff = 5
             except Exception as exc:
+                # A connection that stayed up a while was healthy: retry soon instead of the grown wait.
+                if time.monotonic() - started > 60:
+                    backoff = 5
                 logging.warning("Public order stream: %s; retrying in %ss", exc, backoff)
-                set_meta(db, stream_error=str(exc)[:160], stream_connected=False)
+                try:
+                    set_meta(db, stream_error=str(exc)[:160], stream_connected=False)
+                except sqlite3.Error:
+                    pass
             self.stopped.wait(backoff)
             backoff = min(backoff * 2, 300)
 

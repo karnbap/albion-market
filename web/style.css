@@ -135,3 +135,8 @@ details.more-help{margin:-12px 0 16px}details.more-help summary{font-size:13px;c
 .lk-src.public{color:#94a5a9}.lk-src.me{color:#dbc6fb}.lk-cheapest td:first-child{box-shadow:inset 3px 0 var(--gold)}
 [data-scroll-key="lookup"] td:first-child small{display:block}
 @media(max-width:760px){.lookup-form{grid-template-columns:1fr 1fr}.lookup-form label:first-child{grid-column:1/-1}}
+/* Review fixes (2026-11-01). */
+.lk-old{opacity:.6}
+.tab-panel:has(.section-nav)::after{content:"";display:block;height:55vh}
+@media(max-width:760px){.tabs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}.tabs button{flex:0 0 auto}
+.section-head .inline-filter,.section-head .inline-filter+.inline-filter{margin-left:0;width:100%;justify-content:space-between}.section-head .inline-filter select{flex:1;max-width:220px}}
