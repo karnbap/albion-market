@@ -254,15 +254,38 @@ class WatchTests(unittest.TestCase):
         w = self.store.watches()["watches"]
         self.assertEqual(len(w), 1)
         wid = w[0]["id"]
-        self.store.set_watch({"action": "update", "id": wid, "buy_below": 9_300, "sell_above": 8_000})
+        self.store.set_watch({"action": "update", "id": wid, "buy_below": 9_300, "sell_above": 9_500})
         w = self.store.watches()["watches"][0]
         # Thetford's public price is 30 hours old, so Martlock's live 9,200 is the cheapest.
         self.assertEqual((w["sell"]["price"], w["sell"]["city"], w["sell"]["source"]), (9_200, "3008", "stream"))
         self.assertTrue(w["buy_hit"] and w["buy_live"])
-        # The buy order was heard 3 hours ago: the sell price is reached, but too old to alert on.
-        self.assertEqual(w["buy"]["price"], 8_800)
+        # The sell alert reads the city with the highest cheapest sell (Lymhurst), not the 8,800 buy order.
+        self.assertEqual((w["list"]["price"], w["list"]["city"], w["buy"]["price"]), (9_500, "1002", 8_800))
+        self.assertTrue(w["sell_hit"] and w["sell_live"])
+        self.store.set_watch({"action": "update", "id": wid, "buy_below": 9_300, "sell_above": 9_501})
+        self.assertFalse(self.store.watches()["watches"][0]["sell_hit"])
+        # A listing heard 3 hours ago still reaches the price, but is too old to alert on.
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(4, 12_000, "7")], "stream", (self.now - timedelta(hours=3)).isoformat())
+        w = self.store.watches()["watches"][0]
+        self.assertEqual(w["list"]["price"], 12_000)
         self.assertTrue(w["sell_hit"])
         self.assertFalse(w["sell_live"])
+        # A lone absurd listing is an outlier and never reaches the alert.
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(5, 100_000_000, "2004")], "stream", (self.now - timedelta(minutes=1)).isoformat())
+        w = self.store.watches()["watches"][0]
+        self.assertEqual((w["list"]["price"], w["list_skipped"]["outlier"]), (12_000, 1))
+        # A city whose floor is my own open sell order says nothing about the market.
+        self.store.db.execute("INSERT INTO my_orders(item,city,side,price,amount,created,remaining) VALUES('T7_RELIC','7','sell',12000,3,?,3)", (self.now.isoformat(),))
+        w = self.store.watches()["watches"][0]
+        self.assertEqual((w["list"]["price"], w["list_skipped"]["own"]), (9_500, 1))
+        self.store.db.execute("DELETE FROM my_orders")
+        # The stream heard only an expensive Lymhurst order; the cheaper public price from today wins for that city.
+        lookup.public.cache["T7_RELIC"]["prices"].append(
+            {"city": "Lymhurst", "quality": 1, "sell_price_min": 8_000, "sell_price_min_date": "2026-11-02T10:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"})
+        floors = self.store.watches()["watches"][0]
+        self.assertEqual((floors["sell"]["city"], floors["list"]["price"], floors["list"]["city"]), ("3008", 12_000, "7"))
         with self.assertRaises(ValueError):
             self.store.set_watch({"action": "update", "id": wid, "buy_below": 0, "sell_above": None})
         with self.assertRaises(ValueError):
