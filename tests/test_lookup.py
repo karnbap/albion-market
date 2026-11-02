@@ -219,3 +219,53 @@ class LookupRobustnessTests(LookupTests):
             lookup.time.monotonic = real
         # Quick failure: 5; next quick failure: 10; then a 300-second healthy run resets to 5.
         self.assertEqual(waits, [5, 10, 5])
+
+
+class WatchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        shutil.copy(ROOT / "config.json", self.root / "config.json")
+        cfg = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+        cfg["excluded_cities"] = ["3005"]
+        (self.root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        self.now = datetime(2026, 11, 2, 12, tzinfo=UTC)
+        self.store = Store(self.root, clock=lambda: self.now)
+        lookup.catalog.items = [{"id": "T7_RELIC", "ko": "그랜드 마스터의 유물", "en": "Grandmaster's Relic"}]
+
+    def tearDown(self):
+        self.store.db.close()
+        lookup.public.cache.clear()
+        self.tmp.cleanup()
+
+    def order(self, oid, price, loc, side="offer", minutes=5):
+        return {"Id": oid, "ItemTypeId": "T7_RELIC", "LocationId": loc, "QualityLevel": 1, "EnchantmentLevel": 0,
+                "UnitPriceSilver": price * 10000, "Amount": 3, "AuctionType": side,
+                "Expires": (self.now + timedelta(days=20)).replace(tzinfo=None).isoformat()}
+
+    def test_watch_finds_best_prices_and_raises_alerts_only_on_fresh_values(self):
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(1, 9_500, "1002"), self.order(2, 9_200, "3008")], "stream", (self.now - timedelta(minutes=5)).isoformat())
+            lookup.add_orders(db, [self.order(3, 8_800, "4002", side="request")], "stream", (self.now - timedelta(hours=3)).isoformat())
+        lookup.public.cache["T7_RELIC"] = {"fetched": time.time(), "error": "", "history": [], "prices": [
+            {"city": "Thetford", "quality": 1, "sell_price_min": 9_000, "sell_price_min_date": "2026-11-01T06:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"}]}
+        self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
+        self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
+        w = self.store.watches()["watches"]
+        self.assertEqual(len(w), 1)
+        wid = w[0]["id"]
+        self.store.set_watch({"action": "update", "id": wid, "buy_below": 9_300, "sell_above": 8_000})
+        w = self.store.watches()["watches"][0]
+        # Thetford's public price is 30 hours old, so Martlock's live 9,200 is the cheapest.
+        self.assertEqual((w["sell"]["price"], w["sell"]["city"], w["sell"]["source"]), (9_200, "3008", "stream"))
+        self.assertTrue(w["buy_hit"] and w["buy_live"])
+        # The buy order was heard 3 hours ago: the sell price is reached, but too old to alert on.
+        self.assertEqual(w["buy"]["price"], 8_800)
+        self.assertTrue(w["sell_hit"])
+        self.assertFalse(w["sell_live"])
+        with self.assertRaises(ValueError):
+            self.store.set_watch({"action": "update", "id": wid, "buy_below": 0, "sell_above": None})
+        with self.assertRaises(ValueError):
+            self.store.set_watch({"action": "add", "item": "../x"})
+        self.store.set_watch({"action": "remove", "id": wid})
+        self.assertEqual(self.store.watches()["watches"], [])

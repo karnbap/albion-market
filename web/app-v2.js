@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261102.4';
+  const legacy=next.build!=='20261102.5';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -513,7 +513,7 @@ function renderLookup(){
  const t=lookupTier(),e=Number($('lookup-enchant').value);
  const tag=t?.tier!=null?`T${t.tier}.${e}`:e?'.'+e:'';
  const none=rows.every(r=>!r.sell&&!r.buy)&&!d.public_loading;
- updateHtml('lookup-view',`<div class="lk-hero"><span class="lk-name">${esc(lookupName(lookupView.hit))}</span>${tag?`<span class="lk-chip">${esc(tag)}</span>`:''}<span class="lk-chip q">${anyQuality?'아무 품질':'품질 '+d.quality+' '+qualityName[d.quality]}</span><code>${esc(d.item)}</code></div>`+(none?`<p class="warn">이 조합은 6개 도시 어디에도 최근 매물·매수 기록이 없습니다.${anyQuality?' 위 「값이 있는 조합」 표에서 금색 칸을 누르면 매물이 있는 티어·인챈트로 바뀝니다.':' 품질을 \'아무 품질\'로 바꿔 보세요. 장비는 한 품질에만 매물이 있는 경우가 많습니다.'}</p>`:'')+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell&&!sell.old&&sell.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell&&!sell.old&&sell.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy&&!buy.old&&buy.price===dearest?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
+ updateHtml('lookup-view',`<div class="lk-hero"><span class="lk-name">${esc(lookupName(lookupView.hit))}</span>${tag?`<span class="lk-chip">${esc(tag)}</span>`:''}<span class="lk-chip q">${anyQuality?'아무 품질':'품질 '+d.quality+' '+qualityName[d.quality]}</span><code>${esc(d.item)}</code><button type="button" class="secondary small-button" data-watch-add>시세 감시에 추가</button></div>`+(none?`<p class="warn">이 조합은 6개 도시 어디에도 최근 매물·매수 기록이 없습니다.${anyQuality?' 위 「값이 있는 조합」 표에서 금색 칸을 누르면 매물이 있는 티어·인챈트로 바뀝니다.':' 품질을 \'아무 품질\'로 바꿔 보세요. 장비는 한 품질에만 매물이 있는 경우가 많습니다.'}</p>`:'')+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell&&!sell.old&&sell.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell&&!sell.old&&sell.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy&&!buy.old&&buy.price===dearest?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
   +`<p class="help">${d.public_loading?'공개 서버에 묻는 중… ':d.public_error?'공개 서버 조회 실패: '+esc(d.public_error)+' · ':d.public_fetched?`공개 서버 값은 ${lookupAge(d.public_fetched)}에 받음 · `:''}실시간 공유·내가 연 시장 값은 최근 24시간 안에 들은 주문입니다. 그사이 팔렸거나 새 매물이 올라왔을 수 있으니 사고팔기 전에는 게임에서 한 번 확인하세요. 7일 평균·판매량은 공개 서버의 하루 단위 거래 이력입니다.</p>`)}
 $('lookup-form').onsubmit=e=>{e.preventDefault();lookupSearch()};
 $('lookup-q').oninput=()=>{clearTimeout(lookupView.searchTimer);lookupView.searchTimer=setTimeout(lookupSearch,250)};
@@ -523,6 +523,54 @@ $('lookup-section').addEventListener('click',e=>{const c=e.target.closest('[data
 {renderLookupRecent();const last=storage.get('lookupLast2',null);if(last?.hit){lookupView.hit=last.hit;fillTiers(last.hit,last.tier);$('lookup-enchant').value=last.enchant||'0';fillEnchants();$('lookup-quality').value=last.quality??'0'}}
 document.querySelector('.tabs').addEventListener('click',e=>{if(e.target.closest('[data-tab=lookup]'))loadLookup()});
 if(storage.get('tab','now')==='lookup')loadLookup();
+// Price watch: the cheapest sell and dearest buy of chosen items, refreshed every 10 seconds even in the background,
+// with an alert once when a buy or sell price is reached on a value from the last hour (re-armed when it stops holding).
+const watchView={data:null,prev:{},flash:{},armed:storage.get('watchArmed',{}),timer:null,audio:null};
+const watchAge=m=>m==null?'—':m<1?'방금':m<60?`${m}분 전`:`${Math.round(m/60)}시간 전`;
+// Tracked items keep the names used everywhere else in the app.
+const watchName=w=>state?.items?.[w.item]?itemName(w.item):w.name;
+const watchSrc={me:'내가 연 시장',stream:'실시간 공유',public:'공개 서버'};
+function watchTag(item,quality){const [base,ench]=item.split('@'),t=/^T(\d)_/.exec(base);return `${t?'T'+t[1]+'.'+(ench||0):ench?'.'+ench:''}${Number(quality)?' · 품질 '+quality:''}`}
+async function postWatch(body){try{watchView.data=await post('/api/watches',body);renderWatches()}catch(e){$('watch-status').textContent='저장 실패: '+e.message}}
+async function loadWatches(){
+ clearTimeout(watchView.timer);
+ try{const r=await fetch('/api/watches');if(r.ok){watchView.data=await r.json();renderWatches();checkWatchAlerts()}}catch{}
+ watchView.timer=setTimeout(loadWatches,10000)}
+function renderWatches(){
+ const d=watchView.data;if(!d)return;
+ const list=d.watches,hits=list.filter(w=>(w.buy_hit&&w.buy_live)||(w.sell_hit&&w.sell_live)).length;
+ $('watch-badge').hidden=!hits;$('watch-badge').textContent=hits;
+ const s=d.stream||{};$('watch-status').textContent=`${list.length}개 감시 중 · 10초마다 갱신${s.stream_connected?' · 실시간 공유 받는 중':''}`;
+ const watched=new Set(list.map(w=>w.item));
+ updateHtml('watch-quick',Object.keys(state?.items||{}).filter(i=>!watched.has(i)).map(i=>`<button type="button" class="secondary small-button" data-watch-quick="${esc(i)}">+ ${esc(itemName(i))}</button>`).join('')||'<small>추적 품목은 모두 감시 중입니다.</small>');
+ // While a price box is being typed in, the table waits so the cursor is not lost.
+ if(document.activeElement?.closest('#watch-list'))return;
+ const now=Date.now();
+ for(const w of list)for(const side of ['sell','buy']){const key=w.id+side,p=w[side]?.price??null;if(key in watchView.prev&&watchView.prev[key]!==p)watchView.flash[key]=now+2500;watchView.prev[key]=p}
+ const cell=(w,side)=>{const q=w[side],key=w.id+side;if(!q)return `<td><small>${w.public_loading?'묻는 중…':'최근 하루 값 없음'}</small></td>`;const hit=side==='sell'?w.buy_hit:w.sell_hit;return `<td class="${watchView.flash[key]>now?'flash':''} ${hit?'hit':''}"><b class="lk-price ${side}">${n(q.price)}</b><small>${esc(state?.cities?.[q.city]||q.city)}${q.amount!=null?' · '+n(q.amount)+'개':''}${!Number(w.quality)&&q.quality?' · 품질 '+q.quality:''}</small><small class="lk-src ${q.source}">${watchSrc[q.source]} · ${watchAge(q.age_minutes)}</small></td>`};
+ const state_=w=>{const out=[];if(w.buy_hit)out.push(w.buy_live?'<span class="pill watch-hit buy">살 때 됨</span>':`<span class="pill">살 가격 충족 · ${watchAge(w.sell.age_minutes)} 값</span>`);if(w.sell_hit)out.push(w.sell_live?'<span class="pill watch-hit sell">팔 때 됨</span>':`<span class="pill">팔 가격 충족 · ${watchAge(w.buy.age_minutes)} 값</span>`);return out.join(' ')||'<small>대기 중</small>'};
+ updateHtml('watch-list',list.length?table(['품목','가장 싸게 사기 (최저 매도)','가장 비싸게 팔기 (최고 매수)','살 때 알림 (이 값 이하)','팔 때 알림 (이 값 이상)','상태',''],list.map(w=>`<tr data-watch="${w.id}"><td>${esc(watchName(w))}<small>${esc(watchTag(w.item,w.quality))}</small></td>${cell(w,'sell')}${cell(w,'buy')}<td><input class="watch-price" type="number" min="1" step="1" inputmode="numeric" data-watch-id="${w.id}" data-side="buy_below" value="${w.buy_below??''}" placeholder="예: ${w.sell?n(Math.round(w.sell.price*.95)).replace(/,/g,''):''}" aria-label="${esc(w.name)} 살 때 알림 가격"></td><td><input class="watch-price" type="number" min="1" step="1" inputmode="numeric" data-watch-id="${w.id}" data-side="sell_above" value="${w.sell_above??''}" placeholder="예: ${w.buy?n(Math.round(w.buy.price*1.05)).replace(/,/g,''):''}" aria-label="${esc(w.name)} 팔 때 알림 가격"></td><td>${state_(w)}</td><td><button type="button" class="icon-button" data-watch-remove="${w.id}" title="감시에서 빼기" aria-label="${esc(w.name)} 감시에서 빼기">×</button></td></tr>`),'watch'):empty('감시 중인 품목이 없습니다. 위 빠른 추가를 누르거나, 품목 시세에서 품목을 고른 뒤 \'감시에 추가\'를 누르세요.'))}
+function chime(){if(!$('watch-sound').checked)return;try{const a=watchView.audio??=new AudioContext(),t=a.currentTime;for(const [f,d] of [[880,0],[1318.5,.12],[1760,.24]]){const o=a.createOscillator(),g=a.createGain();o.type='triangle';o.frequency.value=f;g.gain.setValueAtTime(0,t+d);g.gain.linearRampToValueAtTime(.18,t+d+.02);g.gain.exponentialRampToValueAtTime(.001,t+d+.5);o.connect(g).connect(a.destination);o.start(t+d);o.stop(t+d+.55)}}catch{}}
+function watchToast(title,body){const box=document.createElement('div');box.className='watch-toast';box.innerHTML=`<b>${esc(title)}</b><span>${esc(body)}</span><button type="button" class="icon-button" aria-label="알림 닫기">×</button>`;box.querySelector('button').onclick=()=>box.remove();$('watch-toasts').append(box);setTimeout(()=>box.remove(),60000)}
+function checkWatchAlerts(){
+ for(const w of watchView.data.watches)for(const [kind,hit,live,q,target,word] of [['buy',w.buy_hit,w.buy_live,w.sell,w.buy_below,'살 때'],['sell',w.sell_hit,w.sell_live,w.buy,w.sell_above,'팔 때']]){
+  const key=w.id+':'+kind+':'+target;
+  if(!(hit&&live)){delete watchView.armed[key];continue}
+  if(watchView.armed[key])continue;
+  watchView.armed[key]=true;
+  const title=`${word}: ${watchName(w)} ${watchTag(w.item,w.quality)}`,body=`${state?.cities?.[q.city]||q.city} ${kind==='buy'?'최저 매도':'최고 매수'} ${n(q.price)} (알림 ${kind==='buy'?'≤':'≥'} ${n(target)}) · ${watchSrc[q.source]} ${watchAge(q.age_minutes)}`;
+  watchToast(title,body);chime();
+  if('Notification' in window&&Notification.permission==='granted')try{new Notification(title,{body,tag:key})}catch{}}
+ storage.set('watchArmed',watchView.armed)}
+function notifyLabel(){const p='Notification' in window?Notification.permission:'denied';$('watch-notify').textContent=p==='granted'?'데스크톱 알림 켜짐':p==='denied'?'데스크톱 알림 막힘 (브라우저 설정)':'데스크톱 알림 켜기';$('watch-notify').disabled=p!=='default'}
+$('watch-notify').onclick=async()=>{if('Notification' in window)await Notification.requestPermission();notifyLabel()};
+$('watch-section').addEventListener('click',e=>{const q=e.target.closest('[data-watch-quick]');if(q)return postWatch({action:'add',item:q.dataset.watchQuick,quality:0});const r=e.target.closest('[data-watch-remove]');if(r)postWatch({action:'remove',id:Number(r.dataset.watchRemove)})});
+$('watch-list').addEventListener('change',e=>{const i=e.target.closest('.watch-price');if(!i)return;const row=i.closest('tr'),val=s=>{const v=row.querySelector(`[data-side=${s}]`).value.trim();return v===''?null:Number(v)};postWatch({action:'update',id:Number(i.dataset.watchId),buy_below:val('buy_below'),sell_above:val('sell_above')})});
+$('watch-list').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.closest('.watch-price'))e.target.blur()});
+$('lookup-section').addEventListener('click',e=>{if(!e.target.closest('[data-watch-add]'))return;const id=lookupId();if(id)postWatch({action:'add',item:id,quality:Number($('lookup-quality').value)}).then(()=>{$('lookup-status').textContent='시세 감시에 추가했습니다.'})});
+// Browsers start sound only after a click on the page.
+document.addEventListener('click',()=>{try{watchView.audio??=new AudioContext();watchView.audio.resume()}catch{}},{once:true});
+notifyLabel();loadWatches();
 // A hidden tab does not poll; the server rebuilds every market on each request.
 refresh();setInterval(()=>{if(document.hidden)return;refresh();if(draft&&!saving)scheduleSave()},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});
