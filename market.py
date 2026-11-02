@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261102.9"
+BUILD = "20261102.10"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -104,6 +104,10 @@ WATCH_BUDGET = 10_000_000
 WATCH_SELL_DAYS = 7
 # The watch shows what buying this much silver's worth would average.
 WATCH_DEPTHS = (5_000_000, 10_000_000)
+# Listing prices compared, from the list price down to the usual traded price.
+WATCH_LEVELS = 4
+# Fewer hours of sales than this say nothing about what sells at which price.
+WATCH_MIN_HOURS = 24
 
 
 def volume_risk(units, guide):
@@ -2537,13 +2541,45 @@ class Store:
                 out.append({"budget": budget, "units": units, "spent": spent, "average": spent / units, "cities": dict(bought), "short": spent < budget * 0.9})
         return out
 
+    def hourly_sales(self, item, quality, city):
+        """Hourly sales of the last 7 days in a city, oldest first. The public API misses hours nobody uploaded; hourly
+        history this PC received fills them (the two agree where both exist, under the same stamp, the bucket's end)."""
+        cities = self.lookup_cities()
+        hit = lookup.public.get_hours(item, list(cities.values()), self.root)
+        week = (self.clock() - timedelta(days=7)).replace(tzinfo=None).isoformat()
+        by_quality = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+        for r in (hit or {}).get("history", []):
+            if r.get("location") == cities.get(city):
+                for d in r.get("data", []):
+                    if d.get("timestamp", "") >= week:
+                        sold = by_quality[r.get("quality")][d["timestamp"]]
+                        sold[0] += d["item_count"]
+                        sold[1] += d["avg_price"] * d["item_count"]
+        hours = by_quality.get(quality)
+        if not hours:
+            hours = defaultdict(lambda: [0, 0])
+            for by_stamp in by_quality.values():
+                for stamp, (units, silver) in by_stamp.items():
+                    hours[stamp][0] += units
+                    hours[stamp][1] += silver
+        # This PC's history is of quality 1 only.
+        if quality in (lookup.ANY_QUALITY, 1):
+            for r in self.db.execute("SELECT stamp, amount, silver FROM history WHERE item=? AND city=? AND hours=1 AND stamp>? AND amount>0", (item, city, week)):
+                hours.setdefault(parse_time(r["stamp"]).replace(tzinfo=None).isoformat(), [r["amount"], r["silver"]])
+        return [{"end": datetime.fromisoformat(s).replace(tzinfo=UTC), "units": u, "average": v / u} for s, (u, v) in sorted(hours.items()) if u]
+
     def watch_forecast(self, view, asks, sell, listing):
         """What WATCH_BUDGET would make on an item: buy the sell orders we heard, cheapest first, while each still
         leaves a profit, and list them all in the list city after sales tax and setup fee. The cheapest price alone
         would overstate it, since that order is often a single unit. With no orders heard, the cheapest price with
         an unknown amount stands in. The list city's sales of the last 7 days, times the part that takes sell orders,
         times my part of those (cycle_share), give how fast it sells; other sellers take the rest. Those sales come
-        from whichever is newer: the history this PC received when I opened the market, or the public API's."""
+        from whichever is newer: the history this PC received when I opened the market, or the public API's.
+
+        With hourly sales, the part that sells at the list price is the part of sales in hours whose average reached
+        it. An hour's average is not each sale's price, so this is a rough measure, but unlike one share for all prices
+        it falls as the price rises. sales.levels compares lower listing prices the same way, buying only what sells
+        in WATCH_SELL_DAYS."""
         if not sell or not listing:
             return None
         cfg = self.cfg
@@ -2554,11 +2590,11 @@ class Store:
         def carried(row):
             return row["price"] + (cfg["transport_per_unit"] if row["city"] != listing["city"] else 0)
 
-        def buy(limit):
+        def buy(limit, worth=net):
             units, spent, oldest, sources, bought = 0, 0, None, defaultdict(int), defaultdict(int)
             for row in rows:
                 unit = carried(row)
-                if unit >= net:
+                if unit >= worth:
                     continue
                 room = int(min((WATCH_BUDGET - spent) // unit, limit - units, limit if row["amount"] is None else row["amount"]))
                 if room >= 1:
@@ -2566,10 +2602,11 @@ class Store:
                     oldest = min(oldest or row["seen"], row["seen"])
                     sources[row["source"]] += room
                     bought[row["city"]] += room
-            return {"units": units, "invested": spent, "profit": units * net - spent, "roi": (units * net - spent) / spent if spent else None, "oldest": oldest, "sources": dict(sources), "cities": dict(bought)}
+            return {"units": units, "invested": spent, "profit": units * worth - spent, "roi": (units * worth - spent) / spent if spent else None, "oldest": oldest, "sources": dict(sources), "cities": dict(bought)}
 
         result = buy(WATCH_BUDGET)
-        history = next((r["history"] for r in view["cities"] if r["city"] == listing["city"]), None) or {}
+        city_row = next((r for r in view["cities"] if r["city"] == listing["city"]), {})
+        history = city_row.get("history") or {}
         average, per_day, sales_source = history.get("average"), history.get("per_day"), "public" if history.get("per_day") else None
         # This PC's history is of quality 1 only.
         own = self.history_summary(view["item"], listing["city"], 7) if view["quality"] in (lookup.ANY_QUALITY, 1) else {}
@@ -2577,11 +2614,32 @@ class Store:
             average, per_day, sales_source = own["weighted_average"], own["amount"] / own["covered_hours"] * 24, "me"
         # state() keeps the studies current; rebuilding them on every 10-second watch read would be too heavy.
         share = next((s["instant_buy_share"] for s in getattr(self, "_studies", []) if s["item"] == view["item"] and s["city"] == listing["city"]), None)
+        hours = self.hourly_sales(view["item"], view["quality"], listing["city"])
+        sold = sum(h["units"] for h in hours)
+        levels = []
+        if len(hours) >= WATCH_MIN_HOURS:
+            usual = sum(h["average"] * h["units"] for h in hours) / sold
+            low = min(usual, listing["price"] * 0.95)
+            for step in range(WATCH_LEVELS):
+                price = round(listing["price"] - (listing["price"] - low) * step / (WATCH_LEVELS - 1))
+                over = [h for h in hours if h["average"] >= price]
+                part = sum(h["units"] for h in over) / sold
+                mine = per_day * part * cfg["cycle_share"] if per_day else None
+                bought = buy(int(mine * WATCH_SELL_DAYS), price * keep) if mine else {"units": 0, "invested": 0, "profit": 0, "roi": None}
+                levels.append({"price": price, "hours": len(over), "days": len({h["end"].date() for h in over}), "share": part, "per_day": per_day * part if per_day else None,
+                               "my_per_day": mine, "sells": int(mine * WATCH_SELL_DAYS) if mine else 0, "units": bought["units"], "invested": bought["invested"], "profit": bought["profit"], "roi": bought["roi"]})
+            share = levels[0]["share"]
+        zone = ZoneInfo(cfg["timezone"])
+        by_hour = defaultdict(list)
+        for h in hours:
+            by_hour[(h["end"] - timedelta(hours=1)).astimezone(zone).hour].append(h["units"])
+        sales = {"hours_seen": len(hours), "per_hour": sold / len(hours) if hours else None, "by_hour": [sum(by_hour[i]) / len(by_hour[i]) if by_hour[i] else None for i in range(24)],
+                 "levels": levels, "week_units": history.get("week_units"), "week_days": history.get("week_days"), "month": city_row.get("month")}
         my_per_day = per_day * (PLAN_INSTANT_SHARE if share is None else share) * cfg["cycle_share"] if per_day else None
         days = result["units"] / my_per_day if my_per_day and result["units"] else None
         fit = buy(int(my_per_day * WATCH_SELL_DAYS)) if days is not None and days > WATCH_SELL_DAYS else None
         oldest = min(filter(None, (result.pop("oldest"), listing["seen"])))
-        result.update(budget=WATCH_BUDGET, net_price=net, list_price=listing["price"], list_city=listing["city"], depth_known=bool(asks), sales_source=sales_source,
+        result.update(sales=sales, share_from_hours=bool(levels), budget=WATCH_BUDGET, net_price=net, list_price=listing["price"], list_city=listing["city"], depth_known=bool(asks), sales_source=sales_source,
                       best_roi=net / carried(rows[0]) - 1, average=average, per_day=per_day, sell_order_share=PLAN_INSTANT_SHARE if share is None else share, cycle_share=cfg["cycle_share"], my_per_day=my_per_day, days=days, fit=fit,
                       average_roi=(average * keep * result["units"] - result["invested"]) / result["invested"]
                       if average and average < listing["price"] and result["invested"] else None,
@@ -2745,11 +2803,18 @@ class Store:
                 p.update(buy=buy, buy_seen=utc(r.get("buy_price_max_date")), buy_quality=r.get("quality"))
         week = (self.clock() - timedelta(days=7)).replace(tzinfo=None).isoformat()
         # Daily trade history: the chosen quality when it has any, otherwise every quality together.
-        history = defaultdict(lambda: defaultdict(list))
+        history, whole = defaultdict(lambda: defaultdict(list)), defaultdict(lambda: defaultdict(list))
         for r in (public or {}).get("history", []):
             c = by_name.get(r.get("location"))
             if c:
                 history[c][r.get("quality")].extend(d for d in r.get("data", []) if d.get("timestamp", "") >= week)
+                whole[c][r.get("quality")].extend(r.get("data", []))
+        # All the API holds, about 30 days.
+        for c, by_quality in whole.items():
+            days = by_quality.get(quality) or [d for ds in by_quality.values() for d in ds]
+            units = sum(d["item_count"] for d in days)
+            if units:
+                rows[c]["month"] = {"units": units, "days": len({d["timestamp"] for d in days}), "average": sum(d["avg_price"] * d["item_count"] for d in days) / units}
         for c, by_quality in history.items():
             days = by_quality.get(quality) or [d for ds in by_quality.values() for d in ds]
             if not days:
@@ -2760,7 +2825,7 @@ class Store:
                 merged[d["timestamp"]][1] += d["avg_price"] * d["item_count"]
             count, silver = sum(v[0] for v in merged.values()), sum(v[1] for v in merged.values())
             last = max(merged)
-            rows[c]["history"] = {"average": silver / count if count else None, "per_day": count / len(merged),
+            rows[c]["history"] = {"average": silver / count if count else None, "per_day": count / len(merged), "week_units": count, "week_days": len(merged),
                                   "last": merged[last][1] / merged[last][0] if merged[last][0] else None,
                                   "last_count": merged[last][0], "last_day": utc(last), "all_qualities": bool(quality) and not by_quality.get(quality)}
         lookup.catalog.ensure(self.root)

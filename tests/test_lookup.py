@@ -234,11 +234,97 @@ class WatchTests(unittest.TestCase):
         self.now = datetime(2026, 11, 2, 12, tzinfo=UTC)
         self.store = Store(self.root, clock=lambda: self.now)
         lookup.catalog.items = [{"id": "T7_RELIC", "ko": "그랜드 마스터의 유물", "en": "Grandmaster's Relic"}]
+        self.hourly([])
 
     def tearDown(self):
         self.store.db.close()
         lookup.public.cache.clear()
         self.tmp.cleanup()
+
+    def hourly(self, spans, location="Lymhurst"):
+        """spans: (hours, units, average), newest last, the newest hour ending an hour ago."""
+        count = sum(s[0] for s in spans)
+        data = [{"item_count": units, "avg_price": price} for hours, units, price in spans for _ in range(hours)]
+        for i, d in enumerate(data):
+            d["timestamp"] = (self.now - timedelta(hours=count - i)).replace(tzinfo=None).isoformat()
+        lookup.public.cache["hours:T7_RELIC"] = {"fetched": time.time(), "error": "", "prices": [], "history": [{"location": location, "quality": 1, "data": data}]}
+
+    def test_forecast_sells_only_the_part_of_sales_that_reached_the_price(self):
+        # Lymhurst lists at 10,000 in the case below; 3 of 30 hours of equal sales averaged that or more.
+        self.hourly([(14, 100, 8_000), (13, 100, 9_000), (3, 100, 10_100)])
+        f = self.forecast_case()
+        self.assertTrue(f["share_from_hours"])
+        self.assertAlmostEqual(f["sell_order_share"], 0.1)
+        self.assertAlmostEqual(f["my_per_day"], 100 * 0.1 * 0.2)
+        self.assertAlmostEqual(f["days"], 6 / 2)
+        levels = f["sales"]["levels"]
+        self.assertEqual([l["price"] for l in levels], [10_000, 9_548, 9_096, 8_643])
+        self.assertEqual([l["hours"] for l in levels], [3, 3, 3, 16])
+        # 2 a day for 7 days at the top: 14 sell, more than the 6 worth buying.
+        self.assertEqual((levels[0]["sells"], levels[0]["units"], levels[0]["invested"]), (14, 6, 45_000))
+        # Lower down more sells, but only the 7,000 asks still leave a profit.
+        low = levels[3]
+        self.assertEqual((low["sells"], low["units"], low["invested"]), (74, 3, 21_000))
+        self.assertAlmostEqual(low["profit"], 3 * 8_643 * 0.895 - 21_000)
+
+    def test_forecast_says_when_no_hour_reached_the_price(self):
+        self.hourly([(30, 100, 8_000)])
+        f = self.forecast_case()
+        self.assertTrue(f["share_from_hours"])
+        self.assertEqual((f["sell_order_share"], f["my_per_day"], f["days"]), (0, 0, None))
+
+    def test_too_few_hours_keep_the_general_share(self):
+        self.hourly([(23, 100, 8_000)])
+        f = self.forecast_case()
+        self.assertFalse(f["share_from_hours"])
+        self.assertEqual(f["sell_order_share"], market.PLAN_INSTANT_SHARE)
+        self.assertEqual(f["sales"]["levels"], [])
+        self.assertEqual(f["sales"]["hours_seen"], 23)
+
+    def test_this_pc_fills_hours_the_public_api_missed_and_gives_way_elsewhere(self):
+        self.hourly([(23, 100, 8_000)])
+        stamp = lambda hours: (self.now - timedelta(hours=hours)).isoformat()
+        with self.store.db:
+            self.store.db.execute("INSERT INTO history VALUES('T7_RELIC','1002',1,?,?,?,?)", (stamp(50), 40, 40 * 10_500, stamp(1)))
+            # The public API has this hour already.
+            self.store.db.execute("INSERT INTO history VALUES('T7_RELIC','1002',1,?,?,?,?)", (stamp(1), 999, 999 * 10_500, stamp(1)))
+            # Six-hour buckets and other cities are not hourly sales here.
+            self.store.db.execute("INSERT INTO history VALUES('T7_RELIC','1002',6,?,?,?,?)", (stamp(60), 999, 999 * 10_500, stamp(1)))
+            self.store.db.execute("INSERT INTO history VALUES('T7_RELIC','3008',1,?,?,?,?)", (stamp(70), 999, 999 * 10_500, stamp(1)))
+        f = self.forecast_case()
+        self.assertEqual(f["sales"]["hours_seen"], 24)
+        self.assertAlmostEqual(f["sell_order_share"], 40 / (23 * 100 + 40))
+
+    def test_sales_give_the_week_the_month_and_the_hours_of_the_day(self):
+        self.store.cfg["timezone"] = "Asia/Seoul"
+        self.hourly([(1, 50, 9_000)])
+        f = self.forecast_case(per_day=100)
+        sales = f["sales"]
+        self.assertEqual((sales["week_units"], sales["week_days"], sales["per_hour"]), (700, 7, 50))
+        # Sold from 10:00 to 11:00 UTC, which is 19:00 to 20:00 in Seoul.
+        self.assertEqual(sales["by_hour"][19], 50)
+        self.assertEqual(sum(v is not None for v in sales["by_hour"]), 1)
+        old = {"item_count": 300, "avg_price": 6_000, "timestamp": (self.now - timedelta(days=20)).replace(tzinfo=None).isoformat()}
+        lookup.public.cache["T7_RELIC"]["history"][0]["data"].append(old)
+        month = self.store.watches()["watches"][0]["forecast"]["sales"]["month"]
+        self.assertEqual((month["units"], month["days"]), (1_000, 8))
+        self.assertAlmostEqual(month["average"], (700 * 9_000 + 300 * 6_000) / 1_000)
+
+    def test_hourly_sales_survive_a_refused_request(self):
+        lookup.public.cache.pop("hours:T7_RELIC")
+        answer = [{"location": "Lymhurst", "quality": 1, "data": [{"item_count": 5, "avg_price": 100, "timestamp": "2026-11-02T10:00:00"}]}]
+        with patch.object(lookup, "fetch_json", return_value=answer) as fetched:
+            lookup.public.directory = self.root
+            lookup.public.fetch_hours("hours:T7_RELIC", "T7_RELIC", ["Lymhurst"])
+        self.assertIn("time-scale=1&", fetched.call_args[0][0])
+        with patch.object(lookup, "fetch_json", side_effect=OSError("429")):
+            lookup.public.fetch_hours("hours:T7_RELIC", "T7_RELIC", ["Lymhurst"])
+        hit = lookup.public.cache["hours:T7_RELIC"]
+        self.assertEqual((hit["history"], hit["error"]), (answer, "429"))
+        # The saved answer comes back after a restart.
+        lookup.public.cache.clear()
+        with lookup.public.lock:
+            self.assertEqual(lookup.public.recall("hours:T7_RELIC", self.root)["history"], answer)
 
     def order(self, oid, price, loc, side="offer", minutes=5):
         return {"Id": oid, "ItemTypeId": "T7_RELIC", "LocationId": loc, "QualityLevel": 1, "EnchantmentLevel": 0,

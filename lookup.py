@@ -34,6 +34,7 @@ KEEP = timedelta(hours=24)
 # About 200 bytes an order on disk, so the cap keeps the file near 200 MB.
 MAX_ROWS = 1_000_000
 PUBLIC_TTL = 300
+HOURS_TTL = 1800
 PUBLIC_KEEP = 30 * 24 * 3600
 # Someone opening a market sends its orders from the best price on, in messages seconds apart: one scan.
 SCAN_GAP = 60
@@ -435,6 +436,26 @@ class PublicPrices:
                 self.running.add(key)
                 threading.Thread(target=self.fetch_family, args=(key, items, city_names), daemon=True).start()
         return hit, key in self.running
+
+    def get_hours(self, item, city_names, directory=None):
+        """Hourly sales of about the last week, kept apart from get(): larger, and slower to change."""
+        key = "hours:" + item
+        with self.lock:
+            hit = self.recall(key, directory)
+            fresh = hit and time.time() - hit["fetched"] < (PUBLIC_TTL if hit["error"] else HOURS_TTL)
+            if not fresh and key not in self.running:
+                self.running.add(key)
+                threading.Thread(target=self.fetch_hours, args=(key, item, city_names), daemon=True).start()
+        return hit
+
+    def fetch_hours(self, key, item, city_names):
+        where = urllib.parse.quote(",".join(city_names))
+        result = {"fetched": time.time(), "prices": [], "history": [], "error": ""}
+        try:
+            result["history"] = fetch_json(f"{API}/history/{item}.json?time-scale=1&locations={where}")
+        except Exception as exc:
+            result["error"] = str(exc)[:160]
+        self.finish(key, result)
 
     def fetch_family(self, key, items, city_names):
         where = urllib.parse.quote(",".join(city_names))
