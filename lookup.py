@@ -3,7 +3,8 @@
 Orders come from two places, both read-only: the AODP public live stream (orders every data-client
 user uploads, received over NATS) and markets this PC's collector opens. Nothing personal is sent
 anywhere: the stream login is AODP's published public account, and the public price API is only
-asked for item ids. Orders live in their own database (data/lookup.sqlite3) and are kept a day.
+asked for item ids. Orders live in their own database (data/lookup.sqlite3) and are kept a day, beside
+the public API's last answer per item, so a restart or a refused request loses nothing.
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import defaultdict
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -31,6 +34,10 @@ KEEP = timedelta(hours=24)
 # About 200 bytes an order on disk, so the cap keeps the file near 200 MB.
 MAX_ROWS = 1_000_000
 PUBLIC_TTL = 300
+PUBLIC_KEEP = 30 * 24 * 3600
+# Someone opening a market sends its orders from the best price on, in messages seconds apart: one scan.
+SCAN_GAP = 60
+SCAN_MIN_ROWS = 5
 QUALITIES = (1, 2, 3, 4, 5)
 ANY_QUALITY = 0
 # The tier word in front of each item name (ao-bin-dumps KO-KR and EN-US), so a family reads as one item.
@@ -51,6 +58,7 @@ def connect(directory, timeout=10):
     CREATE INDEX IF NOT EXISTS orders_item ON orders(item, quality);
     CREATE INDEX IF NOT EXISTS orders_seen ON orders(seen);
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS public_saved(key TEXT PRIMARY KEY, fetched REAL NOT NULL, data TEXT NOT NULL);
     """)
     return db
 
@@ -86,6 +94,43 @@ def purge(db, now=None):
         extra = db.execute("SELECT COUNT(*) FROM orders").fetchone()[0] - MAX_ROWS
         if extra > 0:
             db.execute("DELETE FROM orders WHERE id IN (SELECT id FROM orders ORDER BY seen LIMIT ?)", (extra,))
+        db.execute("DELETE FROM public_saved WHERE fetched<?", (time.time() - PUBLIC_KEEP,))
+
+
+def current_orders(rows):
+    """Keep only orders that may still exist. A scan seen again re-stamps every order it lists, so an older row
+    inside the newest scan's prices, or better than its best price, was bought or cancelled. Older rows beyond the
+    scan's far end are simply out of its reach, and a few lone rows prove nothing, so those stay. Each kept row
+    carries when its market's newest scan began (scan), or None."""
+    groups = defaultdict(list)
+    for row in rows:
+        groups[row["item"], row["location"], row["quality"], row["side"]].append(row)
+    kept = []
+    for (_, _, _, side), group in groups.items():
+        group.sort(key=lambda r: datetime.fromisoformat(r["seen"]))
+        spans = [[group[0]]]
+        for before, row in zip(group, group[1:]):
+            gap = (datetime.fromisoformat(row["seen"]) - datetime.fromisoformat(before["seen"])).total_seconds()
+            if gap > SCAN_GAP:
+                spans.append([])
+            spans[-1].append(row)
+        scan = next((s for s in reversed(spans) if len(s) >= SCAN_MIN_ROWS), None)
+        began = scan[0]["seen"] if scan else None
+        low, high = (min(r["price"] for r in scan), max(r["price"] for r in scan)) if scan else (0, 0)
+        for row in group:
+            row["scan"] = began
+            if not scan or datetime.fromisoformat(row["seen"]) >= datetime.fromisoformat(began) or (row["price"] > high if side == "sell" else row["price"] < low):
+                kept.append(row)
+    return kept
+
+
+def heard_orders(db, items, quality, side, now):
+    """The orders of these items heard in the last day that may still exist. side None takes both."""
+    marks = ",".join("?" * len(items))
+    where = f"item IN ({marks}) AND seen>=? AND amount>0" + (" AND quality=?" if quality else "") + (" AND side=?" if side else "")
+    args = [*items, (now - KEEP).isoformat(), *([quality] if quality else []), *([side] if side else [])]
+    names = ("item", "location", "quality", "side", "price", "amount", "seen", "source")
+    return current_orders([dict(zip(names, r)) for r in db.execute(f"SELECT {', '.join(names)} FROM orders WHERE {where}", args)])
 
 
 def markets(db, item, quality, city_of, now=None):
@@ -93,14 +138,13 @@ def markets(db, item, quality, city_of, now=None):
     quality 0 (ANY_QUALITY) takes every quality and says which one the best price is."""
     now = now or utcnow()
     out = {}
-    where, args = ("AND quality=?", (quality,)) if quality else ("", ())
-    rows = db.execute(f"SELECT location, side, price, amount, seen, source, quality FROM orders WHERE item=? {where} AND seen>=? AND amount>0",
-                      (item, *args, (now - KEEP).isoformat())).fetchall()
-    for loc, side, price, amount, seen, source, q in rows:
-        city = city_of(loc)
+    for row in heard_orders(db, [item], quality, None, now):
+        side, price, amount, seen, source, q = row["side"], row["price"], row["amount"], row["seen"], row["source"], row["quality"]
+        city = city_of(row["location"])
         if city is None:
             continue
-        m = out.setdefault(city, {}).setdefault(side, {"levels": {}, "qualities": {}, "seen": "", "units": 0, "mine": False})
+        m = out.setdefault(city, {}).setdefault(side, {"levels": {}, "qualities": {}, "seen": "", "units": 0, "mine": False, "scan": None})
+        m["scan"] = max(m["scan"] or "", row["scan"] or "") or None
         m["levels"][price] = m["levels"].get(price, 0) + amount
         m["qualities"].setdefault(price, set()).add(q)
         m["units"] += amount
@@ -115,22 +159,17 @@ def markets(db, item, quality, city_of, now=None):
     return out
 
 def sell_levels(db, item, quality, city_of, now=None):
-    """Every sell order heard in the last day over all cities, cheapest first."""
-    now = now or utcnow()
-    where, args = ("AND quality=?", (quality,)) if quality else ("", ())
-    rows = db.execute(f"SELECT location, price, amount, seen FROM orders WHERE item=? {where} AND side='sell' AND seen>=? AND amount>0 ORDER BY price",
-                      (item, *args, (now - KEEP).isoformat())).fetchall()
-    return [{"city": city_of(loc), "price": price, "amount": amount, "seen": seen} for loc, price, amount, seen in rows if city_of(loc) is not None]
+    """Every sell order heard in the last day that may still exist, over all cities, cheapest first."""
+    rows = heard_orders(db, [item], quality, "sell", now or utcnow())
+    return sorted(({**r, "city": city_of(r["location"])} for r in rows if city_of(r["location"]) is not None), key=lambda r: r["price"])
 
 
 def cheapest_sells(db, items, city_of, now=None):
     """Per item id and city: the cheapest sell order heard in the last day (any quality)."""
-    now = now or utcnow()
     out = {}
-    marks = ",".join("?" * len(items))
-    for item, loc, price, seen in db.execute(f"SELECT item, location, price, seen FROM orders WHERE side='sell' AND amount>0 AND seen>=? AND item IN ({marks})",
-                                             ((now - KEEP).isoformat(), *items)):
-        city = city_of(loc)
+    for row in heard_orders(db, items, ANY_QUALITY, "sell", now or utcnow()):
+        item, price, seen = row["item"], row["price"], row["seen"]
+        city = city_of(row["location"])
         if city is None:
             continue
         best = out.setdefault(item, {}).get(city)
@@ -341,26 +380,56 @@ catalog = Catalog()
 
 
 class PublicPrices:
-    """Public price API answers for every quality, fetched in the background and kept five minutes per item."""
+    """Public price API answers for every quality, fetched in the background, asked again after five minutes.
+    The last good answer is saved, so it is there at once after a restart and while the API refuses."""
 
     def __init__(self):
-        self.cache, self.running, self.lock = {}, set(), threading.Lock()
+        self.cache, self.running, self.lock, self.directory = {}, set(), threading.Lock(), None
 
-    def get(self, item, city_names):
+    def recall(self, key, directory):
+        """What we know for key, from memory or else from disk. Call holding the lock."""
+        self.directory = directory or self.directory
+        if key not in self.cache and self.directory:
+            try:
+                with closing(connect(self.directory, timeout=2)) as db:
+                    row = db.execute("SELECT fetched, data FROM public_saved WHERE key=?", (key,)).fetchone()
+                if row:
+                    self.cache[key] = {**json.loads(row[1]), "fetched": row[0], "error": ""}
+            except sqlite3.Error:
+                logging.exception("Reading the saved public answer failed")
+        return self.cache.get(key)
+
+    def finish(self, key, result):
+        """Store an answer. A failed request must not blank what we already know."""
+        with self.lock:
+            old = self.cache.get(key)
+            if result["error"] and old:
+                result.update(prices=result["prices"] or old["prices"], history=result["history"] or old.get("history", []))
+            self.cache[key] = result
+            self.running.discard(key)
+        if not result["error"] and self.directory:
+            try:
+                with closing(connect(self.directory, timeout=2)) as db, db:
+                    db.execute("INSERT INTO public_saved VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET fetched=excluded.fetched, data=excluded.data",
+                               (key, result["fetched"], json.dumps({"prices": result["prices"], "history": result["history"]})))
+            except sqlite3.Error:
+                logging.exception("Saving the public answer failed")
+
+    def get(self, item, city_names, directory=None):
         """Every quality comes back at once; the caller picks one or the best of all."""
         with self.lock:
-            hit = self.cache.get(item)
+            hit = self.recall(item, directory)
             fresh = hit and time.time() - hit["fetched"] < PUBLIC_TTL
             if not fresh and item not in self.running:
                 self.running.add(item)
                 threading.Thread(target=self.fetch, args=(item, city_names), daemon=True).start()
         return hit, item in self.running
 
-    def get_family(self, family, items, city_names):
-        """Current prices of every tier and enchant of one family, in as few requests as the URL length allows."""
+    def get_family(self, family, items, city_names, directory=None):
+        """Current prices and daily sales of every tier and enchant of one family, in as few requests as the URL length allows."""
         key = "family:" + family
         with self.lock:
-            hit = self.cache.get(key)
+            hit = self.recall(key, directory)
             fresh = hit and time.time() - hit["fetched"] < PUBLIC_TTL
             if not fresh and key not in self.running:
                 self.running.add(key)
@@ -369,20 +438,19 @@ class PublicPrices:
 
     def fetch_family(self, key, items, city_names):
         where = urllib.parse.quote(",".join(city_names))
-        result = {"fetched": time.time(), "prices": [], "error": ""}
+        result = {"fetched": time.time(), "prices": [], "history": [], "error": ""}
         try:
             batch = []
             for item in items + [None]:
                 if batch and (item is None or len(",".join(batch + [item])) > 3000):
                     result["prices"].extend(fetch_json(f"{API}/prices/{','.join(batch)}.json?locations={where}"))
+                    result["history"].extend(fetch_json(f"{API}/history/{','.join(batch)}.json?time-scale=24&locations={where}"))
                     batch = []
                 if item:
                     batch.append(item)
         except Exception as exc:
             result["error"] = str(exc)[:160]
-        with self.lock:
-            self.cache[key] = result
-            self.running.discard(key)
+        self.finish(key, result)
 
     def fetch(self, item, city_names):
         where = urllib.parse.quote(",".join(city_names))
@@ -392,13 +460,7 @@ class PublicPrices:
             result["history"] = fetch_json(f"{API}/history/{item}.json?time-scale=24&locations={where}")
         except Exception as exc:
             result["error"] = str(exc)[:160]
-        with self.lock:
-            # A failed request (the API limits how often it answers) must not blank what we already know.
-            old = self.cache.get(item)
-            if result["error"] and old:
-                result.update(prices=result["prices"] or old["prices"], history=result["history"] or old["history"])
-            self.cache[item] = result
-            self.running.discard(item)
+        self.finish(item, result)
 
 public = PublicPrices()
 

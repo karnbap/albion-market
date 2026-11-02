@@ -256,8 +256,20 @@ class WatchTests(unittest.TestCase):
         self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
         return self.store.watches()["watches"][0]["forecast"]
 
+    def test_watch_shows_the_average_of_buying_a_sum_and_where(self):
+        self.forecast_case()
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(9, 100_000_000, "4002")], "stream", self.now.isoformat())
+        with patch.object(market, "WATCH_DEPTHS", (15_000, 10_000_000)):
+            depth = self.store.watches()["watches"][0]["depth"]
+        self.assertEqual((depth[0]["units"], depth[0]["average"], depth[0]["cities"], depth[0]["short"]), (2, 7_000, {"3008": 2}, False))
+        # Only 12 units were heard, and the absurd order is not one of them.
+        self.assertEqual((depth[1]["units"], depth[1]["cities"], depth[1]["short"]), (12, {"3008": 9, "1002": 3}, True))
+        self.assertAlmostEqual(depth[1]["average"], 104_700 / 12)
+
     def test_forecast_buys_only_what_still_leaves_a_profit(self):
         f = self.forecast_case()
+        self.assertEqual(f["cities"], {"3008": 6})
         # Lists at 10,000 and keeps 8,950 after fees: the 9,900 ask and dearer are not bought.
         self.assertEqual((round(f["net_price"]), f["units"], f["invested"]), (8_950, 6, 45_000))
         self.assertAlmostEqual(f["profit"], 8_700)
@@ -289,6 +301,101 @@ class WatchTests(unittest.TestCase):
         f = self.store.watches()["watches"][0]["forecast"]
         self.assertEqual((f["units"], f["invested"], f["roi"]), (0, 0, None))
         self.assertLess(f["best_roi"], 0)
+
+    def scan(self, first_id, prices, minutes_ago, loc="1002", side="offer"):
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(first_id + i, p, loc, side) for i, p in enumerate(prices)], "stream", (self.now - timedelta(minutes=minutes_ago)).isoformat())
+
+    def test_a_newer_scan_removes_orders_that_are_gone(self):
+        city = lambda loc: location(loc)
+        self.scan(1, [6_000, 7_000, 7_400, 9_000, 12_000], 120)
+        self.scan(11, [7_300, 7_350, 7_500, 7_600, 8_000], 5)
+        with closing(lookup.connect(self.root)) as db:
+            prices = [r["price"] for r in lookup.sell_levels(db, "T7_RELIC", 0, city, self.now)]
+            book = lookup.markets(db, "T7_RELIC", 0, city, self.now)["1002"]["sell"]
+        # 6,000 and 7,000 sit under the new best price and 7,400 inside the scan, not listed again: all gone.
+        # 9,000 and 12,000 are beyond where the new scan stopped, so they may still be there.
+        self.assertEqual(prices, [7_300, 7_350, 7_500, 7_600, 8_000, 9_000, 12_000])
+        self.assertEqual(book["price"], 7_300)
+        self.assertTrue(book["scan"])
+        # One lone order heard later proves nothing about the others.
+        self.scan(21, [9_500], 1)
+        with closing(lookup.connect(self.root)) as db:
+            self.assertEqual(lookup.markets(db, "T7_RELIC", 0, city, self.now)["1002"]["sell"]["price"], 7_300)
+
+    def test_a_newer_scan_removes_buy_orders_from_the_top(self):
+        self.scan(1, [9_000, 8_500, 8_000, 7_500, 7_000], 120, side="request")
+        self.scan(11, [8_200, 8_100, 7_900, 7_800, 7_700], 5, side="request")
+        with closing(lookup.connect(self.root)) as db:
+            book = lookup.markets(db, "T7_RELIC", 0, location, self.now)["1002"]["buy"]
+        self.assertEqual(book["price"], 8_200)
+        # The five of the new scan, plus 7,500 and 7,000 beyond where it stopped: 7 orders of 3.
+        self.assertEqual(book["units"], 21)
+
+    def test_watch_list_price_trusts_a_scan_newer_than_the_public_price(self):
+        self.scan(1, [9_100, 9_200, 9_300, 9_400, 9_500], 5)
+        lookup.public.cache["T7_RELIC"] = {"fetched": time.time(), "error": "", "history": [], "prices": [
+            {"city": "Lymhurst", "quality": 1, "sell_price_min": 8_800, "sell_price_min_date": "2026-11-02T07:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"}]}
+        self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
+        w = self.store.watches()["watches"][0]
+        self.assertEqual(w["list"]["price"], 9_100)
+
+    def test_forecast_drops_heard_orders_a_newer_public_price_has_passed(self):
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(1, 6_000, "3008"), self.order(2, 7_000, "3008")], "stream", (self.now - timedelta(hours=5)).isoformat())
+        lookup.public.cache["T7_RELIC"] = {"fetched": time.time(), "error": "", "history": [], "prices": [
+            {"city": "Martlock", "quality": 1, "sell_price_min": 6_500, "sell_price_min_date": "2026-11-02T11:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"},
+            {"city": "Lymhurst", "quality": 1, "sell_price_min": 10_000, "sell_price_min_date": "2026-11-02T11:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"}]}
+        self.store.cfg.update(sales_tax=0.08, setup_fee=0.025, transport_per_unit=0)
+        self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
+        f = self.store.watches()["watches"][0]["forecast"]
+        self.assertEqual((f["units"], f["invested"]), (3, 21_000))
+
+    def test_forecast_reads_this_pc_history_when_newer(self):
+        self.forecast_case()
+        for hours in range(24, 0, -1):
+            self.store.db.execute("INSERT INTO history VALUES('T7_RELIC','1002',1,?,10,95000,?)", ((self.now - timedelta(hours=hours)).isoformat(), self.now.isoformat()))
+        f = self.store.watches()["watches"][0]["forecast"]
+        self.assertEqual((f["sales_source"], round(f["per_day"]), round(f["average"])), ("me", 240, 9_500))
+
+    def test_public_answers_survive_a_restart(self):
+        answer = [{"city": "Lymhurst", "quality": 1, "sell_price_min": 9_000}]
+        lookup.public.directory = self.root
+        with patch.object(lookup, "fetch_json", return_value=answer):
+            lookup.public.fetch("T7_RELIC", ["Lymhurst"])
+        lookup.public.cache.clear()
+        with patch.object(lookup.public, "fetch"):
+            hit, _ = lookup.public.get("T7_RELIC", ["Lymhurst"], self.root)
+        self.assertEqual(hit["prices"], answer)
+        lookup.public.running.clear()
+        # A refused request is not saved over the good answer.
+        with patch.object(lookup, "fetch_json", side_effect=OSError("429")):
+            lookup.public.fetch("T7_RELIC", ["Lymhurst"])
+        lookup.public.cache.clear()
+        with patch.object(lookup.public, "fetch"):
+            hit, _ = lookup.public.get("T7_RELIC", ["Lymhurst"], self.root)
+        self.assertEqual(hit["prices"], answer)
+        lookup.public.running.clear()
+        lookup.public.directory = None
+
+    def test_family_grid_gives_each_combination_its_average_price(self):
+        lookup.catalog.items = [{"id": "T4_MAIN_TEST", "ko": "숙련자의 시험", "en": "Adept's Test"}, {"id": "T4_MAIN_TEST@1", "ko": "숙련자의 시험", "en": "Adept's Test"}]
+        day = (self.now - timedelta(days=1)).replace(tzinfo=None).isoformat()
+        old = (self.now - timedelta(days=20)).replace(tzinfo=None).isoformat()
+        family = lookup.catalog.family_of("T4_MAIN_TEST")[0]
+        lookup.public.cache["family:" + family] = {"fetched": time.time(), "error": "", "prices": [], "history": [
+            {"item_id": "T4_MAIN_TEST", "location": "Lymhurst", "quality": 1, "data": [{"item_count": 1, "avg_price": 100, "timestamp": day}, {"item_count": 50, "avg_price": 999, "timestamp": old}]},
+            {"item_id": "T4_MAIN_TEST", "location": "Martlock", "quality": 2, "data": [{"item_count": 3, "avg_price": 200, "timestamp": day}]},
+            {"item_id": "T4_MAIN_TEST", "location": "Caerleon", "quality": 1, "data": [{"item_count": 9, "avg_price": 9_000, "timestamp": day}]}]}
+        combos = {c["item"]: c for c in self.store.lookup_family(family)["combos"]}
+        self.assertEqual(combos["T4_MAIN_TEST"]["average"], 175)
+        self.assertEqual(combos["T4_MAIN_TEST"]["average_days"], 7)
+        self.assertIsNone(combos["T4_MAIN_TEST@1"]["average"])
+        # With no sale in the last week, the older days of the history stand in and say so.
+        lookup.public.cache["family:" + family]["history"][0]["data"].pop(0)
+        lookup.public.cache["family:" + family]["history"].pop(1)
+        combo = next(c for c in self.store.lookup_family(family)["combos"] if c["item"] == "T4_MAIN_TEST")
+        self.assertEqual((combo["average"], combo["average_days"]), (999, 30))
 
     def test_failed_public_fetch_keeps_what_we_knew(self):
         lookup.public.cache["T7_RELIC"] = {"fetched": 0, "error": "", "prices": [{"city": "Lymhurst"}], "history": [{"location": "Lymhurst"}]}
