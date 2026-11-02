@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261102.6"
+BUILD = "20261102.7"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -2515,14 +2515,22 @@ class Store:
                 raise ValueError("Unknown action")
 
     def watches(self):
-        """Every watched item: the cheapest sell and dearest buy over the trade cities, newest source per city
-        (this PC, the live stream or the public API, values within a day), and whether an alert price is reached.
-        An alert counts as live only on a value seen within the last hour."""
+        """Every watched item over the trade cities, newest source per city (this PC, the live stream or the
+        public API, values within a day): the cheapest sell, the dearest buy, and list: the city whose cheapest
+        sell is highest, where a sell order can be listed for the most. The buy alert reads the cheapest sell;
+        the sell alert reads list. An alert counts as live only on a value seen within the last hour.
+
+        list guards against false alerts. The stream can carry one expensive order of a city without its cheaper
+        ones, so a lower public price from the last day wins for that city; a city's floor that is my own open
+        order says nothing about the market and is skipped; a floor over twice the middle city's is an outlier."""
         now = self.clock()
         out = []
         for w in self.db.execute("SELECT id, item, quality, buy_below, sell_above FROM watches ORDER BY id").fetchall():
             view = self.lookup_item(w["item"], w["quality"])
             best = {"sell": None, "buy": None}
+            floors, skipped_own = [], 0
+            mine = {(r["city"], round(r["price"])) for r in self.db.execute(
+                "SELECT city, price FROM my_orders WHERE item=? AND side='sell' AND closed IS NULL AND COALESCE(remaining, amount)>0", (w["item"],))}
             for row in view["cities"]:
                 for side in ("sell", "buy"):
                     local, pub = row["local"].get(side), row["public"] or {}
@@ -2541,12 +2549,28 @@ class Store:
                     b = best[side]
                     if b is None or (q["price"] < b["price"] if side == "sell" else q["price"] > b["price"]):
                         best[side] = q
+                    if side != "sell":
+                        continue
+                    floor = q
+                    if q["source"] != "public" and pub.get("sell") and pub["sell"] < q["price"]:
+                        pub_age = (now - parse_time(seen_pub)).total_seconds() / 60
+                        if pub_age <= 24 * 60:
+                            floor = {"price": pub["sell"], "amount": None, "seen": seen_pub, "quality": pub.get("sell_quality"),
+                                     "source": "public", "city": row["city"], "age_minutes": round(pub_age)}
+                    if (row["city"], round(floor["price"])) in mine:
+                        skipped_own += 1
+                    else:
+                        floors.append(floor)
+            prices = sorted(f["price"] for f in floors)
+            usable = [f for f in floors if f["price"] <= prices[(len(prices) - 1) // 2] * 2]
+            listing = max(usable, key=lambda f: f["price"]) if usable else None
             sell, buy = best["sell"], best["buy"]
             out.append({"id": w["id"], "item": w["item"], "quality": w["quality"], "name": view["name"],
-                        "buy_below": w["buy_below"], "sell_above": w["sell_above"], "sell": sell, "buy": buy,
+                        "buy_below": w["buy_below"], "sell_above": w["sell_above"], "sell": sell, "buy": buy, "list": listing,
+                        "list_skipped": {"own": skipped_own, "outlier": len(floors) - len(usable)},
                         "buy_hit": bool(sell and w["buy_below"] and sell["price"] <= w["buy_below"]),
-                        "sell_hit": bool(buy and w["sell_above"] and buy["price"] >= w["sell_above"]),
-                        "buy_live": bool(sell and sell["age_minutes"] <= 60), "sell_live": bool(buy and buy["age_minutes"] <= 60),
+                        "sell_hit": bool(listing and w["sell_above"] and listing["price"] >= w["sell_above"]),
+                        "buy_live": bool(sell and sell["age_minutes"] <= 60), "sell_live": bool(listing and listing["age_minutes"] <= 60),
                         "public_loading": view["public_loading"]})
         try:
             with closing(lookup.connect(self.root, timeout=2)) as ldb:
