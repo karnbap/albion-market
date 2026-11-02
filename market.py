@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261102.4"
+BUILD = "20261102.5"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -329,6 +329,8 @@ class Store:
           price REAL NOT NULL, amount INTEGER NOT NULL, bought TEXT NOT NULL, created TEXT NOT NULL, removed TEXT);
         CREATE TABLE IF NOT EXISTS bank_stock(item TEXT NOT NULL, city TEXT NOT NULL, amount INTEGER NOT NULL, updated TEXT NOT NULL,
           PRIMARY KEY(item,city));
+        CREATE TABLE IF NOT EXISTS watches(id INTEGER PRIMARY KEY, item TEXT NOT NULL, quality INTEGER NOT NULL,
+          buy_below INTEGER, sell_above INTEGER, created TEXT NOT NULL, UNIQUE(item,quality));
         CREATE TABLE IF NOT EXISTS finished_lists(location TEXT PRIMARY KEY, city TEXT NOT NULL, received TEXT NOT NULL, entries TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS last_results(kind TEXT PRIMARY KEY, created TEXT NOT NULL, seen TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bank_auto(location TEXT PRIMARY KEY, city TEXT, items TEXT NOT NULL, seen TEXT NOT NULL);
@@ -2483,6 +2485,76 @@ class Store:
         c = lookup.catalog
         return {"items": c.search(query[:60]), "loading": c.loading, "error": c.error, "ready": c.items is not None}
 
+    def set_watch(self, values):
+        """The price watch list: add an item (and quality), set its buy / sell alert prices, or remove it."""
+        action = values.get("action")
+        if action == "add":
+            item, quality = values.get("item"), values.get("quality", lookup.ANY_QUALITY)
+            if not isinstance(item, str) or not re.fullmatch(r"[A-Z0-9_]{2,80}(@[1-4])?", item) or quality not in (lookup.ANY_QUALITY, *lookup.QUALITIES):
+                raise ValueError("Unknown item")
+            with self.lock, self.db:
+                if self.db.execute("SELECT COUNT(*) FROM watches").fetchone()[0] >= 40:
+                    raise ValueError("감시 목록은 40개까지입니다")
+                self.db.execute("INSERT OR IGNORE INTO watches(item,quality,created) VALUES(?,?,?)", (item, quality, self.clock().isoformat()))
+            return
+        wid = values.get("id")
+        if isinstance(wid, bool) or not isinstance(wid, int):
+            raise ValueError("Unknown watch")
+        with self.lock, self.db:
+            if action == "remove":
+                self.db.execute("DELETE FROM watches WHERE id=?", (wid,))
+            elif action == "update":
+                prices = []
+                for key in ("buy_below", "sell_above"):
+                    v = values.get(key)
+                    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 10**10):
+                        raise ValueError("알림 가격은 1 이상의 정수로 적어 주세요")
+                    prices.append(v)
+                self.db.execute("UPDATE watches SET buy_below=?, sell_above=? WHERE id=?", (*prices, wid))
+            else:
+                raise ValueError("Unknown action")
+
+    def watches(self):
+        """Every watched item: the cheapest sell and dearest buy over the trade cities, newest source per city
+        (this PC, the live stream or the public API, values within a day), and whether an alert price is reached.
+        An alert counts as live only on a value seen within the last hour."""
+        now = self.clock()
+        out = []
+        for w in self.db.execute("SELECT id, item, quality, buy_below, sell_above FROM watches ORDER BY id").fetchall():
+            view = self.lookup_item(w["item"], w["quality"])
+            best = {"sell": None, "buy": None}
+            for row in view["cities"]:
+                for side in ("sell", "buy"):
+                    local, pub = row["local"].get(side), row["public"] or {}
+                    seen_pub = pub.get(side + "_seen")
+                    if local and (not seen_pub or local["seen"] >= seen_pub):
+                        q = {"price": local["price"], "amount": local["amount"], "seen": local["seen"], "quality": local.get("quality"),
+                             "source": "me" if local["mine"] else "stream"}
+                    elif pub.get(side):
+                        q = {"price": pub[side], "amount": None, "seen": seen_pub, "quality": pub.get(side + "_quality"), "source": "public"}
+                    else:
+                        continue
+                    age = (now - parse_time(q["seen"])).total_seconds() / 60
+                    if age > 24 * 60:
+                        continue
+                    q.update(city=row["city"], age_minutes=round(age))
+                    b = best[side]
+                    if b is None or (q["price"] < b["price"] if side == "sell" else q["price"] > b["price"]):
+                        best[side] = q
+            sell, buy = best["sell"], best["buy"]
+            out.append({"id": w["id"], "item": w["item"], "quality": w["quality"], "name": view["name"],
+                        "buy_below": w["buy_below"], "sell_above": w["sell_above"], "sell": sell, "buy": buy,
+                        "buy_hit": bool(sell and w["buy_below"] and sell["price"] <= w["buy_below"]),
+                        "sell_hit": bool(buy and w["sell_above"] and buy["price"] >= w["sell_above"]),
+                        "buy_live": bool(sell and sell["age_minutes"] <= 60), "sell_live": bool(buy and buy["age_minutes"] <= 60),
+                        "public_loading": view["public_loading"]})
+        try:
+            with closing(lookup.connect(self.root, timeout=2)) as ldb:
+                stream = lookup.get_meta(ldb)
+        except sqlite3.Error:
+            stream = {}
+        return {"watches": out, "stream": stream}
+
     def lookup_family(self, family):
         """Which tier and enchant combinations of a family have a sell order anywhere right now:
         per combination the cheapest price, its city and how many cities list it (values within 7 days)."""
@@ -2682,6 +2754,8 @@ def handler_class(store, token):
                 return self.respond({"app": "AlbionLocal", "ready": True, "auto_update": getattr(store, "auto_update", {"enabled": False}), "capture_verified": bool(store.db.execute("SELECT 1 FROM packets WHERE topic='marketorders.ingest' LIMIT 1").fetchone())})
             if parts.path == "/api/lookup/search":
                 return self.respond(store.lookup_search(parse_qs(parts.query).get("q", [""])[0]))
+            if parts.path == "/api/watches":
+                return self.respond(store.watches())
             if parts.path == "/api/lookup/family":
                 try:
                     return self.respond(store.lookup_family(parse_qs(parts.query).get("family", [""])[0]))
@@ -2754,6 +2828,9 @@ def handler_class(store, token):
                             result = {"removed": True}
                         else:
                             result = {"added": store.add_purchase(payload)}
+                    elif path == "/api/watches":
+                        store.set_watch(payload)
+                        result = store.watches()
                     elif path == "/api/bank":
                         store.set_bank(payload)
                         result = {"saved": True}
