@@ -102,6 +102,8 @@ BUYOUT_NOTES = ["본 매도 목록 범위 안에서만 계산", "조회 뒤 다�
 # The price watch's forecast: the money it imagines investing, and how long stock may wait to sell.
 WATCH_BUDGET = 10_000_000
 WATCH_SELL_DAYS = 7
+# The watch shows what buying this much silver's worth would average.
+WATCH_DEPTHS = (5_000_000, 10_000_000)
 
 
 def volume_risk(units, guide):
@@ -2519,6 +2521,22 @@ class Store:
             else:
                 raise ValueError("Unknown action")
 
+    def watch_depth(self, asks, ceiling):
+        """The average price of buying each WATCH_DEPTHS worth from the sell orders we heard, cheapest first over
+        all cities, and how many units from which city. Orders over ceiling are outliers and are not counted.
+        short: the orders we heard ran out before the money did."""
+        out = []
+        for budget in WATCH_DEPTHS:
+            units, spent, bought = 0, 0, defaultdict(int)
+            for row in asks:
+                room = min((budget - spent) // row["price"], row["amount"])
+                if room >= 1 and (ceiling is None or row["price"] <= ceiling):
+                    units, spent = units + room, spent + room * row["price"]
+                    bought[row["city"]] += room
+            if units:
+                out.append({"budget": budget, "units": units, "spent": spent, "average": spent / units, "cities": dict(bought), "short": spent < budget * 0.9})
+        return out
+
     def watch_forecast(self, view, asks, sell, listing):
         """What WATCH_BUDGET would make on an item: buy the sell orders we heard, cheapest first, while each still
         leaves a profit, and list them all in the list city after sales tax and setup fee. The cheapest price alone
@@ -2537,7 +2555,7 @@ class Store:
             return row["price"] + (cfg["transport_per_unit"] if row["city"] != listing["city"] else 0)
 
         def buy(limit):
-            units, spent, oldest, sources = 0, 0, None, defaultdict(int)
+            units, spent, oldest, sources, bought = 0, 0, None, defaultdict(int), defaultdict(int)
             for row in rows:
                 unit = carried(row)
                 if unit >= net:
@@ -2547,7 +2565,8 @@ class Store:
                     units, spent = units + room, spent + room * unit
                     oldest = min(oldest or row["seen"], row["seen"])
                     sources[row["source"]] += room
-            return {"units": units, "invested": spent, "profit": units * net - spent, "roi": (units * net - spent) / spent if spent else None, "oldest": oldest, "sources": dict(sources)}
+                    bought[row["city"]] += room
+            return {"units": units, "invested": spent, "profit": units * net - spent, "roi": (units * net - spent) / spent if spent else None, "oldest": oldest, "sources": dict(sources), "cities": dict(bought)}
 
         result = buy(WATCH_BUDGET)
         history = next((r["history"] for r in view["cities"] if r["city"] == listing["city"]), None) or {}
@@ -2635,6 +2654,7 @@ class Store:
                         "buy_hit": bool(sell and w["buy_below"] and sell["price"] <= w["buy_below"]),
                         "sell_hit": bool(listing and w["sell_above"] and listing["price"] >= w["sell_above"]),
                         "buy_live": bool(sell and sell["age_minutes"] <= 60), "sell_live": bool(listing and listing["age_minutes"] <= 60),
+                        "depth": self.watch_depth(asks, prices[(len(prices) - 1) // 2] * 2 if prices else None),
                         "forecast": self.watch_forecast(view, asks, sell, listing), "public_loading": view["public_loading"], "public_error": view["public_error"]})
         try:
             with closing(lookup.connect(self.root, timeout=2)) as ldb:

@@ -256,8 +256,20 @@ class WatchTests(unittest.TestCase):
         self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
         return self.store.watches()["watches"][0]["forecast"]
 
+    def test_watch_shows_the_average_of_buying_a_sum_and_where(self):
+        self.forecast_case()
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(9, 100_000_000, "4002")], "stream", self.now.isoformat())
+        with patch.object(market, "WATCH_DEPTHS", (15_000, 10_000_000)):
+            depth = self.store.watches()["watches"][0]["depth"]
+        self.assertEqual((depth[0]["units"], depth[0]["average"], depth[0]["cities"], depth[0]["short"]), (2, 7_000, {"3008": 2}, False))
+        # Only 12 units were heard, and the absurd order is not one of them.
+        self.assertEqual((depth[1]["units"], depth[1]["cities"], depth[1]["short"]), (12, {"3008": 9, "1002": 3}, True))
+        self.assertAlmostEqual(depth[1]["average"], 104_700 / 12)
+
     def test_forecast_buys_only_what_still_leaves_a_profit(self):
         f = self.forecast_case()
+        self.assertEqual(f["cities"], {"3008": 6})
         # Lists at 10,000 and keeps 8,950 after fees: the 9,900 ask and dearer are not bought.
         self.assertEqual((round(f["net_price"]), f["units"], f["invested"]), (8_950, 6, 45_000))
         self.assertAlmostEqual(f["profit"], 8_700)
