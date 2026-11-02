@@ -4,11 +4,13 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import lookup
+import market
 from market import Store, location
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -242,6 +244,59 @@ class WatchTests(unittest.TestCase):
         return {"Id": oid, "ItemTypeId": "T7_RELIC", "LocationId": loc, "QualityLevel": 1, "EnchantmentLevel": 0,
                 "UnitPriceSilver": price * 10000, "Amount": 3, "AuctionType": side,
                 "Expires": (self.now + timedelta(days=20)).replace(tzinfo=None).isoformat()}
+
+    def forecast_case(self, per_day=100):
+        """Two asks then a price with no profit left; the list city sold per_day a day over the last week."""
+        with closing(lookup.connect(self.root)) as db:
+            seen = (self.now - timedelta(minutes=5)).isoformat()
+            lookup.add_orders(db, [self.order(1, 7_000, "3008"), self.order(2, 8_000, "3008"), self.order(3, 9_900, "3008"), self.order(4, 10_000, "1002")], "stream", seen)
+        days = [{"item_count": per_day, "avg_price": 9_000, "timestamp": (self.now - timedelta(days=d)).replace(tzinfo=None).isoformat()} for d in range(1, 8)]
+        lookup.public.cache["T7_RELIC"] = {"fetched": time.time(), "error": "", "prices": [], "history": [{"location": "Lymhurst", "quality": 1, "data": days}]}
+        self.store.cfg.update(sales_tax=0.08, setup_fee=0.025, transport_per_unit=0, cycle_share=0.2)
+        self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
+        return self.store.watches()["watches"][0]["forecast"]
+
+    def test_forecast_buys_only_what_still_leaves_a_profit(self):
+        f = self.forecast_case()
+        # Lists at 10,000 and keeps 8,950 after fees: the 9,900 ask and dearer are not bought.
+        self.assertEqual((round(f["net_price"]), f["units"], f["invested"]), (8_950, 6, 45_000))
+        self.assertAlmostEqual(f["profit"], 8_700)
+        self.assertAlmostEqual(f["roi"], 8_700 / 45_000)
+        self.assertTrue(f["depth_known"])
+        self.assertAlmostEqual(f["my_per_day"], 100 * market.PLAN_INSTANT_SHARE * 0.2)
+        self.assertAlmostEqual(f["days"], 6 / f["my_per_day"])
+        self.assertIsNone(f["fit"])
+        # The 7-day average sells below the listing, so the lower return is given too.
+        self.assertAlmostEqual(f["average_roi"], (9_000 * 0.895 * 6 - 45_000) / 45_000)
+
+    def test_forecast_says_when_the_money_will_not_sell_within_a_week(self):
+        f = self.forecast_case(per_day=2)
+        self.assertGreater(f["days"], market.WATCH_SELL_DAYS)
+        self.assertEqual(f["fit"]["units"], int(f["my_per_day"] * market.WATCH_SELL_DAYS))
+        self.assertLess(f["fit"]["invested"], f["invested"])
+
+    def test_forecast_without_heard_orders_or_profit(self):
+        self.store.cfg.update(sales_tax=0.08, setup_fee=0.025, transport_per_unit=0)
+        lookup.public.cache["T7_RELIC"] = {"fetched": time.time(), "error": "", "history": [], "prices": [
+            {"city": "Thetford", "quality": 1, "sell_price_min": 9_000, "sell_price_min_date": "2026-11-02T11:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"},
+            {"city": "Lymhurst", "quality": 1, "sell_price_min": 12_000, "sell_price_min_date": "2026-11-02T11:00:00", "buy_price_max": 0, "buy_price_max_date": "0001-01-01T00:00:00"}]}
+        self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
+        f = self.store.watches()["watches"][0]["forecast"]
+        self.assertFalse(f["depth_known"])
+        self.assertEqual(f["units"], 10_000_000 // 9_000)
+        self.assertIsNone(f["days"])
+        lookup.public.cache["T7_RELIC"]["prices"][1]["sell_price_min"] = 9_500
+        f = self.store.watches()["watches"][0]["forecast"]
+        self.assertEqual((f["units"], f["invested"], f["roi"]), (0, 0, None))
+        self.assertLess(f["best_roi"], 0)
+
+    def test_failed_public_fetch_keeps_what_we_knew(self):
+        lookup.public.cache["T7_RELIC"] = {"fetched": 0, "error": "", "prices": [{"city": "Lymhurst"}], "history": [{"location": "Lymhurst"}]}
+        with patch.object(lookup, "fetch_json", side_effect=OSError("429")):
+            lookup.public.fetch("T7_RELIC", ["Lymhurst"])
+        hit = lookup.public.cache["T7_RELIC"]
+        self.assertEqual((hit["prices"], hit["history"]), ([{"city": "Lymhurst"}], [{"location": "Lymhurst"}]))
+        self.assertIn("429", hit["error"])
 
     def test_watch_finds_best_prices_and_raises_alerts_only_on_fresh_values(self):
         with closing(lookup.connect(self.root)) as db:
