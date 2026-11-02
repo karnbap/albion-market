@@ -114,6 +114,15 @@ def markets(db, item, quality, city_of, now=None):
             m["levels"] = [{"price": p, "amount": a} for p, a in prices[:5]]
     return out
 
+def sell_levels(db, item, quality, city_of, now=None):
+    """Every sell order heard in the last day over all cities, cheapest first."""
+    now = now or utcnow()
+    where, args = ("AND quality=?", (quality,)) if quality else ("", ())
+    rows = db.execute(f"SELECT location, price, amount, seen FROM orders WHERE item=? {where} AND side='sell' AND seen>=? AND amount>0 ORDER BY price",
+                      (item, *args, (now - KEEP).isoformat())).fetchall()
+    return [{"city": city_of(loc), "price": price, "amount": amount, "seen": seen} for loc, price, amount, seen in rows if city_of(loc) is not None]
+
+
 def cheapest_sells(db, items, city_of, now=None):
     """Per item id and city: the cheapest sell order heard in the last day (any quality)."""
     now = now or utcnow()
@@ -384,6 +393,10 @@ class PublicPrices:
         except Exception as exc:
             result["error"] = str(exc)[:160]
         with self.lock:
+            # A failed request (the API limits how often it answers) must not blank what we already know.
+            old = self.cache.get(item)
+            if result["error"] and old:
+                result.update(prices=result["prices"] or old["prices"], history=result["history"] or old["history"])
             self.cache[item] = result
             self.running.discard(item)
 
