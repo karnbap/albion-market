@@ -114,6 +114,22 @@ def markets(db, item, quality, city_of, now=None):
             m["levels"] = [{"price": p, "amount": a} for p, a in prices[:5]]
     return out
 
+def cheapest_sells(db, items, city_of, now=None):
+    """Per item id and city: the cheapest sell order heard in the last day (any quality)."""
+    now = now or utcnow()
+    out = {}
+    marks = ",".join("?" * len(items))
+    for item, loc, price, seen in db.execute(f"SELECT item, location, price, seen FROM orders WHERE side='sell' AND amount>0 AND seen>=? AND item IN ({marks})",
+                                             ((now - KEEP).isoformat(), *items)):
+        city = city_of(loc)
+        if city is None:
+            continue
+        best = out.setdefault(item, {}).get(city)
+        if best is None or price < best[0]:
+            out[item][city] = (price, seen)
+    return out
+
+
 def set_meta(db, **values):
     with db:
         db.executemany("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -300,6 +316,10 @@ class Catalog:
                         "tier": (hits[0] if len(hits) < len(tiers) else None) if hits else None})
         return out
 
+    def family_ids(self, family):
+        """Every item id of one family: all tiers and enchant levels."""
+        return [x["id"] for x in self.items or [] if self.family_of(x["id"])[0] == family]
+
     def name(self, item):
         base = item.partition("@")[0]
         for x in self.items or []:
@@ -326,6 +346,34 @@ class PublicPrices:
                 self.running.add(item)
                 threading.Thread(target=self.fetch, args=(item, city_names), daemon=True).start()
         return hit, item in self.running
+
+    def get_family(self, family, items, city_names):
+        """Current prices of every tier and enchant of one family, in as few requests as the URL length allows."""
+        key = "family:" + family
+        with self.lock:
+            hit = self.cache.get(key)
+            fresh = hit and time.time() - hit["fetched"] < PUBLIC_TTL
+            if not fresh and key not in self.running:
+                self.running.add(key)
+                threading.Thread(target=self.fetch_family, args=(key, items, city_names), daemon=True).start()
+        return hit, key in self.running
+
+    def fetch_family(self, key, items, city_names):
+        where = urllib.parse.quote(",".join(city_names))
+        result = {"fetched": time.time(), "prices": [], "error": ""}
+        try:
+            batch = []
+            for item in items + [None]:
+                if batch and (item is None or len(",".join(batch + [item])) > 3000):
+                    result["prices"].extend(fetch_json(f"{API}/prices/{','.join(batch)}.json?locations={where}"))
+                    batch = []
+                if item:
+                    batch.append(item)
+        except Exception as exc:
+            result["error"] = str(exc)[:160]
+        with self.lock:
+            self.cache[key] = result
+            self.running.discard(key)
 
     def fetch(self, item, city_names):
         where = urllib.parse.quote(",".join(city_names))

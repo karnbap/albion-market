@@ -119,6 +119,27 @@ class LookupTests(unittest.TestCase):
         self.assertEqual(rows["7"]["public"]["sell"], 230_000)
         self.assertFalse(rows["3008"]["history"]["all_qualities"])
 
+    def test_family_grid_shows_where_each_tier_and_enchant_has_a_sell_order(self):
+        with self.db() as db:
+            lookup.add_orders(db, [self.order(1, 210_000, 1)], "stream", (self.now - timedelta(minutes=5)).isoformat())
+        lookup.public.cache["family:2H_CLAYMORE"] = {"fetched": time.time(), "error": "", "prices": [
+            {"item_id": "T4_2H_CLAYMORE", "city": "Martlock", "quality": 2, "sell_price_min": 9_000, "sell_price_min_date": "2026-10-31T10:00:00"},
+            {"item_id": "T4_2H_CLAYMORE", "city": "Thetford", "quality": 1, "sell_price_min": 9_500, "sell_price_min_date": "2026-11-01T10:00:00"},
+            {"item_id": "T4_2H_CLAYMORE", "city": "Lymhurst", "quality": 1, "sell_price_min": 1_000, "sell_price_min_date": "2026-10-01T10:00:00"},
+            {"item_id": "T6_2H_CLAYMORE@1", "city": "Lymhurst", "quality": 1, "sell_price_min": 205_000, "sell_price_min_date": "2026-11-01T09:00:00"},
+            {"item_id": "T6_2H_CLAYMORE", "city": "Caerleon", "quality": 1, "sell_price_min": 5, "sell_price_min_date": "2026-11-01T09:00:00"}]}
+        view = self.store.lookup_family("2H_CLAYMORE")
+        combos = {(c["tier"], c["enchant"]): c for c in view["combos"]}
+        self.assertEqual(set(combos), {(6, 0), (6, 1), (4, 0)})
+        # A month-old Lymhurst price drops out; the cheapest of the rest, across qualities, wins.
+        self.assertEqual((combos[(4, 0)]["cheapest"], combos[(4, 0)]["city"], combos[(4, 0)]["cities"]), (9_000, "3008", 2))
+        # Lymhurst T6.1: the stream heard it more recently than the public server, so its price stands.
+        self.assertEqual((combos[(6, 1)]["cheapest"], combos[(6, 1)]["cities"]), (210_000, 1))
+        # Caerleon is excluded, so T6.0 has no city.
+        self.assertEqual((combos[(6, 0)]["cities"], combos[(6, 0)]["cheapest"]), (0, None))
+        with self.assertRaises(ValueError):
+            self.store.lookup_family("../x")
+
     def test_item_view_rejects_ids_outside_the_item_id_shape(self):
         for bad in ("", "T6_2H_CLAYMORE@9", "../x", "t4_bag"):
             with self.assertRaises(ValueError):
@@ -158,6 +179,7 @@ class LookupRobustnessTests(LookupTests):
     test_book_merges_a_city_zone_and_keeps_cheapest_sell_and_dearest_buy = test_old_and_expired_orders_are_purged = None
     test_markets_i_open_feed_the_lookup_but_my_order_lists_do_not = test_item_view_joins_local_orders_with_the_cached_public_answer = None
     test_item_view_rejects_ids_outside_the_item_id_shape = test_search_returns_item_families_with_tiers_as_a_filter = None
+    test_family_grid_shows_where_each_tier_and_enchant_has_a_sell_order = None
     test_stream_parser_answers_ping_and_keeps_partial_messages = None
 
     def test_a_failing_lookup_write_does_not_lose_the_tracked_market(self):
