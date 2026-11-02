@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261102.2';
+  const legacy=next.build!=='20261102.3';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -461,7 +461,7 @@ window.addEventListener('scroll',()=>{if(!restorePending){clearTimeout(scrollTim
 window.addEventListener('pagehide',()=>{if(ready){rememberView();if(draft)storage.set('settingsDraft',readDraft())}});
 $('reset').onclick=async()=>{const target=`${state.items[selectedItem]} · ${state.cities[selectedCity]}`;if(!window.confirm(`${target} 시장의 지금 호가를 비울까요? 게임에서 그 시장을 다시 열기 전까지 호가와 매매 후보가 빈칸이 됩니다.`))return;try{await post('/api/reset',{item:selectedItem,city:selectedCity});$('reset-status').textContent=`${target} 호가를 비웠습니다 · 게임에서 그 시장의 매수·매도 목록을 다시 열어 주세요.`;await refresh()}catch(e){$('reset-status').textContent='호가 비우기 실패: '+e.message}};
 // Any-item lookup: search an item family, then pick tier, enchant and quality like filters; poll that item's city prices while the tab is open.
-const lookupView={hit:null,hits:new Map(),timer:null,searchTimer:null,data:null};
+const lookupView={hit:null,hits:new Map(),timer:null,searchTimer:null,data:null,combos:null,combosAt:0};
 const lookupTier=()=>lookupView.hit?.tiers.find(t=>String(t.tier)===$('lookup-tier').value)||lookupView.hit?.tiers[0];
 const lookupId=()=>{const h=lookupView.hit;if(!h)return null;const t=lookupTier(),e=Number($('lookup-enchant').value);return (t?.tier!=null?`T${t.tier}_${h.family}`:h.family)+(e?'@'+e:'')};
 const lookupAge=v=>v?ago(v):'—';
@@ -483,8 +483,19 @@ function chooseFamily(h,tier){
  fillTiers(h,tier!==''&&tier!=null?tier:$('lookup-tier').value);
  storage.set('lookupRecent2',[h,...storage.get('lookupRecent2',[]).filter(r=>r.family!==h.family)].slice(0,8));
  remember();renderLookupRecent();updateHtml('lookup-hits','');loadLookup()}
+async function loadCombos(){
+ const h=lookupView.hit;if(!h||h.tiers.reduce((a,t)=>a+t.enchants.length,0)<2){updateHtml('lookup-combos','');return}
+ const same=lookupView.combos?.family===h.family;if(same&&!lookupView.combos.public_loading&&Date.now()-lookupView.combosAt<60000){renderCombos();return}
+ try{const r=await fetch('/api/lookup/family?family='+encodeURIComponent(h.family)),data=await r.json();if(!r.ok||h!==lookupView.hit)return;lookupView.combos=data;lookupView.combosAt=Date.now();renderCombos()}catch{}}
+// Tier rows by enchant columns: where a sell order exists, its cheapest price and how many cities list it.
+function renderCombos(){
+ const d=lookupView.combos,h=lookupView.hit;if(!d||!h||d.family!==h.family){updateHtml('lookup-combos','');return}
+ const at=new Map(d.combos.map(c=>[`${c.tier}/${c.enchant}`,c])),tiers=h.tiers.map(t=>t.tier),cur=lookupTier()?.tier,ce=Number($('lookup-enchant').value);
+ const any=d.combos.some(c=>c.cities);
+ const cell=(t,e)=>{const c=at.get(`${t}/${e}`);if(!c)return '<td class="cb-none"></td>';const on=String(t)===String(cur)&&e===ce;return `<td><button type="button" class="combo ${c.cities?'has':'empty'} ${on?'on':''}" data-combo-tier="${t??''}" data-combo-enchant="${e}" title="${c.cities?`${esc(state.cities[c.city]||c.city)} 최저 · ${c.cities}개 도시`:'최근 7일 매물 없음'}">${c.cities?`<b>${n(c.cheapest)}</b><small>${c.cities}곳</small>`:'—'}</button></td>`};
+ updateHtml('lookup-combos',`<div class="combo-head"><span class="lookup-label">값이 있는 조합</span><small>${d.public_loading?'공개 서버에 묻는 중…':any?'칸을 누르면 그 티어·인챈트로 바뀝니다 · 최근 7일 최저 매도(아무 품질)':'이 품목은 최근 7일 동안 6개 도시 어디에도 매물이 없습니다.'}</small></div>`+table(['티어','.0','.1','.2','.3','.4'],tiers.map(t=>`<tr><th scope="row">${t!=null?'T'+t:'—'}</th>${[0,1,2,3,4].map(e=>cell(t,e)).join('')}</tr>`),'lookup-combos'))}
 async function loadLookup(){
- clearTimeout(lookupView.timer);const id=lookupId();if(!id)return;
+ clearTimeout(lookupView.timer);const id=lookupId();if(!id)return;loadCombos();
  try{const quality=$('lookup-quality').value,r=await fetch(`/api/lookup/item?id=${encodeURIComponent(id)}&quality=${quality}`),data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(id!==lookupId()||quality!==$('lookup-quality').value)return;lookupView.data=data;renderLookup()}
  catch(e){updateHtml('lookup-view',`<p class="warn">시세를 못 불러왔습니다: ${esc(e.message)}</p>`)}
  // Poll faster while the public answer is still on its way.
@@ -500,15 +511,15 @@ function renderLookup(){
  const rows=d.cities.map(c=>({c,sell:pick(c.local,c.public,'sell'),buy:pick(c.local,c.public,'buy'),h:c.history}));
  const cheapest=Math.min(...rows.map(r=>r.sell&&!r.sell.old?r.sell.price:Infinity)),dearest=Math.max(...rows.map(r=>r.buy&&!r.buy.old?r.buy.price:-Infinity));
  const t=lookupTier(),e=Number($('lookup-enchant').value);
- const label=`${lookupName(lookupView.hit)} · ${t?.tier!=null?'T'+t.tier:''}${e?'.'+e:t?.tier!=null?'.0':''} · ${anyQuality?'아무 품질':'품질 '+d.quality+' '+qualityName[d.quality]}`;
+ const tag=t?.tier!=null?`T${t.tier}.${e}`:e?'.'+e:'';
  const none=rows.every(r=>!r.sell&&!r.buy)&&!d.public_loading;
- updateHtml('lookup-view',`<h3 class="sub-head">${esc(label)} <small>${esc(d.item)}</small></h3>`+(none?`<p class="warn">이 조합은 6개 도시 어디에도 최근 매물·매수 기록이 없습니다.${anyQuality?' 다른 티어나 인챈트를 골라 보세요.':' 품질을 \'아무 품질\'로 바꿔 보세요. 장비는 한 품질에만 매물이 있는 경우가 많습니다.'}</p>`:'')+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell&&!sell.old&&sell.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell&&!sell.old&&sell.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy&&!buy.old&&buy.price===dearest?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
+ updateHtml('lookup-view',`<div class="lk-hero"><span class="lk-name">${esc(lookupName(lookupView.hit))}</span>${tag?`<span class="lk-chip">${esc(tag)}</span>`:''}<span class="lk-chip q">${anyQuality?'아무 품질':'품질 '+d.quality+' '+qualityName[d.quality]}</span><code>${esc(d.item)}</code></div>`+(none?`<p class="warn">이 조합은 6개 도시 어디에도 최근 매물·매수 기록이 없습니다.${anyQuality?' 위 「값이 있는 조합」 표에서 금색 칸을 누르면 매물이 있는 티어·인챈트로 바뀝니다.':' 품질을 \'아무 품질\'로 바꿔 보세요. 장비는 한 품질에만 매물이 있는 경우가 많습니다.'}</p>`:'')+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell&&!sell.old&&sell.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell&&!sell.old&&sell.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy&&!buy.old&&buy.price===dearest?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
   +`<p class="help">${d.public_loading?'공개 서버에 묻는 중… ':d.public_error?'공개 서버 조회 실패: '+esc(d.public_error)+' · ':d.public_fetched?`공개 서버 값은 ${lookupAge(d.public_fetched)}에 받음 · `:''}실시간 공유·내가 연 시장 값은 최근 24시간 안에 들은 주문입니다. 그사이 팔렸거나 새 매물이 올라왔을 수 있으니 사고팔기 전에는 게임에서 한 번 확인하세요. 7일 평균·판매량은 공개 서버의 하루 단위 거래 이력입니다.</p>`)}
 $('lookup-form').onsubmit=e=>{e.preventDefault();lookupSearch()};
 $('lookup-q').oninput=()=>{clearTimeout(lookupView.searchTimer);lookupView.searchTimer=setTimeout(lookupSearch,250)};
 $('lookup-tier').onchange=()=>{fillEnchants();remember();loadLookup()};
 for(const id of ['lookup-enchant','lookup-quality'])$(id).onchange=()=>{remember();loadLookup()};
-$('lookup-section').addEventListener('click',e=>{const b=e.target.closest('[data-family]');const h=b&&lookupView.hits.get(b.dataset.family);if(h)chooseFamily(h,b.dataset.tier)});
+$('lookup-section').addEventListener('click',e=>{const c=e.target.closest('[data-combo-enchant]');if(c){$('lookup-tier').value=c.dataset.comboTier;fillEnchants();$('lookup-enchant').value=c.dataset.comboEnchant;remember();loadLookup();return}const b=e.target.closest('[data-family]');const h=b&&lookupView.hits.get(b.dataset.family);if(h)chooseFamily(h,b.dataset.tier)});
 {renderLookupRecent();const last=storage.get('lookupLast2',null);if(last?.hit){lookupView.hit=last.hit;fillTiers(last.hit,last.tier);$('lookup-enchant').value=last.enchant||'0';fillEnchants();$('lookup-quality').value=last.quality??'0'}}
 document.querySelector('.tabs').addEventListener('click',e=>{if(e.target.closest('[data-tab=lookup]'))loadLookup()});
 if(storage.get('tab','now')==='lookup')loadLookup();

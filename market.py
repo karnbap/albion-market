@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261102.2"
+BUILD = "20261102.3"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -2483,6 +2483,45 @@ class Store:
         c = lookup.catalog
         return {"items": c.search(query[:60]), "loading": c.loading, "error": c.error, "ready": c.items is not None}
 
+    def lookup_family(self, family):
+        """Which tier and enchant combinations of a family have a sell order anywhere right now:
+        per combination the cheapest price, its city and how many cities list it (values within 7 days)."""
+        if not re.fullmatch(r"[A-Z0-9_]{2,80}", family or ""):
+            raise ValueError("Unknown item")
+        lookup.catalog.ensure(self.root)
+        items = lookup.catalog.family_ids(family)
+        if not items:
+            return {"family": family, "combos": [], "loading": lookup.catalog.loading, "public_loading": False}
+        cities = self.lookup_cities()
+
+        def city_of(loc):
+            city = location(loc)
+            return city if city in cities else None
+
+        with closing(lookup.connect(self.root)) as ldb:
+            local = lookup.cheapest_sells(ldb, items, city_of, self.clock())
+        public, loading = lookup.public.get_family(family, items, list(cities.values()))
+        by_name = {n: c for c, n in cities.items()}
+        week = (self.clock() - timedelta(days=7)).replace(tzinfo=None).isoformat()
+        best = defaultdict(dict)
+        for r in (public or {}).get("prices", []):
+            c, price, seen = by_name.get(r.get("city")), r.get("sell_price_min"), r.get("sell_price_min_date") or ""
+            if c and price and seen >= week and (c not in best[r["item_id"]] or price < best[r["item_id"]][c][0]):
+                best[r["item_id"]][c] = (price, seen + "+00:00")
+        for item, by_city in local.items():
+            for c, (price, seen) in by_city.items():
+                if c not in best[item] or seen > best[item][c][1]:
+                    best[item][c] = (price, seen)
+        combos = []
+        for item in items:
+            _, tier, enchant = lookup.catalog.family_of(item)
+            listed = best.get(item, {})
+            low = min(listed.items(), key=lambda kv: kv[1][0]) if listed else None
+            combos.append({"item": item, "tier": tier, "enchant": enchant, "cities": len(listed),
+                           "cheapest": low[1][0] if low else None, "city": low[0] if low else None,
+                           "seen": max(v[1] for v in listed.values()) if listed else None})
+        return {"family": family, "combos": combos, "public_loading": loading, "public_error": (public or {}).get("error", "")}
+
     def lookup_item(self, item, quality):
         """Any item, every trade city: the newest orders we heard (stream or this PC) beside the public API.
         quality 0 means any quality: the cheapest sell and dearest buy of all, each with its quality."""
@@ -2643,6 +2682,11 @@ def handler_class(store, token):
                 return self.respond({"app": "AlbionLocal", "ready": True, "auto_update": getattr(store, "auto_update", {"enabled": False}), "capture_verified": bool(store.db.execute("SELECT 1 FROM packets WHERE topic='marketorders.ingest' LIMIT 1").fetchone())})
             if parts.path == "/api/lookup/search":
                 return self.respond(store.lookup_search(parse_qs(parts.query).get("q", [""])[0]))
+            if parts.path == "/api/lookup/family":
+                try:
+                    return self.respond(store.lookup_family(parse_qs(parts.query).get("family", [""])[0]))
+                except ValueError as exc:
+                    return self.respond({"error": str(exc)}, 400)
             if parts.path == "/api/lookup/item":
                 params = parse_qs(parts.query)
                 try:
