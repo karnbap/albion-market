@@ -272,3 +272,15 @@ input[type=checkbox],input[type=radio]{accent-color:var(--gold)}
 .watch-toast b{font-family:var(--serif);color:var(--gold-hi)}.watch-toast span{grid-column:1;font-size:13px;color:var(--muted)}.watch-toast button{grid-row:1/3;grid-column:2;align-self:start}
 @keyframes toast-in{from{transform:translateY(12px);opacity:0}}
 @media(prefers-reduced-motion:reduce){#watch-list td.flash,.tab-badge,.watch-toast{animation:none}}
+/* In-game tier, enchantment and quality colours. Tier and enchant: Albion item icon colours. Quality: a plain ladder (no verified in-game palette). */
+.tier-tag{font-weight:700;letter-spacing:.2px}
+.tier-tag.t1{color:#a7a7a7}.tier-tag.t2{color:#c9a77c}.tier-tag.t3{color:#6cc35c}.tier-tag.t4{color:#5b9cf0}
+.tier-tag.t5{color:#f05a4f}.tier-tag.t6{color:#f49a3e}.tier-tag.t7{color:#f6d651}.tier-tag.t8{color:#ffffff;text-shadow:0 0 6px rgba(255,255,255,.55)}
+.ench-tag{font-weight:700}.ench-tag.e0{color:var(--muted)}.ench-tag.e1{color:#5fd66f}.ench-tag.e2{color:#53a9ff}.ench-tag.e3{color:#bd78ff}.ench-tag.e4{color:#ffd24a;text-shadow:0 0 6px rgba(255,210,74,.5)}
+.q-tag{font-weight:600}.q-tag.q1{color:var(--muted)}.q-tag.q2{color:#b8c6d6}.q-tag.q3{color:#d89a5b}.q-tag.q4{color:#e9edf5;text-shadow:0 0 6px rgba(233,237,245,.45)}.q-tag.q5{color:#ffd24a;text-shadow:0 0 8px rgba(255,210,74,.55)}
+/* Inside gilded chips the tag colours sit on a dark plate so they stay readable. */
+.lk-chip{background:linear-gradient(180deg,#2e2219,#16100c);color:var(--text);border:1px solid var(--gold);text-shadow:none}
+.lk-chip.q{background:linear-gradient(180deg,#2e2219,#16100c);border-color:#8f6bd6}
+.combo.e1.has{border-top:2px solid #5fd66f}.combo.e2.has{border-top:2px solid #53a9ff}.combo.e3.has{border-top:2px solid #bd78ff}.combo.e4.has{border-top:2px solid #ffd24a}
+header .crest{width:58px;height:69px;filter:drop-shadow(0 2px 2px rgba(0,0,0,.6)) drop-shadow(0 0 12px rgba(232,196,110,.3))}
+@media(max-width:760px){header .crest{width:44px;height:52px}}
