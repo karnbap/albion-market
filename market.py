@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261102.8"
+BUILD = "20261102.9"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -2524,19 +2524,20 @@ class Store:
         leaves a profit, and list them all in the list city after sales tax and setup fee. The cheapest price alone
         would overstate it, since that order is often a single unit. With no orders heard, the cheapest price with
         an unknown amount stands in. The list city's sales of the last 7 days, times the part that takes sell orders,
-        times my part of those (cycle_share), give how fast it sells; other sellers take the rest."""
+        times my part of those (cycle_share), give how fast it sells; other sellers take the rest. Those sales come
+        from whichever is newer: the history this PC received when I opened the market, or the public API's."""
         if not sell or not listing:
             return None
         cfg = self.cfg
         keep = 1 - cfg["sales_tax"] - cfg["setup_fee"]
         net = listing["price"] * keep
-        rows = asks or [{"city": sell["city"], "price": sell["price"], "amount": None, "seen": sell["seen"]}]
+        rows = asks or [{"city": sell["city"], "price": sell["price"], "amount": None, "seen": sell["seen"], "source": "public"}]
 
         def carried(row):
             return row["price"] + (cfg["transport_per_unit"] if row["city"] != listing["city"] else 0)
 
         def buy(limit):
-            units, spent, oldest = 0, 0, None
+            units, spent, oldest, sources = 0, 0, None, defaultdict(int)
             for row in rows:
                 unit = carried(row)
                 if unit >= net:
@@ -2545,18 +2546,23 @@ class Store:
                 if room >= 1:
                     units, spent = units + room, spent + room * unit
                     oldest = min(oldest or row["seen"], row["seen"])
-            return {"units": units, "invested": spent, "profit": units * net - spent, "roi": (units * net - spent) / spent if spent else None, "oldest": oldest}
+                    sources[row["source"]] += room
+            return {"units": units, "invested": spent, "profit": units * net - spent, "roi": (units * net - spent) / spent if spent else None, "oldest": oldest, "sources": dict(sources)}
 
         result = buy(WATCH_BUDGET)
         history = next((r["history"] for r in view["cities"] if r["city"] == listing["city"]), None) or {}
-        average, per_day = history.get("average"), history.get("per_day")
+        average, per_day, sales_source = history.get("average"), history.get("per_day"), "public" if history.get("per_day") else None
+        # This PC's history is of quality 1 only.
+        own = self.history_summary(view["item"], listing["city"], 7) if view["quality"] in (lookup.ANY_QUALITY, 1) else {}
+        if own.get("amount") and own["covered_hours"] >= 24 and (not history.get("last_day") or parse_time(own["newest_bucket_end"]) > parse_time(history["last_day"])):
+            average, per_day, sales_source = own["weighted_average"], own["amount"] / own["covered_hours"] * 24, "me"
         # state() keeps the studies current; rebuilding them on every 10-second watch read would be too heavy.
         share = next((s["instant_buy_share"] for s in getattr(self, "_studies", []) if s["item"] == view["item"] and s["city"] == listing["city"]), None)
         my_per_day = per_day * (PLAN_INSTANT_SHARE if share is None else share) * cfg["cycle_share"] if per_day else None
         days = result["units"] / my_per_day if my_per_day and result["units"] else None
         fit = buy(int(my_per_day * WATCH_SELL_DAYS)) if days is not None and days > WATCH_SELL_DAYS else None
         oldest = min(filter(None, (result.pop("oldest"), listing["seen"])))
-        result.update(budget=WATCH_BUDGET, net_price=net, list_price=listing["price"], list_city=listing["city"], depth_known=bool(asks),
+        result.update(budget=WATCH_BUDGET, net_price=net, list_price=listing["price"], list_city=listing["city"], depth_known=bool(asks), sales_source=sales_source,
                       best_roi=net / carried(rows[0]) - 1, average=average, per_day=per_day, sell_order_share=PLAN_INSTANT_SHARE if share is None else share, cycle_share=cfg["cycle_share"], my_per_day=my_per_day, days=days, fit=fit,
                       average_roi=(average * keep * result["units"] - result["invested"]) / result["invested"]
                       if average and average < listing["price"] and result["invested"] else None,
@@ -2570,7 +2576,8 @@ class Store:
         the sell alert reads list. An alert counts as live only on a value seen within the last hour.
 
         list guards against false alerts. The stream can carry one expensive order of a city without its cheaper
-        ones, so a lower public price from the last day wins for that city; a city's floor that is my own open
+        ones, so a lower public price from the last day wins for that city unless a newer scan listed the city from its
+        best price on; a city's floor that is my own open
         order says nothing about the market and is skipped; a floor over twice the middle city's is an outlier."""
         now, cities = self.clock(), self.lookup_cities()
         out = []
@@ -2601,7 +2608,9 @@ class Store:
                     if side != "sell":
                         continue
                     floor = q
-                    if q["source"] != "public" and pub.get("sell") and pub["sell"] < q["price"]:
+                    # A scan newer than the public price has already told us the city's real best price.
+                    scanned = local and local.get("scan") and seen_pub and parse_time(local["scan"]) >= parse_time(seen_pub)
+                    if q["source"] != "public" and pub.get("sell") and pub["sell"] < q["price"] and not scanned:
                         pub_age = (now - parse_time(seen_pub)).total_seconds() / 60
                         if pub_age <= 24 * 60:
                             floor = {"price": pub["sell"], "amount": None, "seen": seen_pub, "quality": pub.get("sell_quality"),
@@ -2616,7 +2625,10 @@ class Store:
             sell, buy = best["sell"], best["buy"]
             with closing(lookup.connect(self.root)) as ldb:
                 asks = lookup.sell_levels(ldb, w["item"], w["quality"], lambda loc: c if (c := location(loc)) in cities else None, now)
-            asks = [a for a in asks if (a["city"], a["price"]) not in mine]
+            # A newer public best price than an order we heard means that cheaper order has gone.
+            publics = {r["city"]: r["public"] for r in view["cities"] if r["public"] and r["public"]["sell"] and r["public"]["sell_seen"]}
+            asks = [a for a in asks if (a["city"], a["price"]) not in mine and not (
+                a["city"] in publics and a["price"] < publics[a["city"]]["sell"] and parse_time(a["seen"]) < parse_time(publics[a["city"]]["sell_seen"]))]
             out.append({"id": w["id"], "item": w["item"], "quality": w["quality"], "name": view["name"],
                         "buy_below": w["buy_below"], "sell_above": w["sell_above"], "sell": sell, "buy": buy, "list": listing,
                         "list_skipped": {"own": skipped_own, "outlier": len(floors) - len(usable)},
@@ -2633,7 +2645,9 @@ class Store:
 
     def lookup_family(self, family):
         """Which tier and enchant combinations of a family have a sell order anywhere right now:
-        per combination the cheapest price, its city and how many cities list it (values within 7 days)."""
+        per combination the cheapest price, its city and how many cities list it (values within 7 days), and the
+        average traded price of the last 7 days over those cities (of what the public daily history holds, about
+        30 days, when the last week has no sales)."""
         if not re.fullmatch(r"[A-Z0-9_]{2,80}", family or ""):
             raise ValueError("Unknown item")
         lookup.catalog.ensure(self.root)
@@ -2648,9 +2662,16 @@ class Store:
 
         with closing(lookup.connect(self.root)) as ldb:
             local = lookup.cheapest_sells(ldb, items, city_of, self.clock())
-        public, loading = lookup.public.get_family(family, items, list(cities.values()))
+        public, loading = lookup.public.get_family(family, items, list(cities.values()), self.root)
         by_name = {n: c for c, n in cities.items()}
         week = (self.clock() - timedelta(days=7)).replace(tzinfo=None).isoformat()
+        traded = {7: defaultdict(lambda: [0, 0]), 30: defaultdict(lambda: [0, 0])}
+        for r in (public or {}).get("history", []):
+            if r.get("location") in by_name:
+                for d in r.get("data", []):
+                    for span in [30, 7] if d.get("timestamp", "") >= week else [30]:
+                        traded[span][r.get("item_id")][0] += d["item_count"]
+                        traded[span][r.get("item_id")][1] += d["avg_price"] * d["item_count"]
         best = defaultdict(dict)
         for r in (public or {}).get("prices", []):
             c, price, seen = by_name.get(r.get("city")), r.get("sell_price_min"), r.get("sell_price_min_date") or ""
@@ -2665,9 +2686,12 @@ class Store:
             _, tier, enchant = lookup.catalog.family_of(item)
             listed = best.get(item, {})
             low = min(listed.items(), key=lambda kv: kv[1][0]) if listed else None
+            span = 7 if traded[7][item][0] else 30
+            sold = traded[span][item]
             combos.append({"item": item, "tier": tier, "enchant": enchant, "cities": len(listed),
                            "cheapest": low[1][0] if low else None, "city": low[0] if low else None,
-                           "seen": max(v[1] for v in listed.values()) if listed else None})
+                           "seen": max(v[1] for v in listed.values()) if listed else None,
+                           "average": sold[1] / sold[0] if sold[0] else None, "average_days": span if sold[0] else None})
         return {"family": family, "combos": combos, "public_loading": loading, "public_error": (public or {}).get("error", "")}
 
     def lookup_item(self, item, quality):
@@ -2683,7 +2707,7 @@ class Store:
 
         with closing(lookup.connect(self.root)) as ldb:
             local, stream = lookup.markets(ldb, item, quality, city_of, self.clock()), lookup.get_meta(ldb)
-        public, loading = lookup.public.get(item, list(cities.values()))
+        public, loading = lookup.public.get(item, list(cities.values()), self.root)
         by_name = {n: c for c, n in cities.items()}
 
         def utc(value):
