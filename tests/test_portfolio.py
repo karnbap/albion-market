@@ -145,6 +145,56 @@ class TradingPlanTests(unittest.TestCase):
         self.assertAlmostEqual(mine["roi"], 130 * (1 - .08 - .025) / 100 - 1)
 
 
+    def test_units_a_buy_order_under_the_target_can_fill_per_city(self):
+        seen = self.now.isoformat()
+        def book(*levels, single=False):
+            return {"levels": [{"price": p, "amount": a} for p, a in levels], "single_only": single, "seen": seen if levels else None, "fresh": bool(levels)}
+        empty = book()
+        books = {item: {c: {"sell": empty, "buy": empty} for c in ("7", "4002", "1002", "3008", "2004", "5003")} for item in self.store.cfg["items"]}
+        soul = books["T8_SOUL"]
+        soul["4002"]["sell"] = book((14000, 3))
+        soul["1002"]["buy"] = book((9000, 100), (8500, 40), (8000, 7))
+        soul["7"]["buy"] = book((9000, 1), single=True)                 # a clicked order: not a list
+        soul["3008"]["buy"] = book((7000, 5))                           # bids, but no sales on record
+        for hours in range(1, 49):
+            end = (self.now - timedelta(hours=hours)).isoformat()
+            self.store.db.execute("INSERT INTO history VALUES(?,?,?,?,?,?,?)", ("T8_SOUL", "1002", 1, end, 10, 10 * 9000, end))
+        self.store.save_config({"buy_order_targets": {"T8_SOUL": 10000}, "transport_per_unit": 50, "cycle_share": .2})
+        keep = 1 - .08 - .025
+        order = lambda cache=None: next(r for r in self.store.buy_order_under(books, cache or {}) if r["item"] == "T8_SOUL")
+        u = order()
+        self.assertEqual((u["target"], u["sell_city"], u["days"]), (10000, "4002", 7))
+        self.assertEqual(u["suggested"], int((14000 * keep / 1.1 - 50) / 1.025))
+        rows = {r["city"]: r for r in u["rows"]}
+        # 240 a day, half unmeasured into buy orders: 840 in a week, and one silver over the best bid nobody is ahead.
+        row = rows["1002"]
+        self.assertEqual((row["best"], row["price"], row["ahead"], row["per_day"], row["units"]), (9000, 9001, 0, 120, 168))
+        self.assertAlmostEqual(row["cost"], 168 * 9001 * 1.025)
+        self.assertAlmostEqual(row["profit"], 168 * (14000 * keep - 50) - 168 * 9001 * 1.025)
+        self.assertFalse(rows["7"]["known"])
+        self.assertEqual((rows["3008"]["known"], rows["3008"]["per_day"], rows["3008"]["units"]), (True, None, 0))
+        self.assertEqual(u["units"], 168)
+        # The target falls among the bids: the order waits behind those at or above it.
+        self.store.save_config({"buy_order_targets": {"T8_SOUL": 8500}})
+        row = next(r for r in order()["rows"] if r["city"] == "1002")
+        self.assertEqual((row["price"], row["ahead"], row["units"]), (8500, 140, int((840 - 140) * .2)))
+        # More ahead than sells in a week: nothing fills.
+        soul["1002"]["buy"] = book((9000, 5000), (8000, 7))
+        row = next(r for r in order()["rows"] if r["city"] == "1002")
+        self.assertEqual((row["ahead"], row["units"], row["profit"]), (5000, 0, None))
+        # My own bid is not in the way, and not outbid.
+        soul["1002"]["buy"] = book((9000, 100), (8500, 40))
+        self.store.save_config({"buy_order_targets": {"T8_SOUL": 10000}})
+        row = next(r for r in order({"mine": {("T8_SOUL", "1002", "buy"): [{"price": 9000, "remaining": 100}]}})["rows"] if r["city"] == "1002")
+        self.assertEqual((row["best"], row["price"], row["ahead"]), (8500, 8501, 0))
+        # The two kinds of target are saved apart, and the suggestion stands in for an empty one.
+        self.store.save_config({"buy_targets": {"T8_SOUL": 111}, "buy_order_targets": {"T8_SOUL": 222}})
+        self.assertEqual((self.store.cfg["buy_targets"]["T8_SOUL"], self.store.cfg["buy_order_targets"]["T8_SOUL"]), (111, 222))
+        self.store.save_config({"buy_order_targets": {}})
+        self.assertEqual((order()["chosen"], order()["target"]), (None, order()["suggested"]))
+        with self.assertRaises(ValueError):
+            self.store.save_config({"buy_order_targets": {"NOPE": 1}})
+
     def test_units_under_the_buy_target_per_city(self):
         seen = self.now.isoformat()
         def book(*levels, single=False):
