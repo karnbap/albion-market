@@ -49,10 +49,10 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # the item's market-wide daily sales, picks that add stock buy less.
 # cycle_share / weekday_cycles: the trading plan's part of a market's daily sales and weekday turns.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3,
-                    "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "sell_targets": {}}
+                    "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "buy_order_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261102.10"
+BUILD = "20261104.1"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -406,7 +406,7 @@ class Store:
             if not math.isfinite(turns) or not turns.is_integer() or not 1 <= turns <= 12:
                 raise ValueError("weekday_cycles must be a whole number from 1 to 12")
             cfg["weekday_cycles"] = int(turns)
-            for key in ("buy_targets", "sell_targets"):
+            for key in ("buy_targets", "buy_order_targets", "sell_targets"):
                 targets = cfg[key]
                 if not isinstance(targets, dict) or any(item not in cfg["items"] for item in targets):
                     raise ValueError(f"{key} must map tracked items to prices")
@@ -2009,6 +2009,16 @@ class Store:
                           "fresh_items": len(here) - len(missing), "newest_seen": max(seen, default=None)})
         return board
 
+    def resale_outlet(self, item, books):
+        """Where bought units would be listed: the dearest lowest ask among the trading cities, with its 7-day
+        average traded price, since which units really sell at that ask is not known."""
+        asks = {c: books[item][c]["sell"]["levels"][0]["price"] for c in self.trade_cities(item)
+                if books[item][c]["sell"]["levels"] and not books[item][c]["sell"]["single_only"]}
+        city = max(asks, key=asks.get, default=None)
+        history = self.history_rows(item, city, 7) if city else []
+        traded = sum(r["amount"] for r in history)
+        return city, asks.get(city), sum(r["silver"] for r in history) / traded if traded else None
+
     def buy_under(self, books):
         """Per item, the units each trading city's sell list offers at or under a target price
         for instant buys: the buy_targets setting, else a suggestion that leaves minimum_margin
@@ -2021,11 +2031,7 @@ class Store:
         for item in cfg["items"]:
             cities = self.trade_cities(item)
             lists = {(item, c): books[item][c]["sell"] for c in cities}
-            asks = {c: lists[item, c]["levels"][0]["price"] for c in cities if known(lists[item, c])}
-            sell_city = max(asks, key=asks.get, default=None)
-            sell = asks.get(sell_city)
-            history = self.history_rows(item, sell_city, 7) if sell_city else []
-            traded = sum(r["amount"] for r in history)
+            sell_city, sell, sell_average = self.resale_outlet(item, books)
             suggested = math.floor(sell * keep / (1 + cfg["minimum_margin"]) - cfg["transport_per_unit"]) if sell else None
             target = cfg["buy_targets"].get(item) or suggested
             rows = []
@@ -2044,7 +2050,50 @@ class Store:
                 rows.append(row)
             units = sum(r["units"] for r in rows)
             out.append({"item": item, "target": target, "chosen": cfg["buy_targets"].get(item), "suggested": suggested,
-                        "sell_city": sell_city, "sell": sell, "sell_average": sum(r["silver"] for r in history) / traded if traded else None,
+                        "sell_city": sell_city, "sell": sell, "sell_average": sell_average,
+                        "rows": rows, "units": units, "cost": sum(r["cost"] for r in rows),
+                        "profit": sum(r["profit"] for r in rows if r["profit"] is not None) if units and sell else None})
+        return out
+
+    def buy_order_under(self, books, cache):
+        """Per item, the units a buy order at or under a target price can expect to fill in WATCH_SELL_DAYS, per trading
+        city: the buy_order_targets setting, else a suggestion that leaves minimum_margin after the setup fee on both
+        orders, sales tax and transport. The order goes one silver over the best other bid when the target allows,
+        else at the target behind the orders at or above it (my own orders are not in the way). Sales into buy orders
+        (slowest daily pace, less the instant-buy share, half when unmeasured) clear those first, and of the rest the
+        order takes the cycle_share setting, as in the trading plan, since others keep bidding."""
+        cfg, keep, out = self.cfg, 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"], []
+        measured = {(s["item"], s["city"]): s["instant_buy_share"] for s in self.market_studies(cache)}
+        for item in cfg["items"]:
+            sell_city, sell, sell_average = self.resale_outlet(item, books)
+            suggested = math.floor((sell * keep / (1 + cfg["minimum_margin"]) - cfg["transport_per_unit"]) / (1 + cfg["setup_fee"])) if sell else None
+            target = cfg["buy_order_targets"].get(item) or suggested
+            rows = []
+            for c in self.trade_cities(item):
+                book = books[item][c]["buy"]
+                row = {"city": c, "seen": book["seen"], "fresh": book["fresh"], "known": bool(book["levels"]) and not book["single_only"],
+                       "best": None, "price": None, "ahead": 0, "per_day": None, "units": 0, "cost": 0, "profit": None}
+                if row["known"] and target is not None:
+                    own = defaultdict(int)
+                    for o in cache.get("mine", {}).get((item, c, "buy"), []):
+                        own[o["price"]] += o["remaining"]
+                    others = [(l["price"], l["amount"] - own[l["price"]]) for l in book["levels"] if l["amount"] > own[l["price"]]]
+                    row["best"] = others[0][0] if others else None
+                    row["price"] = min(target, row["best"] + 1) if others else target
+                    row["ahead"] = sum(a for p, a in others if p >= row["price"])
+                    pace = self.volume_guide(cache, item, c)["per_day"]
+                    share = measured.get((item, c))
+                    row["per_day"] = pace * (1 - (PLAN_INSTANT_SHARE if share is None else share)) if pace else None
+                    if row["per_day"]:
+                        row["units"] = int(max(0, row["per_day"] * WATCH_SELL_DAYS - row["ahead"]) * cfg["cycle_share"])
+                    if row["units"]:
+                        row["cost"] = row["units"] * row["price"] * (1 + cfg["setup_fee"])
+                        carry = cfg["transport_per_unit"] if c != sell_city else 0
+                        row["profit"] = row["units"] * (sell * keep - carry) - row["cost"] if sell else None
+                rows.append(row)
+            units = sum(r["units"] for r in rows)
+            out.append({"item": item, "target": target, "chosen": cfg["buy_order_targets"].get(item), "suggested": suggested,
+                        "sell_city": sell_city, "sell": sell, "sell_average": sell_average, "days": WATCH_SELL_DAYS,
                         "rows": rows, "units": units, "cost": sum(r["cost"] for r in rows),
                         "profit": sum(r["profit"] for r in rows if r["profit"] is not None) if units and sell else None})
         return out
@@ -2482,7 +2531,7 @@ class Store:
                 "selected_item": item, "selected_city": city, "books": books,
                 "history": [self.summary(cache, item, city, d) for d in (1, 7, 28)], "patterns": self.patterns(item, city),
                 "city_extremes": self.city_extremes(books), "candidates": candidates, "past_candidates": past_candidates, "past_buyouts": past_buyouts, "city_board": board,
-                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "buy_under": self.buy_under(books), "sell_targets": sell_targets, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
+                "candidate_notes": COMMON_NOTES, "buyouts": buyouts, "buyout_notes": BUYOUT_NOTES, "buy_under": self.buy_under(books), "buy_order_under": self.buy_order_under(books, cache), "sell_targets": sell_targets, "now": now, "now_groups": now_groups, "pick_history": history, "outlook": self.demand_outlook(cache, item, city), "mail_diagnostics": self.mail_diagnostics(), "client_debug": self.client_debug(),
                 "book_patterns": self.book_patterns(item, city), "studies": self.market_studies(cache), "my_orders": mine_rows, "purchases": purchases, "stale_listings": self.stale_listings(cache, books, mine_rows, purchases), "holdings": holdings, "capital": capital, "portfolio": self.portfolio(cache, books, capital, purchases), "timing": self.timing(cache, item, city, books), "volume_guides": guides, "packets": count, "last_packet": dict(last) if last else None,
                 "settings": {k: self.cfg[k] for k in ("sales_tax", "setup_fee", "fees_confirmed", "minimum_margin", "near_high_fraction", "fresh_minutes", "transport_per_unit", "transport_confirmed", *SETTING_DEFAULTS)},
                 "email": {"enabled": self.cfg["email"]["enabled"], "configured": bool(self.cfg["email"]["to"] and self.cfg["email"]["smtp_host"]), "times": self.cfg["email"]["times"]},
