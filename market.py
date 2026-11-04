@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "buy_order_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261104.1"
+BUILD = "20261104.2"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -355,7 +355,7 @@ class Store:
         for table, name, kind in (("my_orders", "remaining", "INTEGER"), ("my_orders", "checked", "TEXT"),
                                   ("my_orders", "source", "TEXT NOT NULL DEFAULT 'manual'"), ("my_orders", "moved", "TEXT"),
                                   ("personal_sales", "mailed", "TEXT"), ("personal_mails", "mailed", "TEXT"),
-                                  ("finished_lists", "identity", "TEXT"), ("purchases", "auction", "TEXT")):
+                                  ("finished_lists", "identity", "TEXT"), ("purchases", "auction", "TEXT"), ("watches", "order_below", "INTEGER")):
             if name not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         self.db.commit()
@@ -2546,7 +2546,8 @@ class Store:
         return {"items": c.search(query[:60]), "loading": c.loading, "error": c.error, "ready": c.items is not None}
 
     def set_watch(self, values):
-        """The price watch list: add an item (and quality), set its buy / sell alert prices, or remove it."""
+        """The price watch list: add an item (and quality), set its alert prices (instant buy, buy order, sell), or remove it.
+        An update leaves an alert price it does not name as it was."""
         action = values.get("action")
         if action == "add":
             item, quality = values.get("item"), values.get("quality", lookup.ANY_QUALITY)
@@ -2564,13 +2565,12 @@ class Store:
             if action == "remove":
                 self.db.execute("DELETE FROM watches WHERE id=?", (wid,))
             elif action == "update":
-                prices = []
-                for key in ("buy_below", "sell_above"):
-                    v = values.get(key)
+                prices = {key: values[key] for key in ("buy_below", "order_below", "sell_above") if key in values}
+                for v in prices.values():
                     if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 10**10):
                         raise ValueError("알림 가격은 1 이상의 정수로 적어 주세요")
-                    prices.append(v)
-                self.db.execute("UPDATE watches SET buy_below=?, sell_above=? WHERE id=?", (*prices, wid))
+                if prices:
+                    self.db.execute(f"UPDATE watches SET {', '.join(k + '=?' for k in prices)} WHERE id=?", (*prices.values(), wid))
             else:
                 raise ValueError("Unknown action")
 
@@ -2617,13 +2617,39 @@ class Store:
                 hours.setdefault(parse_time(r["stamp"]).replace(tzinfo=None).isoformat(), [r["amount"], r["silver"]])
         return [{"end": datetime.fromisoformat(s).replace(tzinfo=UTC), "units": u, "average": v / u} for s, (u, v) in sorted(hours.items()) if u]
 
-    def watch_forecast(self, view, asks, sell, listing):
+    def watch_pace(self, view, city):
+        """A city's 7-day average price and sales per day, from whichever is newer: the history this PC received when
+        I opened the market, or the public API's."""
+        history = next((r for r in view["cities"] if r["city"] == city), {}).get("history") or {}
+        average, per_day, source = history.get("average"), history.get("per_day"), "public" if history.get("per_day") else None
+        # This PC's history is of quality 1 only.
+        own = self.history_summary(view["item"], city, 7) if view["quality"] in (lookup.ANY_QUALITY, 1) else {}
+        if own.get("amount") and own["covered_hours"] >= 24 and (not history.get("last_day") or parse_time(own["newest_bucket_end"]) > parse_time(history["last_day"])):
+            average, per_day, source = own["weighted_average"], own["amount"] / own["covered_hours"] * 24, "me"
+        return average, per_day, source
+
+    def watch_fills(self, view, tops):
+        """Where a buy order could go, cheapest first: one silver over each city's best bid, with the sales per day that
+        reach buy orders there (the part not taken by sell orders, half when unmeasured)."""
+        # state() keeps the studies current; rebuilding them on every 10-second watch read would be too heavy.
+        measured = {s["city"]: s["instant_buy_share"] for s in getattr(self, "_studies", []) if s["item"] == view["item"]}
+        out = []
+        for top in sorted(tops, key=lambda t: t["price"]):
+            pace = self.watch_pace(view, top["city"])[1]
+            share = measured.get(top["city"])
+            out.append({**top, "best": top["price"], "price": top["price"] + 1, "amount": None, "per_day": pace * (1 - (PLAN_INSTANT_SHARE if share is None else share)) if pace else None})
+        return out
+
+    def watch_forecast(self, view, asks, sell, listing, fills=()):
         """What WATCH_BUDGET would make on an item: buy the sell orders we heard, cheapest first, while each still
         leaves a profit, and list them all in the list city after sales tax and setup fee. The cheapest price alone
         would overstate it, since that order is often a single unit. With no orders heard, the cheapest price with
         an unknown amount stands in. The list city's sales of the last 7 days, times the part that takes sell orders,
-        times my part of those (cycle_share), give how fast it sells; other sellers take the rest. Those sales come
-        from whichever is newer: the history this PC received when I opened the market, or the public API's.
+        times my part of those (cycle_share), give how fast it sells; other sellers take the rest.
+
+        order is the same money spent the other way: buy orders one silver over each city's best bid, cheapest first,
+        paying the setup fee on them too, and only what fills in WATCH_SELL_DAYS (fills' sales per day times cycle_share,
+        since others keep bidding).
 
         With hourly sales, the part that sells at the list price is the part of sales in hours whose average reached
         it. An hour's average is not each sale's price, so this is a rough measure, but unlike one share for all prices
@@ -2653,15 +2679,26 @@ class Store:
                     bought[row["city"]] += room
             return {"units": units, "invested": spent, "profit": units * worth - spent, "roi": (units * worth - spent) / spent if spent else None, "oldest": oldest, "sources": dict(sources), "cities": dict(bought)}
 
+        def order_unit(fill):
+            return fill["price"] * (1 + cfg["setup_fee"]) + (cfg["transport_per_unit"] if fill["city"] != listing["city"] else 0)
+
+        def place(limit, worth=net):
+            units, spent, oldest, bought = 0, 0, None, defaultdict(int)
+            for fill in fills:
+                unit = order_unit(fill)
+                if unit >= worth or not fill["per_day"]:
+                    continue
+                room = int(min((WATCH_BUDGET - spent) // unit, limit - units, fill["per_day"] * cfg["cycle_share"] * WATCH_SELL_DAYS))
+                if room >= 1:
+                    units, spent = units + room, spent + room * unit
+                    oldest = min(oldest or fill["seen"], fill["seen"])
+                    bought[fill["city"]] += room
+            return {"units": units, "invested": spent, "profit": units * worth - spent, "roi": (units * worth - spent) / spent if spent else None, "oldest": oldest, "cities": dict(bought)}
+
         result = buy(WATCH_BUDGET)
         city_row = next((r for r in view["cities"] if r["city"] == listing["city"]), {})
         history = city_row.get("history") or {}
-        average, per_day, sales_source = history.get("average"), history.get("per_day"), "public" if history.get("per_day") else None
-        # This PC's history is of quality 1 only.
-        own = self.history_summary(view["item"], listing["city"], 7) if view["quality"] in (lookup.ANY_QUALITY, 1) else {}
-        if own.get("amount") and own["covered_hours"] >= 24 and (not history.get("last_day") or parse_time(own["newest_bucket_end"]) > parse_time(history["last_day"])):
-            average, per_day, sales_source = own["weighted_average"], own["amount"] / own["covered_hours"] * 24, "me"
-        # state() keeps the studies current; rebuilding them on every 10-second watch read would be too heavy.
+        average, per_day, sales_source = self.watch_pace(view, listing["city"])
         share = next((s["instant_buy_share"] for s in getattr(self, "_studies", []) if s["item"] == view["item"] and s["city"] == listing["city"]), None)
         hours = self.hourly_sales(view["item"], view["quality"], listing["city"])
         sold = sum(h["units"] for h in hours)
@@ -2675,8 +2712,10 @@ class Store:
                 part = sum(h["units"] for h in over) / sold
                 mine = per_day * part * cfg["cycle_share"] if per_day else None
                 bought = buy(int(mine * WATCH_SELL_DAYS), price * keep) if mine else {"units": 0, "invested": 0, "profit": 0, "roi": None}
+                ordered = place(int(mine * WATCH_SELL_DAYS), price * keep) if mine else {"units": 0, "invested": 0, "profit": 0, "roi": None}
                 levels.append({"price": price, "hours": len(over), "days": len({h["end"].date() for h in over}), "share": part, "per_day": per_day * part if per_day else None,
-                               "my_per_day": mine, "sells": int(mine * WATCH_SELL_DAYS) if mine else 0, "units": bought["units"], "invested": bought["invested"], "profit": bought["profit"], "roi": bought["roi"]})
+                               "my_per_day": mine, "sells": int(mine * WATCH_SELL_DAYS) if mine else 0, "units": bought["units"], "invested": bought["invested"], "profit": bought["profit"], "roi": bought["roi"],
+                               "order_units": ordered["units"], "order_invested": ordered["invested"], "order_profit": ordered["profit"], "order_roi": ordered["roi"]})
             share = levels[0]["share"]
         zone = ZoneInfo(cfg["timezone"])
         by_hour = defaultdict(list)
@@ -2687,8 +2726,15 @@ class Store:
         my_per_day = per_day * (PLAN_INSTANT_SHARE if share is None else share) * cfg["cycle_share"] if per_day else None
         days = result["units"] / my_per_day if my_per_day and result["units"] else None
         fit = buy(int(my_per_day * WATCH_SELL_DAYS)) if days is not None and days > WATCH_SELL_DAYS else None
+        order = place(WATCH_BUDGET)
+        order_days = order["units"] / my_per_day if my_per_day and order["units"] else None
+        order_oldest = min(filter(None, (order.pop("oldest"), listing["seen"])))
+        order.update(days=order_days, fit=place(int(my_per_day * WATCH_SELL_DAYS)) if order_days is not None and order_days > WATCH_SELL_DAYS else None,
+                     prices={f["city"]: f["price"] for f in fills}, known=bool(fills), best_roi=net / order_unit(fills[0]) - 1 if fills else None,
+                     average_roi=(average * keep * order["units"] - order["invested"]) / order["invested"] if average and average < listing["price"] and order["invested"] else None,
+                     age_minutes=round((self.clock() - parse_time(order_oldest)).total_seconds() / 60))
         oldest = min(filter(None, (result.pop("oldest"), listing["seen"])))
-        result.update(sales=sales, share_from_hours=bool(levels), budget=WATCH_BUDGET, net_price=net, list_price=listing["price"], list_city=listing["city"], depth_known=bool(asks), sales_source=sales_source,
+        result.update(order=order, sales=sales, share_from_hours=bool(levels), budget=WATCH_BUDGET, net_price=net, list_price=listing["price"], list_city=listing["city"], depth_known=bool(asks), sales_source=sales_source,
                       best_roi=net / carried(rows[0]) - 1, average=average, per_day=per_day, sell_order_share=PLAN_INSTANT_SHARE if share is None else share, cycle_share=cfg["cycle_share"], my_per_day=my_per_day, days=days, fit=fit,
                       average_roi=(average * keep * result["units"] - result["invested"]) / result["invested"]
                       if average and average < listing["price"] and result["invested"] else None,
@@ -2697,22 +2743,26 @@ class Store:
 
     def watches(self):
         """Every watched item over the trade cities, newest source per city (this PC, the live stream or the
-        public API, values within a day): the cheapest sell, the dearest buy, and list: the city whose cheapest
-        sell is highest, where a sell order can be listed for the most. The buy alert reads the cheapest sell;
-        the sell alert reads list. An alert counts as live only on a value seen within the last hour.
+        public API, values within a day): the cheapest sell, the dearest buy, list: the city whose cheapest
+        sell is highest, where a sell order can be listed for the most, and order: the city where a buy order on top of
+        the bids costs least, among those with recent sales when any has them. The buy alert reads the cheapest sell;
+        the order alert reads order; the sell alert reads list. An alert counts as live only on a value seen within the
+        last hour.
 
         list guards against false alerts. The stream can carry one expensive order of a city without its cheaper
         ones, so a lower public price from the last day wins for that city unless a newer scan listed the city from its
         best price on; a city's floor that is my own open
-        order says nothing about the market and is skipped; a floor over twice the middle city's is an outlier."""
+        order says nothing about the market and is skipped; a floor over twice the middle city's is an outlier.
+        order guards the same way, mirrored: a higher public bid wins, my own top bid is skipped, and a bid under half
+        the middle city's is an outlier."""
         now, cities = self.clock(), self.lookup_cities()
         out = []
-        for w in self.db.execute("SELECT id, item, quality, buy_below, sell_above FROM watches ORDER BY id").fetchall():
+        for w in self.db.execute("SELECT id, item, quality, buy_below, order_below, sell_above FROM watches ORDER BY id").fetchall():
             view = self.lookup_item(w["item"], w["quality"])
             best = {"sell": None, "buy": None}
-            floors, skipped_own = [], 0
-            mine = {(r["city"], round(r["price"])) for r in self.db.execute(
-                "SELECT city, price FROM my_orders WHERE item=? AND side='sell' AND closed IS NULL AND COALESCE(remaining, amount)>0", (w["item"],))}
+            floors, skipped_own = {"sell": [], "buy": []}, {"sell": 0, "buy": 0}
+            mine = {side: {(r["city"], round(r["price"])) for r in self.db.execute(
+                "SELECT city, price FROM my_orders WHERE item=? AND side=? AND closed IS NULL AND COALESCE(remaining, amount)>0", (w["item"], side))} for side in ("sell", "buy")}
             for row in view["cities"]:
                 for side in ("sell", "buy"):
                     local, pub = row["local"].get(side), row["public"] or {}
@@ -2731,38 +2781,42 @@ class Store:
                     b = best[side]
                     if b is None or (q["price"] < b["price"] if side == "sell" else q["price"] > b["price"]):
                         best[side] = q
-                    if side != "sell":
-                        continue
                     floor = q
                     # A scan newer than the public price has already told us the city's real best price.
                     scanned = local and local.get("scan") and seen_pub and parse_time(local["scan"]) >= parse_time(seen_pub)
-                    if q["source"] != "public" and pub.get("sell") and pub["sell"] < q["price"] and not scanned:
+                    if q["source"] != "public" and pub.get(side) and (pub[side] < q["price"] if side == "sell" else pub[side] > q["price"]) and not scanned:
                         pub_age = (now - parse_time(seen_pub)).total_seconds() / 60
                         if pub_age <= 24 * 60:
-                            floor = {"price": pub["sell"], "amount": None, "seen": seen_pub, "quality": pub.get("sell_quality"),
+                            floor = {"price": pub[side], "amount": None, "seen": seen_pub, "quality": pub.get(side + "_quality"),
                                      "source": "public", "city": row["city"], "age_minutes": round(pub_age)}
-                    if (row["city"], round(floor["price"])) in mine:
-                        skipped_own += 1
+                    if (row["city"], round(floor["price"])) in mine[side]:
+                        skipped_own[side] += 1
                     else:
-                        floors.append(floor)
-            prices = sorted(f["price"] for f in floors)
-            usable = [f for f in floors if f["price"] <= prices[(len(prices) - 1) // 2] * 2]
+                        floors[side].append(floor)
+            prices = sorted(f["price"] for f in floors["sell"])
+            usable = [f for f in floors["sell"] if f["price"] <= prices[(len(prices) - 1) // 2] * 2]
             listing = max(usable, key=lambda f: f["price"]) if usable else None
+            bids = sorted(f["price"] for f in floors["buy"])
+            tops = [f for f in floors["buy"] if f["price"] * 2 >= bids[len(bids) // 2]]
+            fills = self.watch_fills(view, tops)
+            order = next((f for f in fills if f["per_day"]), fills[0] if fills else None)
             sell, buy = best["sell"], best["buy"]
             with closing(lookup.connect(self.root)) as ldb:
                 asks = lookup.sell_levels(ldb, w["item"], w["quality"], lambda loc: c if (c := location(loc)) in cities else None, now)
             # A newer public best price than an order we heard means that cheaper order has gone.
             publics = {r["city"]: r["public"] for r in view["cities"] if r["public"] and r["public"]["sell"] and r["public"]["sell_seen"]}
-            asks = [a for a in asks if (a["city"], a["price"]) not in mine and not (
+            asks = [a for a in asks if (a["city"], a["price"]) not in mine["sell"] and not (
                 a["city"] in publics and a["price"] < publics[a["city"]]["sell"] and parse_time(a["seen"]) < parse_time(publics[a["city"]]["sell_seen"]))]
             out.append({"id": w["id"], "item": w["item"], "quality": w["quality"], "name": view["name"],
-                        "buy_below": w["buy_below"], "sell_above": w["sell_above"], "sell": sell, "buy": buy, "list": listing,
-                        "list_skipped": {"own": skipped_own, "outlier": len(floors) - len(usable)},
+                        "buy_below": w["buy_below"], "order_below": w["order_below"], "sell_above": w["sell_above"], "sell": sell, "buy": buy, "list": listing, "order": order,
+                        "list_skipped": {"own": skipped_own["sell"], "outlier": len(floors["sell"]) - len(usable)},
+                        "order_skipped": {"own": skipped_own["buy"], "outlier": len(floors["buy"]) - len(tops)},
                         "buy_hit": bool(sell and w["buy_below"] and sell["price"] <= w["buy_below"]),
+                        "order_hit": bool(order and w["order_below"] and order["price"] <= w["order_below"]),
                         "sell_hit": bool(listing and w["sell_above"] and listing["price"] >= w["sell_above"]),
-                        "buy_live": bool(sell and sell["age_minutes"] <= 60), "sell_live": bool(listing and listing["age_minutes"] <= 60),
+                        "buy_live": bool(sell and sell["age_minutes"] <= 60), "order_live": bool(order and order["age_minutes"] <= 60), "sell_live": bool(listing and listing["age_minutes"] <= 60),
                         "depth": self.watch_depth(asks, prices[(len(prices) - 1) // 2] * 2 if prices else None),
-                        "forecast": self.watch_forecast(view, asks, sell, listing), "public_loading": view["public_loading"], "public_error": view["public_error"]})
+                        "forecast": self.watch_forecast(view, asks, sell, listing, fills), "public_loading": view["public_loading"], "public_error": view["public_error"]})
         try:
             with closing(lookup.connect(self.root, timeout=2)) as ldb:
                 stream = lookup.get_meta(ldb)

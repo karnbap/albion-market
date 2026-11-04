@@ -342,6 +342,57 @@ class WatchTests(unittest.TestCase):
         self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
         return self.store.watches()["watches"][0]["forecast"]
 
+    def test_watch_splits_buying_now_from_placing_a_buy_order(self):
+        with closing(lookup.connect(self.root)) as db:
+            seen = (self.now - timedelta(minutes=5)).isoformat()
+            lookup.add_orders(db, [self.order(10, 6_000, "1002", side="request"), self.order(11, 5_000, "3008", side="request")], "stream", seen)
+        f = self.forecast_case()
+        w = self.store.watches()["watches"][0]
+        # Martlock's bid is lower but it has no sales; Lymhurst has them, half into buy orders.
+        self.assertEqual((w["order"]["city"], w["order"]["best"], w["order"]["price"], w["order"]["per_day"]), ("1002", 6_000, 6_001, 50))
+        o = f["order"]
+        # 50 a day × 7 days × my 20% = 70 units, paying the setup fee on the order too.
+        self.assertEqual((o["units"], o["cities"], o["prices"]["1002"]), (70, {"1002": 70}, 6_001))
+        self.assertAlmostEqual(o["invested"], 70 * 6_001 * 1.025)
+        self.assertAlmostEqual(o["profit"], 70 * 10_000 * 0.895 - 70 * 6_001 * 1.025)
+        # Buying now is reckoned on its own, from the sell orders.
+        self.assertEqual(f["cities"], {"3008": f["units"]})
+
+    def test_watch_order_alert_is_its_own(self):
+        with closing(lookup.connect(self.root)) as db:
+            lookup.add_orders(db, [self.order(10, 5_000, "1002", side="request")], "stream", (self.now - timedelta(minutes=5)).isoformat())
+        self.forecast_case()
+        wid = self.store.watches()["watches"][0]["id"]
+        self.store.set_watch({"action": "update", "id": wid, "order_below": 5_001})
+        w = self.store.watches()["watches"][0]
+        self.assertTrue(w["order_hit"] and w["order_live"])
+        self.assertFalse(w["buy_hit"])
+        self.store.set_watch({"action": "update", "id": wid, "order_below": 5_000, "buy_below": 7_000})
+        w = self.store.watches()["watches"][0]
+        self.assertFalse(w["order_hit"])
+        self.assertTrue(w["buy_hit"])
+        # An update naming one alert leaves the others.
+        self.store.set_watch({"action": "update", "id": wid, "sell_above": 9_000})
+        w = self.store.watches()["watches"][0]
+        self.assertEqual((w["order_below"], w["buy_below"], w["sell_above"]), (5_000, 7_000, 9_000))
+        with self.assertRaises(ValueError):
+            self.store.set_watch({"action": "update", "id": wid, "order_below": 0})
+
+    def test_watch_order_skips_my_top_bid_and_outliers_and_trusts_a_higher_public_bid(self):
+        with closing(lookup.connect(self.root)) as db:
+            seen = (self.now - timedelta(minutes=5)).isoformat()
+            # A junk bid in Thetford, my own top bid in Martlock, and a stream bid in Lymhurst under a newer-looking public one.
+            lookup.add_orders(db, [self.order(10, 100, "7", side="request"), self.order(11, 6_000, "3008", side="request"),
+                                   self.order(12, 5_000, "1002", side="request"), self.order(13, 5_500, "2004", side="request")], "stream", seen)
+        self.store.db.execute("INSERT INTO my_orders(item,city,side,price,amount,created) VALUES('T7_RELIC','3008','buy',6000,3,?)", (self.now.isoformat(),))
+        self.store.db.commit()
+        lookup.public.cache["T7_RELIC"] = {"fetched": time.time(), "error": "", "history": [], "prices": [
+            {"city": "Lymhurst", "quality": 1, "sell_price_min": 0, "sell_price_min_date": "0001-01-01T00:00:00", "buy_price_max": 5_800, "buy_price_max_date": (self.now - timedelta(hours=1)).replace(tzinfo=None).isoformat()}]}
+        self.store.set_watch({"action": "add", "item": "T7_RELIC", "quality": 0})
+        w = self.store.watches()["watches"][0]
+        self.assertEqual((w["order"]["city"], w["order"]["best"]), ("2004", 5_500))
+        self.assertEqual(w["order_skipped"], {"own": 1, "outlier": 1})
+
     def test_watch_shows_the_average_of_buying_a_sum_and_where(self):
         self.forecast_case()
         with closing(lookup.connect(self.root)) as db:
