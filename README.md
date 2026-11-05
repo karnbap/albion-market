@@ -111,6 +111,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\enable-game-watch.ps1
 
 분석 보고서를 SMTP로 보내는 선택 기능은 기본 꺼짐입니다. 수신자·발송 시간·계정은 로컬 설정으로 지정하고, 비밀번호는 `ALBION_SMTP_PASSWORD` 환경변수에 둡니다. 게임 내 거래 메일 수집과 SMTP 보고서는 별개입니다.
 
+## Claude 대화 탭
+
+프로그램 안에서 이 컴퓨터의 Claude Code에게 시세·재고·주문을 물어봅니다. 처음 한 번 터미널에서 `claude auth login`으로 로그인해야 합니다. 쓴 만큼 Claude 요금제 사용량에서 차감됩니다.
+
+- **읽기만 합니다.** 파일 읽기·찾기와 `market_tools.py`의 시세 조회만 허용하고, 명령 실행·파일 수정·다른 MCP 연결은 주지 않습니다. `config.json`과 `data/`는 직접 읽지 못하게 막습니다.
+- **보내는 자료.** 질문을 보낼 때 현재 상태를 `data/chat/snapshot.json`에 씁니다(접속 토큰·메일 주소·호가 전체·거래 메일 원문은 뺌). 질문과 Claude가 읽은 내용은 답을 만들기 위해 Anthropic으로 전송됩니다. 공식 AODP 서버로는 보내지 않습니다.
+- **대화 저장.** 대화는 `data/chat.sqlite3`에 남고 Git에서 제외됩니다. 답은 서버에서 만들어지므로 탭을 옮기거나 새로고침해도 이어집니다. 답 하나는 10분이 지나면 멈춥니다.
+- `chat.py`를 고치면 분석 프로그램을 다시 시작해야 반영됩니다. `market.py`와 달리 자동 반영되지 않습니다.
+
 ## 개발·검증
 
 ```powershell

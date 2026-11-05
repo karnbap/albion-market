@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261104.3';
+  const legacy=next.build!=='20261105.1';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -625,3 +625,66 @@ notifyLabel();loadWatches();
 refresh();setInterval(()=>{if(document.hidden)return;refresh();if(draft&&!saving)scheduleSave()},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});
 document.addEventListener('focusout',()=>setTimeout(()=>{if(ready&&!editing())refresh()},0));
+
+// Claude chat tab. The answer runs on the server, so this only polls it; a reload picks it back up.
+const chatView={id:storage.get('chatConversation',null),data:null,timer:null,seen:''};
+const chatOpen=()=>!document.querySelector('.tab-panel[data-tab=chat]').hidden;
+function chatInline(text){return text.replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')}
+// Input is escaped first, so the markup added here is the only markup in the result.
+function chatMarkdown(raw){
+ const out=[];let table=null,list=null,para=[];
+ const flush=()=>{if(para.length){out.push(`<p>${para.join('<br>')}</p>`);para=[]}if(list){out.push(`<${list.tag}>${list.rows.map(r=>`<li>${r}</li>`).join('')}</${list.tag}>`);list=null}if(table){const[head,...rows]=table;out.push(`<div class="table-wrap"><table><thead><tr>${head.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);table=null}};
+ for(const line of esc(raw).split('\n')){
+  const t=line.trim();let m;
+  if(/^\|.*\|$/.test(t)){if(!table)flush();if(/^\|[\s:|-]+\|$/.test(t))continue;(table??=[]).push(t.slice(1,-1).split('|').map(c=>chatInline(c.trim())));continue}
+  if(table)flush();
+  if(!t){flush();continue}
+  if(m=/^#{1,6}\s+(.*)$/.exec(t)){flush();out.push(`<h4>${chatInline(m[1])}</h4>`);continue}
+  if(m=/^([-*]|\d+\.)\s+(.*)$/.exec(t)){const tag=/\d/.test(m[1])?'ol':'ul';if(para.length||(list&&list.tag!==tag))flush();(list??={tag,rows:[]}).rows.push(chatInline(m[2]));continue}
+  if(list)flush();para.push(chatInline(t));
+ }
+ flush();return out.join('');
+}
+function renderChat(){
+ const box=$('chat-log'),d=chatView.data,atEnd=box.scrollHeight-box.scrollTop-box.clientHeight<80;
+ const rows=(d?.messages||[]).map(m=>`<div class="chat-msg ${m.role==='user'?'chat-user':'chat-claude'}${m.failed?' chat-failed':''}">${chatMarkdown(m.text)}</div>`);
+ if(d?.running)rows.push(`<div class="chat-msg chat-claude">${chatMarkdown(d.running.text)}<small class="chat-status">${esc(d.running.status)}…</small></div>`);
+ const html=rows.join('')||'<p class="help chat-empty">알비온 시세·재고·주문을 무엇이든 물어보세요. 예: T7 유물 재고를 어떻게 정리할까?</p>';
+ if(html!==chatView.seen){box.innerHTML=html;chatView.seen=html;if(atEnd||d?.running)box.scrollTop=box.scrollHeight}
+ $('chat-send').hidden=!!d?.running;$('chat-stop').hidden=!d?.running;
+}
+async function loadChatList(){
+ try{const r=await (await fetch('/api/chat')).json();
+  $('chat-pick').innerHTML='<option value="">새 대화</option>'+r.conversations.map(c=>`<option value="${esc(c.id)}">${esc(c.title)}${c.running?' (답하는 중)':''}</option>`).join('');
+  if(chatView.id&&!r.conversations.some(c=>c.id===chatView.id))chatView.id=null;
+  $('chat-pick').value=chatView.id||'';
+  $('chat-status-line').textContent=r.available?'':'이 컴퓨터에서 Claude Code를 찾지 못했습니다.';
+ }catch(e){$('chat-status-line').textContent='불러오지 못했습니다: '+e.message}
+}
+async function loadChat(){
+ clearTimeout(chatView.timer);
+ if(!chatView.id){chatView.data=null;renderChat();return}
+ const id=chatView.id;
+ try{const r=await fetch('/api/chat/conversation?id='+encodeURIComponent(id)),data=await r.json();if(id!==chatView.id)return;if(!r.ok)throw Error(data.error||r.status);
+  const wasRunning=chatView.data?.running;chatView.data=data;renderChat();
+  if(data.running){if(chatOpen())chatView.timer=setTimeout(loadChat,700)}else if(wasRunning)loadChatList();
+ }catch(e){$('chat-status-line').textContent='불러오지 못했습니다: '+e.message}
+}
+function pickChat(id){chatView.id=id||null;chatView.data=null;storage.set('chatConversation',chatView.id);$('chat-pick').value=id||'';$('chat-status-line').textContent='';loadChat()}
+async function sendChat(){
+ const box=$('chat-input'),text=box.value.trim();if(!text||$('chat-send').disabled)return;
+ $('chat-send').disabled=true;$('chat-status-line').textContent='자료를 준비하는 중…';
+ try{const r=await post('/api/chat/send',{conversation:chatView.id,text});box.value='';storage.set('chatDraft','');$('chat-status-line').textContent='';chatView.id=r.conversation;storage.set('chatConversation',r.conversation);await loadChatList();await loadChat();box.focus()}
+ catch(e){$('chat-status-line').textContent='보내지 못했습니다: '+e.message}
+ finally{$('chat-send').disabled=false}
+}
+$('chat-input').value=storage.get('chatDraft','');
+$('chat-input').oninput=e=>storage.set('chatDraft',e.target.value);
+// isComposing: Enter that finishes a Korean syllable must not send the message.
+$('chat-input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendChat()}};
+$('chat-send').onclick=sendChat;
+$('chat-stop').onclick=async()=>{try{await post('/api/chat/stop',{conversation:chatView.id})}catch(e){$('chat-status-line').textContent='멈추지 못했습니다: '+e.message}};
+$('chat-new').onclick=()=>{pickChat(null);$('chat-input').focus()};
+$('chat-pick').onchange=e=>pickChat(e.target.value);
+document.querySelector('.tabs').addEventListener('click',e=>{if(e.target.closest('[data-tab=chat]')){loadChatList();loadChat()}});
+if(storage.get('tab','now')==='chat'){loadChatList();loadChat()}
