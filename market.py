@@ -52,7 +52,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "buy_order_targets": {}, "sell_targets": {}}
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261104.3"
+BUILD = "20261105.2"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -2061,7 +2061,8 @@ class Store:
         orders, sales tax and transport. The order goes one silver over the best other bid when the target allows,
         else at the target behind the orders at or above it (my own orders are not in the way). Sales into buy orders
         (slowest daily pace, less the instant-buy share, half when unmeasured) clear those first, and of the rest the
-        order takes the cycle_share setting, as in the trading plan, since others keep bidding."""
+        order takes the cycle_share setting, as in the trading plan, since others keep bidding. An old list's units can
+        be long gone, so fresh_units, fresh_cost and fresh_profit add only the lists still inside fresh_minutes."""
         cfg, keep, out = self.cfg, 1 - self.cfg["sales_tax"] - self.cfg["setup_fee"], []
         measured = {(s["item"], s["city"]): s["instant_buy_share"] for s in self.market_studies(cache)}
         for item in cfg["items"]:
@@ -2092,10 +2093,14 @@ class Store:
                         row["profit"] = row["units"] * (sell * keep - carry) - row["cost"] if sell else None
                 rows.append(row)
             units = sum(r["units"] for r in rows)
+            fresh = [r for r in rows if r["fresh"]]
+            fresh_units = sum(r["units"] for r in fresh)
             out.append({"item": item, "target": target, "chosen": cfg["buy_order_targets"].get(item), "suggested": suggested,
                         "sell_city": sell_city, "sell": sell, "sell_average": sell_average, "days": WATCH_SELL_DAYS,
                         "rows": rows, "units": units, "cost": sum(r["cost"] for r in rows),
-                        "profit": sum(r["profit"] for r in rows if r["profit"] is not None) if units and sell else None})
+                        "profit": sum(r["profit"] for r in rows if r["profit"] is not None) if units and sell else None,
+                        "fresh_units": fresh_units, "fresh_cost": sum(r["cost"] for r in fresh),
+                        "fresh_profit": sum(r["profit"] for r in fresh if r["profit"] is not None) if fresh_units and sell else None})
         return out
 
     def sell_targets(self, books, open_orders, holdings, cache):
