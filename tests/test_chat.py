@@ -63,7 +63,7 @@ class ChatTests(unittest.TestCase):
         return [json.loads(line) for line in (self.root / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
 
     def ask(self, text, conversation=None):
-        cid = self.room.send({"text": text, "conversation": conversation}, {"items": {}})["conversation"]
+        cid = self.room.send({"text": text, "conversation": conversation}, {"items": {}, "cities": {"2004": "Bridgewatch"}})["conversation"]
         for _ in range(400):
             if cid not in chat.JOBS:
                 return cid, self.room.conversation(cid)
@@ -73,7 +73,7 @@ class ChatTests(unittest.TestCase):
     def test_answer_is_saved_and_the_next_message_resumes_the_session(self):
         cid, data = self.ask("T7 유물 재고는?")
         self.assertEqual([m["role"] for m in data["messages"]], ["user", "assistant"])
-        self.assertEqual(data["messages"][1]["text"], "첫 부분\n\n끝 부분")
+        self.assertEqual(data["messages"][1]["text"], "끝 부분")
         self.assertFalse(data["messages"][1]["failed"])
         self.assertEqual(data["title"], "T7 유물 재고는?")
         self.assertIsNone(data["running"])
@@ -91,11 +91,12 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
         self.assertIn("--strict-mcp-config", args)
         allowed = args[args.index("--allowedTools") + 1].split(",")
-        self.assertFalse([t for t in allowed if t not in ("Read", "Grep", "Glob") and not t.startswith("mcp__albion__")])
+        self.assertEqual(allowed, [f"mcp__albion__{name}" for name in chat.TOOL_NAMES])
         denied = args[args.index("--disallowedTools") + 1]
         self.assertIn("Read(./config.json)", denied)
         self.assertIn("Read(./data/**)", denied)
         self.assertNotIn("질문", " ".join(args))
+        self.assertIn('"2004": "Bridgewatch"', args[args.index("--append-system-prompt") + 1])
 
     def test_session_variables_of_a_parent_claude_are_not_inherited(self):
         with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "x", "ANTHROPIC_BASE_URL": "http://x", "CLAUDE_CODE_OAUTH_TOKEN": "synthetic"}):
@@ -196,7 +197,7 @@ class ChatHttpTests(unittest.TestCase):
             if not data["running"]:
                 break
             time.sleep(.025)
-        self.assertEqual(data["messages"][-1]["text"], "첫 부분\n\n끝 부분")
+        self.assertEqual(data["messages"][-1]["text"], "끝 부분")
         snapshot = json.loads((self.root / "data" / "chat" / "snapshot.json").read_text(encoding="utf-8"))
         self.assertIn("holdings", snapshot)
         self.assertNotIn("token", snapshot)
