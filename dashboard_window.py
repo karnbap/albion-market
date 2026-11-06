@@ -14,6 +14,7 @@ import time
 # web/index.html <title>; Edge app windows are titled by the page alone.
 TITLE = 'Albion Trade Master'
 SW_MINIMIZE, SW_RESTORE = 6, 9
+WM_CLOSE = 0x0010
 
 
 def edge_path():
@@ -38,6 +39,14 @@ def find_window():
         return True
     user.EnumWindows(visit, 0)
     return found[0] if found else None
+
+
+def close_window():
+    """Asks the dashboard window to close, as its close button would. Returns whether one was open."""
+    if hwnd := find_window():
+        ctypes.WinDLL('user32', use_last_error=True).PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        return True
+    return False
 
 
 def open_window(address, background=False, wait=15):

@@ -20,7 +20,7 @@ $albionWatchShortcut.TargetPath=$albionWatchPython
 $albionWatchShortcut.Arguments='"'+$albionWatchScript+'"'
 $albionWatchShortcut.WorkingDirectory=$albionWatchRoot
 $albionWatchShortcut.WindowStyle=7
-$albionWatchShortcut.Description='Start local market capture with Albion; stop capture after the game exits.'
+$albionWatchShortcut.Description='Start local market capture with Albion; stop capture and the analysis app after the game exits.'
 $albionWatchShortcut.Save()
 if(-not $InstallOnly) {
     Start-Process -FilePath $albionWatchPython -ArgumentList @('"'+$albionWatchScript+'"') -WorkingDirectory $albionWatchRoot -WindowStyle Hidden

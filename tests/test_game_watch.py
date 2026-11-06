@@ -13,9 +13,10 @@ class FakePlatform:
     def __init__(self):
         self.names = set()
         self.running = False
-        self.starts = self.stops = self.receiver_starts = self.windows = 0
+        self.starts = self.stops = self.receiver_starts = self.windows = self.app_stops = 0
         self.success = True
         self.receiver = True
+        self.chat = False
     def processes(self): return self.names
     def capture_running(self): return self.running
     def start_capture(self):
@@ -32,6 +33,11 @@ class FakePlatform:
         self.receiver = self.success
         return self.success
     def open_dashboard(self): self.windows += 1
+    def chat_running(self): return self.chat
+    def stop_app(self):
+        self.app_stops += 1
+        self.receiver = not self.success
+        return self.success
 
 
 class GameWatchTests(unittest.TestCase):
@@ -64,6 +70,51 @@ class GameWatchTests(unittest.TestCase):
         self.step(1)
         self.assertEqual(self.platform.stops,1)
         self.assertFalse(self.platform.running)
+
+    def test_exit_closes_app_once_after_capture(self):
+        self.platform.names={GAME};self.step()
+        self.platform.names=set();self.step();self.step(9)
+        self.assertEqual(self.platform.app_stops,0)
+        self.step(1)
+        self.assertEqual((self.platform.stops,self.platform.app_stops),(1,1))
+        self.assertFalse(self.platform.receiver)
+        self.step(3);self.step(30)
+        self.assertEqual(self.platform.app_stops,1)
+
+    def test_app_opened_without_game_stays_open(self):
+        self.step();self.step(30);self.step(300)
+        self.assertEqual(self.platform.app_stops,0)
+
+    def test_running_claude_answer_delays_close(self):
+        self.platform.names={GAME};self.step()
+        self.platform.names=set();self.platform.chat=True
+        self.step();self.step(10);self.step(60)
+        self.assertEqual(self.platform.stops,1)
+        self.assertEqual(self.platform.app_stops,0)
+        self.platform.chat=False;self.step(3)
+        self.assertEqual(self.platform.app_stops,1)
+
+    def test_failed_app_stop_is_not_retried_in_a_loop(self):
+        self.platform.names={GAME};self.step()
+        self.platform.names=set();self.platform.success=False
+        with self.assertLogs(level='INFO') as logs: self.step();self.step(10);self.step(3);self.step(3)
+        self.assertEqual(self.platform.app_stops,1)
+        self.assertIn('분석 프로그램 종료 확인 필요',' '.join(logs.output))
+
+    def test_next_game_after_close_starts_app_again(self):
+        self.platform.names={GAME};self.step()
+        self.platform.names=set();self.step();self.step(10)
+        self.platform.names={GAME};self.step(3)
+        for _ in range(5): self.step(3)
+        self.assertEqual(self.platform.receiver_starts,1)
+        self.assertTrue(self.platform.receiver)
+        self.assertEqual(self.platform.windows,1)
+
+    def test_manual_stop_session_does_not_close_app_later(self):
+        self.platform.names={GAME};self.step()
+        (self.root/'data/game-watch-paused').write_text('manual')
+        self.platform.names=set();self.step(3);self.step(3);self.step(30)
+        self.assertEqual(self.platform.app_stops,0)
 
     def test_brief_game_restart_cancels_pending_stop(self):
         self.platform.names={GAME};self.step()
@@ -171,8 +222,11 @@ class GameWatchTests(unittest.TestCase):
         self.assertEqual(self.platform.windows,1)
         self.platform.names=set()
         for _ in range(5): self.step(3)
+        # The exit closed the analysis program, so the next game starts it again before the window.
+        self.assertFalse(self.platform.receiver)
         self.platform.names={GAME}
-        for _ in range(3): self.step(3)
+        for _ in range(6): self.step(3)
+        self.assertEqual(self.platform.receiver_starts,1)
         self.assertEqual(self.platform.windows,2)
 
     def test_launcher_uses_file_output_not_gui_inherited_pipes(self):
