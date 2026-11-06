@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261105.1';
+  const legacy=next.build!=='20261105.2';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -342,6 +342,8 @@ function renderBuyouts(){
  updateHtml('buyouts',rows.length?table(buyoutHead,rows.map(buyoutRow),'buyouts'):pastBuyouts.length?`<p class="warn past-note">${esc(noBuyouts)}</p><h3 class="sub-head">지난 분석 · ${date(state.past_buyouts.seen)} (${ago(state.past_buyouts.seen)}) 기준</h3><p class="help">그때 본 매도 목록으로 계산한 결과입니다. 지금은 매물이 팔리거나 새로 올라와 바뀌었을 수 있으니, 사기 전에 게임에서 그 시장을 다시 열어 확인해 주세요.</p>${table(buyoutHead,pastBuyouts.map(buyoutRow),'buyouts-past')}`:empty(noBuyouts));
 }
 let buyMode=storage.get('buyMode','instant')==='order'?'order':'instant';
+const buyOpen=new Set();
+const shortAgo=v=>{const days=Math.floor((Date.now()-Date.parse(v))/86400000);return days>=2?`${days}일 전`:ago(v)};
 function renderBuyUnder(){
  const order=buyMode==='order',rows=order?state.buy_order_under:state.buy_under;
  for(const b of document.querySelectorAll('#buy-under-mode button')){const on=b.dataset.mode===buyMode;b.classList.toggle('active',on);b.setAttribute('aria-pressed',on)}
@@ -349,10 +351,21 @@ function renderBuyUnder(){
  if(!rows){updateHtml('buy-under',empty('분석 프로그램을 다시 실행하면 나옵니다.'));return}
  const cities=rows[0]?.rows.map(r=>r.city)||[],city=c=>esc(state.cities[c]||c);
  $('buy-under-context').textContent=`${cities.map(c=>state.cities[c]).join(', ')} · 각 시장의 마지막 ${order?'매수':'매도'} 목록`;
- const orderCell=r=>!r.known?`<td><small>${r.seen?'단일 주문만 봄':'미조회'}</small></td>`:`<td class="${r.units?'':'muted'}"><b>${r.per_day?`${n(r.units)}개`:'물량 모름'}</b>${r.units?`<small>${n(r.price)}에 주문 · ${n(r.cost)} 실버</small>`:''}<small>최고 매수 ${r.best!=null?n(r.best):'-'}</small><small>앞선 주문 ${n(r.ahead)}개</small><small>${r.per_day?`하루 매수 체결 ${n(r.per_day)}개`:'거래 기록 없음'}</small><small>${r.fresh?'유효':'지난 자료'} · ${ago(r.seen)}</small></td>`;
- const cell=r=>order?orderCell(r):!r.known?`<td><small>${r.seen?'단일 주문만 봄':'미조회'}</small></td>`:`<td class="${r.units?'':'muted'}"><b>${n(r.units)}개</b>${r.units?`<small>평균 ${n(r.average)} · ${n(r.cost)} 실버</small>`:''}<small>최저 ${n(r.lowest)}</small><small>${r.fresh?'유효':'지난 자료'} · ${ago(r.seen)}</small></td>`;
- const line=u=>`<tr><th scope="row">${tierLabel(state.items[u.item])}</th><td><form class="buy-target-form" data-item="${esc(u.item)}"><input type="number" name="price" min="1" step="1" inputmode="numeric" aria-label="${esc(state.items[u.item])} 목표가" value="${u.chosen??''}" placeholder="${u.suggested??''}"></form><small>${u.chosen?'직접 정함':u.suggested?'자동 제안':'팔 곳 호가 없음'}${u.chosen&&u.suggested?` · 제안 ${n(u.suggested)}`:''}</small></td>${u.rows.map(cell).join('')}<td><b>${n(u.units)}개</b>${u.units?`<small>${n(u.cost)} 실버</small>`:''}${u.profit!=null?`<small class="${u.profit>0?'positive':'warn'}">예상 ${u.profit>0?'+':''}${n(u.profit)}</small>`:''}</td><td>${u.sell_city?`${city(u.sell_city)} <b>${n(u.sell)}</b><small>7일 평균 체결 ${u.sell_average!=null?n(u.sell_average):'-'}</small>`:'-'}</td></tr>`;
- updateHtml('buy-under',rows.length?table(['품목',order?'목표가 (주문 매수)':'목표가 (바로 사기)',...cities.map(c=>state.cities[c]),order?`합계 (${rows[0].days}일)`:'합계','팔 곳 · 지금 최저 매도'],rows.map(line),'buy-under'):empty('추적 품목이 없습니다.'));
+ const cell=r=>!r.known?`<td><small>${r.seen?'단일 주문만 봄':'미조회'}</small></td>`:`<td class="${r.units?'':'muted'}"><b>${n(r.units)}개</b>${r.units?`<small>평균 ${n(r.average)} · ${n(r.cost)} 실버</small>`:''}<small>최저 ${n(r.lowest)}</small><small>${r.fresh?'유효':'지난 자료'} · ${ago(r.seen)}</small></td>`;
+ const targetCell=u=>`<td class="bu-target"><form class="buy-target-form" data-item="${esc(u.item)}"><input type="number" name="price" min="1" step="1" inputmode="numeric" aria-label="${esc(state.items[u.item])} 목표가" value="${u.chosen??''}" placeholder="${u.suggested??''}"></form><small>${u.chosen?'직접 정함':u.suggested?'자동 제안':'팔 곳 호가 없음'}${u.chosen&&u.suggested?` · 제안 ${n(u.suggested)}`:''}</small></td>`;
+ const sellCell=u=>`<td>${u.sell_city?`${city(u.sell_city)} <b>${n(u.sell)}</b><small>7일 평균 체결 ${u.sell_average!=null?n(u.sell_average):'-'}</small>`:'-'}</td>`;
+ const expected=v=>`예상 ${v>0?'+':''}${n(v)}`;
+ const line=u=>`<tr><th scope="row">${tierLabel(state.items[u.item])}</th>${targetCell(u)}${u.rows.map(cell).join('')}<td><b>${n(u.units)}개</b>${u.units?`<small>${n(u.cost)} 실버</small>`:''}${u.profit!=null?`<small class="${u.profit>0?'positive':'warn'}">${expected(u.profit)}</small>`:''}</td>${sellCell(u)}</tr>`;
+ // Order view: each city shows only the quantity and the orders ahead; the rest unfolds with the row.
+ const orderCell=(u,r,top)=>!r.known?`<td class="bu-cell"><small>${r.seen?'단일 주문만 봄':'미조회'}</small></td>`:`<td class="bu-cell${r.units?'':' muted'}${r.fresh?'':' bu-stale'}${r.fresh&&r.units&&r.units===top?' bu-top':''}"><b class="bu-qty">${r.per_day?`${n(r.units)}개`:'물량 모름'}</b>${r.units&&r.price!==u.target?`<small class="bu-num">${n(r.price)}에 주문</small>`:''}${r.price!=null?`<small class="bu-num${r.ahead?'':' positive'}">앞선 ${n(r.ahead)}개</small>`:''}${r.fresh?'':`<small class="bu-age">${shortAgo(r.seen)}</small>`}</td>`;
+ const orderTotal=u=>`<td class="bu-total"><b class="bu-qty">${n(u.fresh_units)}개</b>${u.fresh_units?`<small>${n(u.fresh_cost)} 실버</small>`:''}${u.fresh_profit!=null?`<small class="${u.fresh_profit>0?'positive':'warn'}">${expected(u.fresh_profit)}</small>`:''}${u.units!==u.fresh_units?`<small class="bu-all">지난 자료 포함 ${n(u.units)}개 · ${n(u.cost)} 실버${u.profit!=null?` · ${expected(u.profit)}`:''}</small>`:''}</td>`;
+ const fact=(label,value,tone='')=>`<dt>${label}</dt><dd class="${tone}">${value}</dd>`;
+ const orderDetail=r=>`<div class="bu-detail-city${r.fresh?'':' bu-stale'}"><strong>${city(r.city)}</strong>${r.known?`<dl>${fact('주문 값',r.price!=null?`${n(r.price)} 실버`:'-')}${fact('총 실버',r.units?n(r.cost):'-')}${fact('최고 매수',r.best!=null?n(r.best):'-')}${fact('앞선 주문',`${n(r.ahead)}개`,r.price!=null&&!r.ahead?'positive':'')}${fact('하루 매수 체결',r.per_day?`${n(r.per_day)}개`:'거래 기록 없음')}${fact(r.fresh?'유효':'지난 자료',date(r.seen))}</dl>`:`<dl>${fact(r.seen?'단일 주문만 봄':'미조회',r.seen?date(r.seen):'-')}</dl>`}</div>`;
+ const orderLine=u=>{const top=Math.max(0,...u.rows.filter(r=>r.known&&r.fresh).map(r=>r.units)),open=buyOpen.has(u.item),detail=`buy-detail-${esc(u.item)}`;
+  return `<tr class="bu-row${open?' open':''}" data-buy-row="${esc(u.item)}"><th scope="row"><button type="button" class="bu-toggle" data-buy-toggle="${esc(u.item)}" aria-expanded="${open}" aria-controls="${detail}">${tierLabel(state.items[u.item])}</button></th>${targetCell(u)}${u.rows.map(r=>orderCell(u,r,top)).join('')}${orderTotal(u)}${sellCell(u)}</tr><tr class="bu-detail" id="${detail}"${open?'':' hidden'}><td colspan="${cities.length+4}"><div class="bu-detail-grid">${u.rows.map(orderDetail).join('')}</div></td></tr>`};
+ const focused=document.activeElement?.closest?.('[data-buy-toggle]')?.dataset.buyToggle;
+ updateHtml('buy-under',rows.length?table(['품목',order?'목표가 (주문 매수)':'목표가 (바로 사기)',...cities.map(c=>state.cities[c]),order?`합계 (${rows[0].days}일)`:'합계','팔 곳 · 지금 최저 매도'],rows.map(order?orderLine:line),'buy-under'):empty('추적 품목이 없습니다.'));
+ if(focused)for(const b of document.querySelectorAll('[data-buy-toggle]'))if(b.dataset.buyToggle===focused)b.focus({preventScroll:true});
 }
 function renderSellTargets(){
  const rows=state.sell_targets;if(!rows){updateHtml('sell-target',empty('분석 프로그램을 다시 실행하면 나옵니다.'));return}
@@ -458,6 +471,7 @@ $('my-orders-filters').onclick=e=>{const b=e.target.closest('[data-key]');if(!b|
 $('my-orders').onclick=async e=>{if(e.target.closest('[data-more]')){showAllMyOrders=!showAllMyOrders;preserveViewport(renderMyOrders);return}const b=e.target.closest('[data-close]');if(!b)return;try{await post('/api/my-orders',{action:'close',id:Number(b.dataset.close)});await refresh()}catch(err){$('my-order-status').textContent='목록에서 빼기 실패: '+err.message}};
 $('bank-form').onsubmit=async e=>{e.preventDefault();const f=e.target;try{await post('/api/bank',{item:f.item.value,city:f.city.value,amount:Number(f.amount.value)});f.amount.value='';$('bank-status').textContent='은행 수량을 저장했습니다.';await refresh()}catch(err){$('bank-status').textContent='저장 실패: '+err.message}};
 $('buy-under-mode').onclick=e=>{const b=e.target.closest('button');if(!b)return;buyMode=b.dataset.mode;storage.set('buyMode',buyMode);$('buy-under-status').textContent='';renderBuyUnder()};
+$('buy-under').onclick=e=>{const row=e.target.closest('[data-buy-row]');if(!row||e.target.closest('.bu-target')||String(getSelection()))return;const item=row.dataset.buyRow;if(!buyOpen.delete(item))buyOpen.add(item);preserveViewport(renderBuyUnder)};
 $('buy-under').onchange=async e=>{if(!e.target.closest('.buy-target-form'))return;const s=$('buy-under-status');try{await saveBuyTargets();s.textContent='목표가 저장됨';await refresh()}catch(err){s.textContent='저장 실패: '+err.message}};
 $('buy-under').onsubmit=e=>{if(!e.target.closest('.buy-target-form'))return;e.preventDefault();document.activeElement?.blur()};
 $('sell-target').onchange=async e=>{if(!e.target.closest('.sell-target-form'))return;const s=$('sell-target-status');try{await saveSellTargets();s.textContent='희망 판매가 저장됨';await refresh()}catch(err){s.textContent='저장 실패: '+err.message}};

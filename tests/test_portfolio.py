@@ -145,6 +145,39 @@ class TradingPlanTests(unittest.TestCase):
         self.assertAlmostEqual(mine["roi"], 130 * (1 - .08 - .025) / 100 - 1)
 
 
+    def test_buy_order_totals_put_fresh_lists_apart_from_old_ones(self):
+        seen = self.now.isoformat()
+        def book(*levels, fresh=True):
+            return {"levels": [{"price": p, "amount": a} for p, a in levels], "single_only": False, "seen": seen if levels else None, "fresh": fresh and bool(levels)}
+        empty = book()
+        books = {item: {c: {"sell": empty, "buy": empty} for c in ("7", "4002", "1002", "3008", "2004", "5003")} for item in self.store.cfg["items"]}
+        soul = books["T8_SOUL"]
+        soul["4002"]["sell"] = book((14000, 3))
+        soul["1002"]["buy"] = book((9000, 100))
+        soul["3008"]["buy"] = book((9000, 100), fresh=False)            # an old list: counted in the whole, not in the fresh total
+        for city in ("1002", "3008"):
+            for hours in range(1, 49):
+                end = (self.now - timedelta(hours=hours)).isoformat()
+                self.store.db.execute("INSERT INTO history VALUES(?,?,?,?,?,?,?)", ("T8_SOUL", city, 1, end, 10, 10 * 9000, end))
+        self.store.save_config({"buy_order_targets": {"T8_SOUL": 10000}, "transport_per_unit": 50, "cycle_share": .2})
+        order = lambda: next(r for r in self.store.buy_order_under(books, {}) if r["item"] == "T8_SOUL")
+        u = order()
+        rows = {r["city"]: r for r in u["rows"]}
+        self.assertTrue(rows["1002"]["fresh"])
+        self.assertFalse(rows["3008"]["fresh"])
+        self.assertEqual(u["units"], rows["1002"]["units"] + rows["3008"]["units"])
+        self.assertEqual(u["fresh_units"], rows["1002"]["units"])
+        self.assertAlmostEqual(u["fresh_cost"], rows["1002"]["cost"])
+        self.assertAlmostEqual(u["fresh_profit"], rows["1002"]["profit"])
+        self.assertAlmostEqual(u["profit"], rows["1002"]["profit"] + rows["3008"]["profit"])
+        # Only old lists: nothing fresh to promise, while the whole stays visible.
+        soul["1002"]["buy"] = book((9000, 100), fresh=False)
+        u = order()
+        self.assertGreater(u["units"], 0)
+        self.assertEqual((u["fresh_units"], u["fresh_cost"], u["fresh_profit"]), (0, 0, None))
+        # The instant-buy view keeps its own totals untouched.
+        self.assertNotIn("fresh_units", next(r for r in self.store.buy_under(books) if r["item"] == "T8_SOUL"))
+
     def test_units_a_buy_order_under_the_target_can_fill_per_city(self):
         seen = self.now.isoformat()
         def book(*levels, single=False):
