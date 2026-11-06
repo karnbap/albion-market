@@ -26,6 +26,7 @@ from statistics import median
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+import chat
 import lookup
 
 ROOT = Path(__file__).resolve().parent
@@ -290,6 +291,7 @@ class Store:
                                    if i in self.cfg["items"] and isinstance(cs, list)}
         ZoneInfo(self.cfg["timezone"])
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.chat_command = None  # Tests put a stand-in for the Claude CLI here.
         self.lock = threading.RLock()
         (self.root / "data").mkdir(exist_ok=True)
         self.db = sqlite3.connect(self.root / "data" / "market.sqlite3", check_same_thread=False)
@@ -3060,6 +3062,13 @@ def handler_class(store, token):
                     return self.respond(store.lookup_item(params.get("id", [""])[0], int(params.get("quality", ["1"])[0])))
                 except ValueError as exc:
                     return self.respond({"error": str(exc)}, 400)
+            if parts.path == "/api/chat":
+                return self.respond(chat.ChatRoom(store.root, self.server.server_port).conversations())
+            if parts.path == "/api/chat/conversation":
+                try:
+                    return self.respond(chat.ChatRoom(store.root, self.server.server_port).conversation(parse_qs(parts.query).get("id", [""])[0]))
+                except ValueError as exc:
+                    return self.respond({"error": str(exc)}, 400)
             if parts.path == "/api/export.csv":
                 return self.respond(store.export_csv(), content_type="text/csv; charset=utf-8")
             if parts.path in ("/", "/app.js", "/app-v2.js", "/style.css", "/v2.css"):
@@ -3130,6 +3139,10 @@ def handler_class(store, token):
                     elif path == "/api/bank-city":
                         store.set_bank_city(payload)
                         result = {"saved": True}
+                    elif path == "/api/chat/send":
+                        result = chat.ChatRoom(store.root, self.server.server_port, store.chat_command).send(payload, store.state())
+                    elif path == "/api/chat/stop":
+                        result = chat.ChatRoom(store.root, self.server.server_port).stop(payload["conversation"])
                     elif path == "/api/reset":
                         store.reset_book(payload["item"], payload["city"])
                         result = {"reset": True}
