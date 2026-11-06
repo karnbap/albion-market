@@ -1,8 +1,10 @@
+# -Automatic: the game watcher closing the app after the game exits; the next game starts it again.
+param([switch]$Automatic)
 $ErrorActionPreference = 'Stop'
 $albionRoot = $PSScriptRoot
 New-Item -ItemType Directory -Force -Path (Join-Path $albionRoot 'data') | Out-Null
 # Keep a manual stop effective until the next game session.
-Set-Content -LiteralPath (Join-Path $albionRoot 'data\game-watch-paused') -Value 'Manual stop; resume after game exits.'
+if (-not $Automatic) { Set-Content -LiteralPath (Join-Path $albionRoot 'data\game-watch-paused') -Value 'Manual stop; resume after game exits.' }
 $albionTargets = @(@{File='capture.pid'; Expected=@((Join-Path $albionRoot 'vendor\albiondata-client.exe'), (Join-Path $albionRoot 'vendor\albiondata-client-fork.exe'))}, @{File='server.pid'; Expected='market.py'})
 foreach ($albionTarget in $albionTargets) {
     $albionPidPath = Join-Path $albionRoot ('data\' + $albionTarget.File)

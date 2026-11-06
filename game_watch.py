@@ -138,6 +138,31 @@ class WindowsPlatform:
                 logging.exception('Dashboard window did not open')
         threading.Thread(target=run,daemon=True).start()
 
+    def chat_running(self):
+        # A Claude answer in progress lives in the receiver; closing it would cut the answer off.
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(self.address()+'/api/chat',timeout=5) as response:
+                return any(row.get('running') for row in json.load(response).get('conversations',[]))
+        except Exception:
+            return False
+
+    def stop_app(self):
+        # The window first, so it never shows a dead page; stop.ps1 checks the receiver PID is ours.
+        dashboard_window.close_window()
+        with (self.root/'data/game-launcher.log').open('ab') as output:
+            result = subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass',
+                '-File',str(self.root/'stop.ps1'),'-Automatic'],
+                cwd=self.root,stdout=output,stderr=subprocess.STDOUT,timeout=40,
+                creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        if result.returncode:
+            raise RuntimeError('Local stop script failed; see game-launcher.log')
+        for _ in range(10):
+            if not self.receiver_ready():
+                return True
+            time.sleep(.5)
+        return False
+
     def stop_capture(self):
         pid = self.capture_pid()
         if pid is None:
@@ -165,6 +190,8 @@ class Controller:
         self.receiver_misses = 0
         self.next_receiver = 0
         self.window_opened = False
+        # Only a game seen by this watcher closes the analysis program, so one opened without the game stays.
+        self.app_with_game = False
         self.last_status = None
 
     def status(self, text, game, capture):
@@ -192,9 +219,11 @@ class Controller:
             if not game:
                 pause.unlink()
             self.absent_since = None
+            self.app_with_game = False
             return self.status('수동 종료로 일시 중지 · 다음 게임 실행 때 재개',game,capture)
         if game:
             self.absent_since = None
+            self.app_with_game = True
             if capture is True:
                 self.failures = 0
                 return self.check_receiver(now)
@@ -218,11 +247,28 @@ class Controller:
         self.receiver_misses = 0
         if self.absent_since is None:
             self.absent_since = now
-        if capture is True and now-self.absent_since >= 10:
-            if not self.platform.stop_capture():
-                return self.status('게임 종료 · 수집기 종료 확인 필요',False,True)
-            return self.status('게임 종료 · 수집기 자동 종료',False,False)
+        if now-self.absent_since >= 10:
+            if capture is True:
+                if not self.platform.stop_capture():
+                    return self.status('게임 종료 · 수집기 종료 확인 필요',False,True)
+                capture = False
+                if not self.app_with_game:
+                    return self.status('게임 종료 · 수집기 자동 종료',False,False)
+            if self.app_with_game:
+                return self.close_app(capture)
         return self.status('게임 실행 대기' if capture is not True else '게임 종료 확인 중',False,capture)
+
+    def close_app(self, capture):
+        if self.platform.chat_running():
+            return self.status('게임 종료 · Claude 답이 끝나면 분석 프로그램 종료',False,capture)
+        # One attempt per game session: a failed stop is logged, never retried in a loop.
+        self.app_with_game = False
+        try:
+            if self.platform.stop_app():
+                return self.status('게임 종료 · 수집기와 분석 프로그램 자동 종료',False,capture)
+        except Exception:
+            logging.exception('Automatic app stop failed')
+        return self.status('게임 종료 · 분석 프로그램 종료 확인 필요',False,capture)
 
     def check_receiver(self, now):
         if self.platform.receiver_ready():
