@@ -30,6 +30,7 @@ import chat
 import gamedata
 import lookup
 import travel
+import upgrade
 
 ROOT = Path(__file__).resolve().parent
 UTC = timezone.utc
@@ -53,12 +54,14 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # cycle_share / weekday_cycles: the trading plan's part of a market's daily sales and weekday turns.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3,
                     "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "buy_order_targets": {}, "sell_targets": {},
-                    "teleport_multiplier": 1.156, "teleport_confirmed": False}
+                    "teleport_multiplier": 1.156, "teleport_confirmed": False, "reroll_cost_scale": 1.0}
 # teleport_multiplier: the server-wide factor of the teleport formula (travel.py). 1.156 is the example of the article
 # the formula comes from; the player checks it against the in-game travel planner and confirms it.
+# reroll_cost_scale: what Global Discount and Gold Market Stabilization do to the quality reroll price (upgrade.py);
+# 1 is the wiki's formula as it stands.
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261107.2"
+BUILD = "20261107.3"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -387,6 +390,9 @@ class Store:
             cfg["transport_per_unit"] = float(cfg["transport_per_unit"])
             if not 0 < cfg["near_high_fraction"] <= 1 or not 1 <= cfg["fresh_minutes"] <= 60 or cfg["transport_per_unit"] < 0:
                 raise ValueError("Invalid freshness / high-price threshold / transport cost")
+            cfg["reroll_cost_scale"] = float(cfg["reroll_cost_scale"])
+            if not math.isfinite(cfg["reroll_cost_scale"]) or not 0 < cfg["reroll_cost_scale"] <= 10:
+                raise ValueError("reroll_cost_scale must be above 0 and at most 10")
             cfg["teleport_multiplier"] = float(cfg["teleport_multiplier"])
             if not math.isfinite(cfg["teleport_multiplier"]) or not 0 < cfg["teleport_multiplier"] <= 10:
                 raise ValueError("teleport_multiplier must be above 0 and at most 10")
@@ -2976,6 +2982,86 @@ class Store:
                 "public_fetched": datetime.fromtimestamp(public["fetched"], UTC).isoformat() if public else None,
                 "stream": stream}
 
+    def lookup_quotes(self, view):
+        """Per city of a lookup answer, its cheapest sell and dearest buy as the screen picks them: what we heard or the
+        public server's value, whichever is newer; old when over a day."""
+        now, out = self.clock(), []
+        for c in view["cities"]:
+            row = {"city": c["city"]}
+            for side in ("sell", "buy"):
+                heard, pub = c["local"].get(side), c["public"] or {}
+                pub_seen = pub.get(side + "_seen")
+                if heard and (not pub_seen or parse_time(heard["seen"]) >= parse_time(pub_seen)):
+                    q = {"price": heard["price"], "amount": heard["amount"], "seen": heard["seen"], "source": "me" if heard["mine"] else "stream"}
+                elif pub.get(side):
+                    q = {"price": pub[side], "amount": None, "seen": pub_seen, "source": "public"}
+                else:
+                    q = None
+                if q:
+                    q["old"] = not q["seen"] or now - parse_time(q["seen"]) > timedelta(days=1)
+                row[side] = q
+            out.append(row)
+        return out
+
+    def cheapest(self, quotes, way):
+        """The cheapest city to buy at, one way: instant pays the cheapest sell order; order goes one silver over the
+        dearest bid and pays the setup fee on top. Records under a day old win when any exist."""
+        fee, side = self.cfg["setup_fee"], "sell" if way == "instant" else "buy"
+        rows = [(r["city"], r[side]) for r in quotes if r[side]]
+        best = None
+        for city, q in [x for x in rows if not x[1]["old"]] or rows:
+            unit = q["price"] if way == "instant" else (q["price"] + 1) * (1 + fee)
+            if best is None or unit < best["unit"]:
+                best = {"city": city, "unit": unit, **q}
+        return best
+
+    def craft_cost(self, item, quality):
+        """What an item at an enchantment and quality costs made from its .0 bought on the market, beside buying it made.
+        Every starting quality up to the target is tried: buy the .0 at it, reroll it at the repair station while it is
+        still .0 (lowest item value, so cheapest; upgrade.py, failures included) and then enchant it with each step's
+        materials (gamedata.py), each bought at its cheapest city. Both ways to buy (instant, buy order) are worked out.
+        Any quality (0) makes a Normal one and compares it with a Normal finished item. Starting qualities priced
+        under a day old win over older ones. Teleport between those cities is left out."""
+        if not re.fullmatch(r"[A-Z0-9_]{2,80}(@[1-4])?", item or "") or quality not in (lookup.ANY_QUALITY, *lookup.QUALITIES):
+            raise ValueError("Unknown item")
+        base, _, level = item.partition("@")
+        enchant, target, data = int(level or 0), max(quality, 1), gamedata.catalog.get(base)
+        out = {"item": item, "quality": quality, "base": base, "enchant": enchant, "target": target, "scale": self.cfg["reroll_cost_scale"]}
+        if data is None or "v" not in data or enchant >= len(data["v"]) or (target > 1 and not 1 <= target <= 5):
+            return {**out, "supported": False, "loading": gamedata.catalog.loading}
+        if enchant == 0 and target == 1:
+            return {**out, "supported": True, "needed": False}
+        loading = False
+
+        def quotes(i, q):
+            nonlocal loading
+            view = self.lookup_item(i, q)
+            loading = loading or view["public_loading"]
+            return self.lookup_quotes(view)
+        starts = []
+        for b in range(1, target + 1):
+            qs = quotes(base, b)
+            starts.append({"quality": b, "instant": self.cheapest(qs, "instant"), "order": self.cheapest(qs, "order"),
+                           "reroll": upgrade.reroll(data["v"][0], b, target, self.cfg["reroll_cost_scale"])})
+        materials = []
+        for step in range(enchant):
+            for res, count in data["up"][step]:
+                qs = quotes(res, lookup.ANY_QUALITY)
+                materials.append({"step": step + 1, "item": res, "name": lookup.catalog.name(res), "count": count,
+                                  "instant": self.cheapest(qs, "instant"), "order": self.cheapest(qs, "order")})
+        ways = {}
+        for way in ("instant", "order"):
+            options = [{"quality": s["quality"], "city": s[way]["city"], "base": s[way]["unit"], "base_old": s[way]["old"],
+                        "reroll": s["reroll"]["silver"], "rolls": s["reroll"]["rolls"]} for s in starts if s[way]]
+            missing = [m["item"] for m in materials if m[way] is None]
+            best = min([o for o in options if not o["base_old"]] or options, key=lambda o: o["base"] + o["reroll"], default=None)
+            spent = sum(m[way]["unit"] * m["count"] for m in materials if m[way])
+            ways[way] = {"missing": missing, "start": best, "materials": spent,
+                         "total": best["base"] + best["reroll"] + spent if best and not missing else None}
+        made = quotes(item, target)
+        return {**out, "supported": True, "needed": True, "values": data["v"], "starts": starts, "materials": materials, "ways": ways,
+                "direct": {"instant": self.cheapest(made, "instant"), "order": self.cheapest(made, "order")}, "loading": loading}
+
     def export_csv(self):
         with self.lock:
             output = io.StringIO(newline="")
@@ -3092,6 +3178,12 @@ def handler_class(store, token):
                 params = parse_qs(parts.query)
                 try:
                     return self.respond(store.lookup_item(params.get("id", [""])[0], int(params.get("quality", ["1"])[0])))
+                except ValueError as exc:
+                    return self.respond({"error": str(exc)}, 400)
+            if parts.path == "/api/lookup/craft":
+                params = parse_qs(parts.query)
+                try:
+                    return self.respond(store.craft_cost(params.get("id", [""])[0], int(params.get("quality", ["1"])[0])))
                 except ValueError as exc:
                     return self.respond({"error": str(exc)}, 400)
             if parts.path == "/api/chat":
