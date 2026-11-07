@@ -16,6 +16,7 @@ from http.server import ThreadingHTTPServer
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import gamedata
 import lookup
 
 ASSETS = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css',
@@ -195,6 +196,9 @@ def run(source_root, data_root, port=None):
     runtime = Runtime(source_root, data_root)
     # The any-item lookup listens to the public order stream; one listener outlives code revisions.
     lookup.start_stream(data_root, runtime.store.cfg.get('server', 'europe'))
+    # Game item data (weights for the teleport cost, values and enchant materials), fetched in the background;
+    # state() keeps trying after a failure.
+    gamedata.catalog.ensure(data_root, download=True)
     server = ThreadingHTTPServer(('127.0.0.1', port or runtime.store.cfg['port']), runtime.handle)
     server.daemon_threads = True
     threading.Thread(target=runtime.watch, daemon=True).start()
