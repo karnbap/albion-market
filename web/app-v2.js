@@ -8,8 +8,8 @@ let state,token,selectedItem=savedView.item||'',selectedCity=savedView.city||'10
 let formVersion=0,saving=false,saveQueued=false,saveTimer,scrollTimer,restorePending=true;
 let draft=storage.get('settingsDraft',null);
 const percentKeys=['sales_tax','setup_fee','minimum_margin','near_high_fraction','depth_price_band','cycle_share'];
-const numberKeys=['trade_budget','inventory_heavy_days','weekday_cycles','fresh_minutes','transport_per_unit','small_quantity_max','large_quantity_min','wall_quantity_min','wall_multiple'];
-const boolKeys=['fees_confirmed','transport_confirmed'];
+const numberKeys=['trade_budget','inventory_heavy_days','weekday_cycles','fresh_minutes','transport_per_unit','teleport_multiplier','reroll_cost_scale','small_quantity_max','large_quantity_min','wall_quantity_min','wall_multiple'];
+const boolKeys=['fees_confirmed','transport_confirmed','teleport_confirmed'];
 const fragmentCache=new Map(),innerScroll=storage.get('tableScroll',{});
 const formatters=new Map();
 const date=v=>{if(!v)return '미조회';const zone=state?.timezone||'Europe/Paris';if(!formatters.has(zone))formatters.set(zone,new Intl.DateTimeFormat('ko-KR',{timeZone:zone,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23',timeZoneName:'shortOffset'}));return formatters.get(zone).format(new Date(v))};
@@ -28,7 +28,7 @@ const timingText=t=>{if(!t)return '';const wd=WEEK[t.weekday],parts=[];
  return parts.length?`파는 곳 지금(${wd} ${t.hour}시): ${parts.join(' · ')}`:`파는 곳 ${wd}요일·${t.hour}시대 기록이 아직 부족`};
 const outlookText=o=>`파는 곳 앞으로 6시간 예상 판매 ${n(o.next6)}개(평소 ${n(o.usual6)}개) · 24시간 ${n(o.next24)}개${o.low_window?' · 수요 적은 시간대':''}`;
 const hourRanges=hours=>{const out=[];for(const h of hours){const last=out[out.length-1];if(last&&(last[1]+1)%24===h)last[1]=h;else out.push([h,h])}return out.map(([a,b])=>a===b?`${String(a).padStart(2,'0')}시`:`${String(a).padStart(2,'0')}~${String(b).padStart(2,'0')}시`).join(', ')};
-const settingsWarnings=()=>[!state.settings.fees_confirmed&&'수수료 설정 미확인',!state.settings.transport_confirmed&&'운송비 설정 미확인'].filter(Boolean);
+const settingsWarnings=()=>[!state.settings.fees_confirmed&&'수수료 설정 미확인',!(state.settings.transport_confirmed&&state.settings.teleport_confirmed)&&'운송비 설정 미확인',state.travel&&!state.travel.ready&&(state.travel.loading?'텔레포트 무게 자료 받는 중':'텔레포트 무게 자료 없음 · 운송비가 추가 운송비만 들어감')].filter(Boolean);
 const empty=text=>`<div class="empty">${esc(text)}</div>`;
 const editing=()=>!!document.activeElement?.closest('#my-order-form,#purchase-form,#bank-form,.bank-city-form,.buy-target-form,.sell-target-form')&&document.activeElement.matches('select,input');
 function table(headers,rows,key){return `<div class="table-wrap" data-scroll-key="${esc(key)}" tabindex="0" aria-label="${esc(key)} 표 스크롤"><table><thead><tr>${headers.map(h=>`<th>${h?.html??esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`}
@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261107.1';
+  const legacy=next.build!=='20261107.3';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -269,7 +269,7 @@ function renderHoldings(){
        +`<td>${where}</td><td>${money(unit)}${instant}${warn}</td><td>${money(g.value_now||null)}</td>`
        +`<td class="${profit==null?'':profit>=0?'positive':'warn'}">${money(profit)}</td></tr>`}),
    'holdings-by-item')
-   +`<details class="more-help"><summary>계산 방법 보기</summary><p class="help"><b>제일 비싸게 팔 곳</b> = 거래 분석 도시 중 매도 주문을 가장 비싸게 걸 수 있는 곳입니다. 마지막으로 연 매도 목록의 최저 매도가보다 1 싸게 걸고, 최저가가 내 주문이면 같은 값으로 봅니다. 앞에 다른 판매자 매물이 적게 깔려 있으면 그것을 먼저 사들이고(본 매도 목록 안, 가격대 수 제한 없이 한 거래 최대 실버까지) 다음 매도가보다 1 싸게 거는 것도 계산해, 산 물량 값까지 넣어 총액이 더 크면 그 방법으로 보여 줍니다. 그만큼 팔 물량이 늘어납니다. <b>팔면 단가</b> = 그 값에서 판매세 ${n(state.settings.sales_tax*100,1)}%와 설치 수수료 ${n(state.settings.setup_fee*100,1)}%를 빼고, 다른 도시에 있는 물량은 개당 운송비(설정)를 뺀 값입니다. 그 값에 다 팔린다는 보장은 없습니다. 사들이는 경우 사는 데 쓴 실버를 빼고 내 보유 수량으로 나눈 값입니다. 작은 글씨 '바로 팔면'은 매수 요청서에 즉시 팔 때(최고 매수가 − 판매세)입니다. 총수익은 원가를 아는 수량만 셉니다.</p></details>`
+   +`<details class="more-help"><summary>계산 방법 보기</summary><p class="help"><b>제일 비싸게 팔 곳</b> = 거래 분석 도시 중 매도 주문을 가장 비싸게 걸 수 있는 곳입니다. 마지막으로 연 매도 목록의 최저 매도가보다 1 싸게 걸고, 최저가가 내 주문이면 같은 값으로 봅니다. 앞에 다른 판매자 매물이 적게 깔려 있으면 그것을 먼저 사들이고(본 매도 목록 안, 가격대 수 제한 없이 한 거래 최대 실버까지) 다음 매도가보다 1 싸게 거는 것도 계산해, 산 물량 값까지 넣어 총액이 더 크면 그 방법으로 보여 줍니다. 그만큼 팔 물량이 늘어납니다. <b>팔면 단가</b> = 그 값에서 판매세 ${n(state.settings.sales_tax*100,1)}%와 설치 수수료 ${n(state.settings.setup_fee*100,1)}%를 빼고, 다른 도시에 있는 물량은 그 도시에서 옮기는 텔레포트비(무게·경로)와 추가 운송비(설정)를 뺀 값입니다. 그 값에 다 팔린다는 보장은 없습니다. 사들이는 경우 사는 데 쓴 실버를 빼고 내 보유 수량으로 나눈 값입니다. 작은 글씨 '바로 팔면'은 매수 요청서에 즉시 팔 때(최고 매수가 − 판매세)입니다. 총수익은 원가를 아는 수량만 셉니다.</p></details>`
    +`<p class="help">합계 — 매수 ${money(sum.buy||null)} → 제일 비싸게 팔면 ${money(sum.now||null)} (차액 <b class="${sum.now-sum.buy>=0?'positive':'warn'}">${money(sum.now-sum.buy)}</b>)</p>`:'';
  updateHtml('holdings',(items.length?`<h3 class="sub-head">품목별 — 사서 들고 있는 것과 지금 가치</h3>${summary}`:'')
    +(rows.length?`<h3 class="sub-head">도시별 자세히</h3>`+table(['도시','품목','시장에 올린 것','은행','거래 완료 탭','인벤토리','합계','원가 기준 금액','바로 팔면 (최고 매수가)'],rows,'holdings'):empty('보유량이 아직 없습니다. 게임에서 내 주문 탭이나 거래 완료 탭, 은행을 열거나, 위에 은행 수량을 적어 주세요.'))+unmapped+finished);
@@ -523,7 +523,7 @@ function renderCombos(){
  updateHtml('lookup-combos',`<div class="combo-head"><span class="lookup-label">값이 있는 조합</span><small>${d.public_loading?'공개 서버에 묻는 중…':any?'칸을 누르면 그 티어·인챈트로 바뀝니다 · 큰 글자는 최근 7일 최저 매도, 평균은 공유 자료의 최근 7일 평균 체결가(거래가 없으면 30일, 아무 품질)':'이 품목은 최근 7일 동안 6개 도시 어디에도 매물이 없습니다.'}</small></div>`+table(['티어',...[0,1,2,3,4].map(e=>({html:`<span class="ench-tag e${e}">.${e}</span>`}))],tiers.map(t=>`<tr><th scope="row">${t!=null?tierSpan(t):'—'}</th>${[0,1,2,3,4].map(e=>cell(t,e)).join('')}</tr>`),'lookup-combos'))}
 async function loadLookup(){
  clearTimeout(lookupView.timer);const id=lookupId();if(!id)return;loadCombos();
- try{const quality=$('lookup-quality').value,r=await fetch(`/api/lookup/item?id=${encodeURIComponent(id)}&quality=${quality}`),data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(id!==lookupId()||quality!==$('lookup-quality').value)return;lookupView.data=data;renderLookup()}
+ try{const quality=$('lookup-quality').value,r=await fetch(`/api/lookup/item?id=${encodeURIComponent(id)}&quality=${quality}`),data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(id!==lookupId()||quality!==$('lookup-quality').value)return;lookupView.data=data;renderLookup();loadCraft(id,quality)}
  catch(e){if(lookupView.data?.item!==lookupId()){updateHtml('lookup-hero','');renderLookupCost(null)}updateHtml('lookup-view',`<p class="warn">시세를 못 불러왔습니다: ${esc(e.message)}</p>`)}
  // Poll faster while the public answer is still on its way.
  if(!document.querySelector('.tab-panel[data-tab=lookup]').hidden)lookupView.timer=setTimeout(loadLookup,lookupView.data?.public_loading?2500:15000)}
@@ -545,12 +545,18 @@ function renderLookup(){
  updateHtml('lookup-view',(none?`<p class="warn">이 조합은 6개 도시 어디에도 최근 매물·매수 기록이 없습니다.${anyQuality?' 위 「값이 있는 조합」 표에서 금색 칸을 누르면 매물이 있는 티어·인챈트로 바뀝니다.':' 품질을 \'아무 품질\'로 바꿔 보세요. 장비는 한 품질에만 매물이 있는 경우가 많습니다.'}</p>`:'')+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell&&!sell.old&&sell.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell&&!sell.old&&sell.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy&&!buy.old&&buy.price===dearest?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
   +`<p class="help">${d.public_loading?'공개 서버에 묻는 중… ':d.public_error?'공개 서버 조회 실패: '+esc(d.public_error)+' · ':d.public_fetched?`공개 서버 값은 ${lookupAge(d.public_fetched)}에 받음 · `:''}실시간 공유·내가 연 시장 값은 최근 24시간 안에 들은 주문입니다. 그사이 팔렸거나 새 매물이 올라왔을 수 있으니 사고팔기 전에는 게임에서 한 번 확인하세요. 7일 평균·판매량은 공개 서버의 하루 단위 거래 이력입니다.</p>`)}
 // What one unit costs, from each city's newest record: an instant buy pays the cheapest sell order and no fee;
-// a buy order goes one silver over the dearest bid and pays the setup fee on top. The cheapest city counts only
-// records under a day old when any exist, so a stale low price never wins over a current one. Costs are whole silver.
+// a buy order goes one silver over the dearest bid and pays the setup fee on top. With a city to take it to, the
+// move from the buy city there (carry: teleport cost plus the extra transport setting) is added. With no travel
+// route (Caerleon) or no weight for the item (carry null) the extra setting alone is added, as the server's carry()
+// does, and teleport says the teleport part is missing. The cheapest city counts
+// only records under a day old when any exist, so a stale low price never wins over a current one. Whole silver.
 // With any quality, a bid of another quality does not compete with mine, so buy orders count only when they are of the
 // quality the cheapest instant buy is of (quality says which).
-function lookupCosts(rows,fee,anyQuality){
- const cities=rows.map(({c,sell,buy})=>({city:c.city,instant:sell?{...sell,unit:sell.price}:null,order:buy?{...buy,bid:buy.price+1,unit:Math.round((buy.price+1)*(1+fee))}:null}));
+function lookupCosts(rows,fee,anyQuality,carry,dest,extra=0){
+ const move=city=>!dest||city===dest?0:carry?.[city]?.[dest]??extra,teleport=city=>!dest||city===dest||carry?.[city]?.[dest]!=null;
+ const cities=rows.map(({c,sell,buy})=>{const m=move(c.city),order=buy?(buy.price+1)*(1+fee):null;
+  return {city:c.city,move:m,teleport:teleport(c.city),instant:sell?{...sell,base:sell.price,unit:Math.round(sell.price+m)}:null,
+   order:buy?{...buy,bid:buy.price+1,base:Math.round(order),unit:Math.round(order+m)}:null}});
  const best=side=>{const has=cities.filter(r=>r[side]),fresh=has.filter(r=>!r[side].old);return (fresh.length?fresh:has).reduce((a,r)=>!a||r[side].unit<a[side].unit?r:a,null)};
  const instant=best('instant'),quality=anyQuality?instant?.instant.quality??null:null;
  if(quality!=null)for(const r of cities)if(r.order&&r.order.quality!==quality)r.order=null;
@@ -558,18 +564,55 @@ function lookupCosts(rows,fee,anyQuality){
 }
 function renderLookupCost(rows){
  const box=$('lookup-cost');box.hidden=!rows;if(!rows)return;
- const st=state.settings,fee=st.setup_fee,units=Math.max(1,Math.min(100000,Math.floor(Number($('lookup-cost-units').value))||1));
- const anyQuality=!Number(lookupView.data.quality),k=lookupCosts(rows,fee,anyQuality),city=c=>esc(state.cities[c]||c),src={me:'내가 연 시장',stream:'실시간 공유',public:'공개 서버'};
+ const d=lookupView.data,st=state.settings,fee=st.setup_fee,units=Math.max(1,Math.min(100000,Math.floor(Number($('lookup-cost-units').value))||1));
+ const pick=$('lookup-cost-dest'),want=d.cities.map(c=>c.city);
+ if([...pick.options].slice(1).map(o=>o.value).join()!==want.join()){const keep=pick.value||storage.get('lookupCostDest','');pick.length=1;for(const c of want)pick.add(new Option(state.cities[c]||c,c));pick.value=want.includes(keep)?keep:''}
+ const dest=d.cities.some(c=>c.city===pick.value)?pick.value:'',tr=d.travel||{};
+ const anyQuality=!Number(d.quality),k=lookupCosts(rows,fee,anyQuality,d.carry,dest,tr.extra??st.transport_per_unit),city=c=>esc(state.cities[c]||c),src={me:'내가 연 시장',stream:'실시간 공유',public:'공개 서버'};
  const when=q=>`<small class="lk-src ${q.source}" title="${esc(date(q.seen))}">${src[q.source]} · ${lookupAge(q.seen)}${q.old?' · 오래된 값':''}</small>`;
- const card=(title,r,side,how)=>{const q=r?.[side];return `<div class="lk-cost-card ${side}"><span class="lk-cost-title">${title}</span>${q?`<b class="lk-price ${side==='instant'?'sell':'buy'} ${q.old?'lk-old':''}">${n(q.unit)}</b><small>개당 · ${city(r.city)}${q.quality&&anyQuality?' · '+qualityLabel(q.quality):''}</small>${units>1?`<span class="lk-cost-total">${n(units)}개 ${n(q.unit*units)}</span>`:''}<small>${how(q)}</small>${when(q)}`:`<small>${side==='order'&&k.quality!=null?`${qualityLabel(k.quality)} 매수 주문 기록 없음`:'어느 도시에도 기록 없음'}</small>`}</div>`};
+ const moved=r=>!dest||r.city===dest?'':r.teleport?` · 옮기는 비용 ${n(r.move)} (${city(r.city)} → ${city(dest)})`:` · <span class="warn">텔레포트비 빠짐${r.move?` · 추가 운송비 ${n(r.move)}만`:''}</span>`;
+ const card=(title,r,side,how)=>{const q=r?.[side];return `<div class="lk-cost-card ${side}"><span class="lk-cost-title">${title}${dest?` · ${city(dest)} 도착`:''}</span>${q?`<b class="lk-price ${side==='instant'?'sell':'buy'} ${q.old?'lk-old':''}">${n(q.unit)}</b><small>개당 · ${city(r.city)}에서 사기${q.quality&&anyQuality?' · '+qualityLabel(q.quality):''}</small>${units>1?`<span class="lk-cost-total">${n(units)}개 ${n(q.unit*units)}</span>`:''}<small>${how(q)}${moved(r)}</small>${when(q)}`:`<small>${side==='order'&&k.quality!=null?`${qualityLabel(k.quality)} 매수 주문 기록 없음`:'어느 도시에도 기록 없음'}</small>`}</div>`};
  const order=card('매수 걸어 사기',k.order,'order',q=>`최고 매수가 ${n(q.price)}보다 1 높게 ${n(q.bid)}에 걸기 + 주문 수수료 ${n(fee*100,1)}%`);
  const instant=card('즉구로 사기',k.instant,'instant',q=>`최저 매도가 그대로 · 수수료 없음${q.amount!=null&&units>q.amount?` · <span class="warn">이 값 물량은 ${n(q.amount)}개뿐, 더 사면 더 비쌈</span>`:''}`);
  const gap=k.order&&k.instant?k.instant.instant.unit-k.order.order.unit:null;
  const diff=gap==null?'':`<p class="lk-cost-gap">${gap>0?`매수 걸면 개당 <b>${n(gap)}</b> 싸게 삽니다${units>1?` (${n(units)}개 ${n(gap*units)})`:''}. 대신 다른 사람이 팔아 줄 때까지 기다려야 하고, 다 체결된다는 보장은 없습니다.`:(gap<0?`지금은 즉구가 개당 ${n(-gap)} 더 쌉니다`:'지금은 둘이 같습니다')+'. 매수를 걸고 기다릴 이유가 없습니다.'}</p>`;
  const cell=q=>q?`${n(q.unit)}${q.old?'<small>오래된 값</small>':''}`:'—';
- const per=`<details class="more-help"><summary>도시별 원가 보기</summary>${table(['도시','매수 걸어 사기 (개당)','즉구 (개당)'],k.cities.map(r=>`<tr><td>${city(r.city)}</td><td>${cell(r.order)}</td><td>${cell(r.instant)}</td></tr>`),'lookup-cost')}</details>`;
- updateHtml('lookup-cost-result',`<div class="lk-cost-cards">${order}${instant}</div>${diff}${per}<p class="help">${k.quality!=null?`품질을 '아무 품질'로 두면 가장 싸게 즉구할 수 있는 ${qualityLabel(k.quality)} 기준으로 두 가지를 비교합니다. 매수 주문은 같은 품질끼리만 경쟁하기 때문입니다. `:''}각 도시의 가장 최근 기록으로 계산합니다. 하루 안의 기록이 있으면 그중 가장 싼 도시를, 없으면 오래된 기록 중 가장 싼 도시를 보여 줍니다. 운송비는 넣지 않았습니다.${st.fees_confirmed?'':' 주문 수수료는 설정에서 아직 확인하지 않은 값입니다.'}</p>`);
+ const heads=['도시','매수 걸어 사기 (개당)','즉구 (개당)',...(dest?['옮기는 비용 (개당)']:[])];
+ const per=`<details class="more-help"><summary>도시별 원가 보기</summary>${table(heads,k.cities.map(r=>`<tr><td>${city(r.city)}</td><td>${cell(r.order)}</td><td>${cell(r.instant)}</td>${dest?`<td>${r.city===dest?'0 (그 도시)':r.teleport?n(r.move):`${n(r.move)}<small>${d.carry?'텔레포트 경로 없음':'무게 모름'} · 추가 운송비만</small>`}</td>`:''}</tr>`),'lookup-cost')}</details>`;
+ const moveNote=tr.weight!=null?`가져갈 도시를 고르면 사는 도시에서 그곳까지의 텔레포트비를 더합니다. 이 품목은 개당 ${n(tr.weight,2)}kg, 품목 배수 ${n(tr.factor)}, 서버 배수 ${n(tr.multiplier,3)}${st.teleport_confirmed?'':' (아직 게임과 맞춰 보지 않은 값)'}이고, 텔레포트비는 이웃 도시 1칸이면 개당 ${n(150*tr.weight*tr.factor*tr.multiplier)}, 2칸이면 그 두 배입니다${tr.extra?`. 여기에 추가 운송비 개당 ${n(tr.extra)}을 더합니다`:''}. 캐얼리언은 텔레포트 경로가 없어 추가 운송비만 넣습니다.`:tr.loading?'텔레포트비 계산용 품목 무게를 받는 중입니다. 그동안은 추가 운송비만 넣습니다.':`이 품목의 무게를 몰라 텔레포트비를 넣지 못하고 추가 운송비만 넣었습니다${tr.error?' ('+esc(tr.error)+')':''}.`;
+ updateHtml('lookup-cost-result',`<div class="lk-cost-cards">${order}${instant}</div>${diff}${per}<p class="help">${k.quality!=null?`품질을 '아무 품질'로 두면 가장 싸게 즉구할 수 있는 ${qualityLabel(k.quality)} 기준으로 두 가지를 비교합니다. 매수 주문은 같은 품질끼리만 경쟁하기 때문입니다. `:''}각 도시의 가장 최근 기록으로 계산합니다. 하루 안의 기록이 있으면 그중 가장 싼 도시를, 없으면 오래된 기록 중 가장 싼 도시를 보여 줍니다. ${moveNote}${st.fees_confirmed?'':' 주문 수수료는 설정에서 아직 확인하지 않은 값입니다.'}</p>`);
 }
+// Making it instead: the .0 bought at the cheapest starting quality, rerolled to the chosen quality while still .0
+// (the server works out the average with failures), then enchanted with each step's materials. Only for an
+// enchanted item or a quality above Normal; the answer must still match what is chosen to be drawn.
+async function loadCraft(id,quality){
+ const enchant=Number(id.split('@')[1]||0);
+ if(!enchant&&Number(quality)<2){lookupView.craft=null;updateHtml('lookup-craft','');return}
+ const shown=lookupView.craft;if(!shown||shown.item!==id||String(shown.quality)!==String(quality)){lookupView.craft=null;updateHtml('lookup-craft','<p class="help">만들어 올리기 원가를 계산하는 중…</p>')}
+ try{const r=await fetch(`/api/lookup/craft?id=${encodeURIComponent(id)}&quality=${quality}`),data=await r.json();if(!r.ok)throw Error(data.error||r.status);
+  if(id!==lookupId()||quality!==$('lookup-quality').value)return;lookupView.craft=data;renderCraft()}
+ catch(e){if(id===lookupId())updateHtml('lookup-craft',`<p class="warn">만들어 올리는 원가를 못 불러왔습니다: ${esc(e.message)}</p>`)}
+}
+function renderCraft(){
+ const k=lookupView.craft;if(!k)return;
+ if(!k.supported){updateHtml('lookup-craft',`<div class="lk-craft"><h4>만들어 올리기 원가</h4><p class="help">${k.loading?'품목 자료를 받는 중입니다.':'이 품목은 인챈트 재료나 품목 가치 자료가 없어 계산하지 못합니다.'}</p></div>`);return}
+ if(!k.needed){updateHtml('lookup-craft','');return}
+ const fee=state.settings.setup_fee,city=c=>esc(state.cities[c]||c),qName=q=>qualityLabel(q),stepName=['','룬','영혼','유물','아발론 조각'];
+ const tier=k.base.match(/^T(\d)/)?.[1]??'',tag=`T${tier}.${k.enchant}`,zero=`T${tier}.0`;
+ const old=q=>q?.old?'<small class="warn">오래된 값</small>':'';
+ const lines=(way)=>{const w=k.ways[way],s=w.start;if(!s)return `<small>${zero} ${way==='instant'?'매물':'매수 주문'} 기록 없음</small>`;
+  const start=k.starts.find(x=>x.quality===s.quality),base=start[way];
+  const rows=[`<li>${zero} ${qName(s.quality)} 사기 <b>${n(s.base)}</b> <small>${city(s.city)}${way==='order'?` · ${n(base.price+1)}에 걸기 + 수수료`:''}</small>${old(base)}</li>`];
+  if(s.quality<k.target)rows.push(`<li>품질 재굴림 ${qName(s.quality)} → ${qName(k.target)} 평균 ${n(s.rolls,1)}회 <b>${n(s.reroll)}</b> <small>실패 포함 평균 · .0일 때 굴림</small></li>`);
+  for(const m of k.materials){const q=m[way];rows.push(`<li>.${m.step} ${esc(stepName[m.step]||m.name||m.item)} ${n(m.count)}개 ${q?`× ${n(q.unit)} = <b>${n(q.unit*m.count)}</b> <small>${city(q.city)}</small>${old(q)}`:'<small class="warn">가격 기록 없음</small>'}</li>`)}
+  return `<ul class="lk-craft-lines">${rows.join('')}</ul>`};
+ const direct=way=>k.direct[way];
+ const card=(title,way)=>{const w=k.ways[way],d=direct(way),gap=w.total!=null&&d?d.unit-w.total:null;
+  return `<div class="lk-cost-card ${way}"><span class="lk-cost-title">${title}</span>${w.total!=null?`<b class="lk-price ${way==='instant'?'sell':'buy'}">${n(w.total)}</b>`:`<small class="warn">${w.missing.length?'재료 가격 기록이 없어 합계를 못 냅니다':`${zero} ${way==='instant'?'매물':'매수 주문'} 기록이 없어 합계를 못 냅니다`}</small>`}${lines(way)}${d?`<small>완성품 ${tag} ${qName(k.target)} ${way==='instant'?'즉구':'매수 걸기'} ${n(d.unit)} (${city(d.city)})${gap!=null?` · 만들면 <b class="${gap>0?'positive':'warn'}">${gap>0?n(gap)+' 쌈':n(-gap)+' 비쌈'}</b>`:''}</small>`:`<small>완성품 ${way==='instant'?'매물':'매수 주문'} 기록 없음</small>`}</div>`};
+ const per=`<details class="more-help"><summary>시작 품질별로 보기</summary>${table(['시작 품질',`${zero} 즉구`,`${zero} 매수 걸기`,'재굴림 평균 비용','평균 횟수'],k.starts.map(s=>`<tr><td>${qName(s.quality)}</td><td>${s.instant?n(s.instant.unit):'—'}</td><td>${s.order?n(s.order.unit):'—'}</td><td>${n(s.reroll.silver)}</td><td>${n(s.reroll.rolls,1)}회</td></tr>`),'lookup-craft')}</details>`;
+ updateHtml('lookup-craft',`<div class="lk-craft"><h4>만들어 올리기 원가 · ${tag} ${qName(k.target)}</h4><div class="lk-cost-cards">${card('매수 걸어 모으기','order')}${card('즉구로 모으기','instant')}</div>${per}<p class="help">${zero}을 시작 품질마다 사 보고 가장 싼 길을 고릅니다(하루 안의 값이 있으면 그중에서). 품질은 .0일 때 먼저 올립니다. 재굴림 비용은 품목 가치에 비례하는데 인챈트할 때마다 두 배가 되기 때문입니다. 재굴림 1회 비용은 품목 가치 ${n(k.values[0])} × 품질 배수${k.scale!==1?` × ${n(k.scale,3)}`:''}이고, 평균은 실패해서 그대로 남는 경우까지 넣은 기댓값입니다. 운이 나쁘면 더 듭니다. 품질 확률과 배수는 위키 기준입니다. 인챈트 재료 개수는 게임 자료에서 받습니다. 재료를 여러 도시에서 사면 옮기는 비용이 따로 듭니다(여기에는 안 넣음). 매수 걸기는 수수료 ${n(fee*100,1)}% 포함이고, 다 체결된다는 보장은 없습니다.${k.loading?' 공개 서버에 묻는 중이라 값이 바뀔 수 있습니다.':''}</p></div>`);
+}
+$('lookup-cost-dest').addEventListener('change',()=>{storage.set('lookupCostDest',$('lookup-cost-dest').value);const d=lookupView.data;if(d&&d.item===lookupId()&&String(d.quality)===$('lookup-quality').value)renderLookup()});
 $('lookup-cost-units').addEventListener('input',()=>{storage.set('lookupCostUnits',$('lookup-cost-units').value);const d=lookupView.data;if(d&&d.item===lookupId()&&String(d.quality)===$('lookup-quality').value)renderLookup()});
 $('lookup-cost-units').value=storage.get('lookupCostUnits','1');
 $('lookup-form').onsubmit=e=>{e.preventDefault();lookupSearch()};
