@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import chat
+import gamedata
 import lookup
 import travel
 
@@ -720,7 +721,7 @@ class Store:
         cfg = self.cfg
         last = self.db.execute("SELECT MAX(id) FROM packets").fetchone()[0]
         key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(cfg["excluded_cities"]),
-               cfg["sales_tax"], cfg["setup_fee"], cfg["transport_per_unit"], cfg["teleport_multiplier"], bool(travel.catalog.items), cfg["cycle_share"])
+               cfg["sales_tax"], cfg["setup_fee"], cfg["transport_per_unit"], cfg["teleport_multiplier"], bool(gamedata.catalog.items), cfg["cycle_share"])
         if getattr(self, "_plan_key", None) == key:
             return self._plan_inputs
         zone = ZoneInfo(cfg["timezone"])
@@ -1874,7 +1875,7 @@ class Store:
         return self.cfg["transport_per_unit"] + (teleport or 0)
 
     def transport_confirmed(self):
-        return self.cfg["transport_confirmed"] and self.cfg["teleport_confirmed"] and travel.catalog.items is not None
+        return self.cfg["transport_confirmed"] and self.cfg["teleport_confirmed"] and gamedata.catalog.items is not None
 
     def worst_carry(self, item, dest):
         """The dearest move into dest from any trading city, for a target price that must hold wherever I buy."""
@@ -2500,9 +2501,9 @@ class Store:
                 self.db.execute("SELECT created,payload FROM pick_log ORDER BY id DESC LIMIT ?", (limit,))]
 
     def state(self, item=None, city=None):
-        # The live receiver (auto_update on) fetches the teleport item data when it is missing; tests and copies only
+        # The live receiver (auto_update on) fetches the game item data when it is missing; tests and copies only
         # read a file already there.
-        travel.catalog.ensure(self.root, download=getattr(self, "auto_update", {}).get("enabled", False))
+        gamedata.catalog.ensure(self.root, download=getattr(self, "auto_update", {}).get("enabled", False))
         with self.lock:
             with self.db:
                 self.read_client_log()
@@ -2556,7 +2557,7 @@ class Store:
                        *((b["item"], b["city"]) for b in (*buyouts, *(past_buyouts or {}).get("rows", [])))}}
             last = self.db.execute("SELECT received,topic FROM packets ORDER BY id DESC LIMIT 1").fetchone()
             count = self.db.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
-            return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "travel": {"ready": travel.catalog.items is not None, "loading": travel.catalog.loading, "error": travel.catalog.error}, "server": "Europe (게임도 유럽 서버인지 확인)",
+            return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "travel": {"ready": gamedata.catalog.items is not None, "loading": gamedata.catalog.loading, "error": gamedata.catalog.error}, "server": "Europe (게임도 유럽 서버인지 확인)",
                 "timezone": self.cfg["timezone"], "items": {i: name + (" · 테스트·보류" if i in self.cfg["trial_items"] else "") for i, name in self.cfg["items"].items()},
                 "trial_items": self.cfg["trial_items"], "item_cities": self.cfg["item_cities"], "cities": CITIES,
                 "selected_item": item, "selected_city": city, "books": books,
@@ -2966,10 +2967,10 @@ class Store:
         # Per unit from each city to each other one: teleport cost plus the transport_per_unit setting; None where the
         # travel planner has no route (the screen then adds the setting alone, as carry() does). The whole map is None
         # when the item's weight is not known yet.
-        weights, extra, mult = travel.catalog.get(item), self.cfg["transport_per_unit"], self.cfg["teleport_multiplier"]
+        weights, extra, mult = gamedata.catalog.get(item), self.cfg["transport_per_unit"], self.cfg["teleport_multiplier"]
         carry = {a: {b: None if (t := travel.unit_cost(item, a, b, mult)) is None else t + extra for b in cities if b != a} for a in cities} if weights else None
-        moving = {"weight": weights[0], "factor": weights[1], "multiplier": mult, "extra": extra, "confirmed": self.transport_confirmed()} if weights else \
-            {"loading": travel.catalog.loading, "error": travel.catalog.error}
+        moving = {"weight": weights["w"], "factor": weights["f"], "multiplier": mult, "extra": extra, "confirmed": self.transport_confirmed()} if weights else \
+            {"loading": gamedata.catalog.loading, "error": gamedata.catalog.error}
         return {"item": item, "quality": quality, "name": lookup.catalog.name(item), "cities": list(rows.values()), "carry": carry, "travel": moving,
                 "public_loading": loading, "public_error": (public or {}).get("error", ""),
                 "public_fetched": datetime.fromtimestamp(public["fetched"], UTC).isoformat() if public else None,

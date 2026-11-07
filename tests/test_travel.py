@@ -1,27 +1,19 @@
-"""Teleport cost: route distances, the item data parse, and the per-unit cost the trading math adds. Synthetic data only."""
-import io
-import json
+"""Teleport cost: route distances and the per-unit cost the trading math adds. Synthetic data only."""
 from pathlib import Path
 import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import gamedata
 import lookup
 import travel
 from market import CARRIED, Store
 
 ROOT = Path(__file__).resolve().parents[1]
 LYMHURST, BRIDGEWATCH, MARTLOCK, FORT_STERLING, THETFORD, BRECILIEN, CAERLEON = "1002", "2004", "3008", "4002", "7", "5003", "3005"
-XML = b"""<?xml version="1.0"?>
-<items>
-  <simpleitem uniquename="T8_TESTSOUL" tier="8" weight="1" maxstacksize="999">
-    <craftingrequirements><craftresource uniquename="T7_TESTSOUL" count="5" /></craftingrequirements>
-  </simpleitem>
-  <simpleitem uniquename="T6_TESTORE" tier="6" weight="1.14" fasttravelfactor="8" />
-  <weapon uniquename="T6_TESTSWORD" tier="6" weight="15.2"><enchantments><enchantment enchantmentlevel="1" /></enchantments></weapon>
-  <simpleitem uniquename="T9_BROKEN" weight="heavy" />
-</items>"""
+ITEMS = {"T8_TESTSOUL": {"w": 1.0, "f": 1.0}, "T6_TESTORE": {"w": 1.14, "f": 8.0},
+         "T6_TESTSWORD": {"w": 15.2, "f": 1.0, "v": [3, 6], "up": [[["T6_RUNE", 384]]]}}
 
 
 class DistanceTests(unittest.TestCase):
@@ -41,53 +33,17 @@ class DistanceTests(unittest.TestCase):
         self.assertIsNone(travel.distance(BRECILIEN, CAERLEON))
 
 
-class ItemDataTests(unittest.TestCase):
+class UnitCostTests(unittest.TestCase):
     def setUp(self):
-        self.items = travel.Catalog()
-        self.items.items = travel.parse(io.BytesIO(XML))
-
-    def test_parse_keeps_weight_and_factor_and_defaults_factor_to_one(self):
-        self.assertEqual(self.items.items, {"T8_TESTSOUL": [1.0, 1.0], "T6_TESTORE": [1.14, 8.0], "T6_TESTSWORD": [15.2, 1.0]})
-
-    def test_enchanted_id_uses_its_base_entry(self):
-        self.assertEqual(self.items.get("T6_TESTSWORD@2"), [15.2, 1.0])
-        self.assertIsNone(self.items.get("T5_UNKNOWN"))
+        self.items = gamedata.Catalog()
+        self.items.items = ITEMS
 
     def test_unit_cost_is_150_per_kg_times_factor_multiplier_and_distance(self):
         self.assertEqual(travel.unit_cost("T8_TESTSOUL", BRECILIEN, LYMHURST, 1.0, self.items), 300)
         self.assertAlmostEqual(travel.unit_cost("T6_TESTORE", THETFORD, FORT_STERLING, 1.2, self.items), 150 * 1.14 * 8 * 1.2)
+        self.assertAlmostEqual(travel.unit_cost("T6_TESTSWORD@2", THETFORD, FORT_STERLING, 1.0, self.items), 150 * 15.2)
         self.assertIsNone(travel.unit_cost("T8_TESTSOUL", CAERLEON, LYMHURST, 1.0, self.items))
         self.assertIsNone(travel.unit_cost("T5_UNKNOWN", THETFORD, LYMHURST, 1.0, self.items))
-
-    def test_ensure_reads_the_saved_file_and_never_downloads_unless_asked(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            catalog = travel.Catalog()
-            with patch.object(catalog, "download") as download:
-                catalog.ensure(tmp)
-                self.assertIsNone(catalog.items)
-                download.assert_not_called()
-            (Path(tmp) / "data").mkdir()
-            (Path(tmp) / "data/item_travel.json").write_text(json.dumps({"T8_TESTSOUL": [1, 1]}), encoding="utf-8")
-            catalog.ensure(tmp)
-            self.assertEqual(catalog.get("T8_TESTSOUL"), [1, 1])
-
-
-class RetryTests(unittest.TestCase):
-    def test_a_failed_download_is_tried_again_only_after_the_wait(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "data").mkdir()
-            catalog, clock = travel.Catalog(), [1000.0]
-            with patch("travel.time.monotonic", lambda: clock[0]), patch("travel.urllib.request.urlopen", side_effect=OSError("offline")), \
-                    patch("travel.threading.Thread") as thread:
-                thread.side_effect = lambda target, args, daemon: type("T", (), {"start": lambda self: target(*args)})()
-                catalog.ensure(tmp, download=True)
-                self.assertEqual((catalog.items, catalog.error, catalog.loading), (None, "offline", False))
-                clock[0] += travel.RETRY_SECONDS - 1
-                catalog.ensure(tmp, download=True)
-                self.assertEqual(thread.call_count, 1)
-                clock[0] += 2
-                catalog.ensure(tmp, download=True)
-                self.assertEqual(thread.call_count, 2)
 
 
 class StoreCarryTests(unittest.TestCase):
@@ -97,11 +53,11 @@ class StoreCarryTests(unittest.TestCase):
         shutil.copy(ROOT / "config.example.json", self.root / "config.json")
         self.store = Store(self.root)
         self.store.cfg.update(transport_per_unit=0, teleport_multiplier=1.0)
-        self.saved = travel.catalog.items
-        travel.catalog.items = travel.parse(io.BytesIO(XML))
+        self.saved = gamedata.catalog.items
+        gamedata.catalog.items = ITEMS
 
     def tearDown(self):
-        travel.catalog.items = self.saved
+        gamedata.catalog.items = self.saved
         self.store.db.close()
         self.tmp.cleanup()
 
@@ -137,7 +93,7 @@ class StoreCarryTests(unittest.TestCase):
         self.store.save_config({"teleport_confirmed": True})
         self.assertTrue(self.store.transport_confirmed())
         # Without the item weights the teleport part is missing, so the cost is not confirmed either.
-        travel.catalog.items = None
+        gamedata.catalog.items = None
         self.assertFalse(self.store.transport_confirmed())
 
     def test_lookup_answer_carries_the_city_to_city_cost(self):
