@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261105.2';
+  const legacy=next.build!=='20261107.1';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -524,7 +524,7 @@ function renderCombos(){
 async function loadLookup(){
  clearTimeout(lookupView.timer);const id=lookupId();if(!id)return;loadCombos();
  try{const quality=$('lookup-quality').value,r=await fetch(`/api/lookup/item?id=${encodeURIComponent(id)}&quality=${quality}`),data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(id!==lookupId()||quality!==$('lookup-quality').value)return;lookupView.data=data;renderLookup()}
- catch(e){updateHtml('lookup-view',`<p class="warn">시세를 못 불러왔습니다: ${esc(e.message)}</p>`)}
+ catch(e){if(lookupView.data?.item!==lookupId()){updateHtml('lookup-hero','');renderLookupCost(null)}updateHtml('lookup-view',`<p class="warn">시세를 못 불러왔습니다: ${esc(e.message)}</p>`)}
  // Poll faster while the public answer is still on its way.
  if(!document.querySelector('.tab-panel[data-tab=lookup]').hidden)lookupView.timer=setTimeout(loadLookup,lookupView.data?.public_loading?2500:15000)}
 function renderLookup(){
@@ -540,8 +540,38 @@ function renderLookup(){
  const t=lookupTier(),e=Number($('lookup-enchant').value);
  const tag=t?.tier!=null?`T${t.tier}.${e}`:e?'.'+e:'';
  const none=rows.every(r=>!r.sell&&!r.buy)&&!d.public_loading;
- updateHtml('lookup-view',`<div class="lk-hero"><span class="lk-name">${tierLabel(lookupName(lookupView.hit))}</span>${tag?`<span class="lk-chip">${tierLabel(tag)}</span>`:''}<span class="lk-chip q">${anyQuality?'아무 품질':qualityLabel(d.quality)}</span><code>${esc(d.item)}</code><button type="button" class="secondary small-button" data-watch-add>시세 감시에 추가</button></div>`+(none?`<p class="warn">이 조합은 6개 도시 어디에도 최근 매물·매수 기록이 없습니다.${anyQuality?' 위 「값이 있는 조합」 표에서 금색 칸을 누르면 매물이 있는 티어·인챈트로 바뀝니다.':' 품질을 \'아무 품질\'로 바꿔 보세요. 장비는 한 품질에만 매물이 있는 경우가 많습니다.'}</p>`:'')+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell&&!sell.old&&sell.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell&&!sell.old&&sell.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy&&!buy.old&&buy.price===dearest?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
+ updateHtml('lookup-hero',`<div class="lk-hero"><span class="lk-name">${tierLabel(lookupName(lookupView.hit))}</span>${tag?`<span class="lk-chip">${tierLabel(tag)}</span>`:''}<span class="lk-chip q">${anyQuality?'아무 품질':qualityLabel(d.quality)}</span><code>${esc(d.item)}</code><button type="button" class="secondary small-button" data-watch-add>시세 감시에 추가</button></div>`);
+ renderLookupCost(rows);
+ updateHtml('lookup-view',(none?`<p class="warn">이 조합은 6개 도시 어디에도 최근 매물·매수 기록이 없습니다.${anyQuality?' 위 「값이 있는 조합」 표에서 금색 칸을 누르면 매물이 있는 티어·인챈트로 바뀝니다.':' 품질을 \'아무 품질\'로 바꿔 보세요. 장비는 한 품질에만 매물이 있는 경우가 많습니다.'}</p>`:'')+table(['도시','최저 매도 (바로 사기)','최고 매수 (바로 팔기)','7일 평균 체결가','하루 판매량 (7일)','마지막 체결일'],rows.map(({c,sell,buy,h})=>`<tr class="${sell&&!sell.old&&sell.price===cheapest?'lk-cheapest':''}"><td>${esc(state.cities[c.city]||c.city)}${sell&&!sell.old&&sell.price===cheapest?'<small class="positive">가장 쌈</small>':''}${buy&&!buy.old&&buy.price===dearest?'<small class="positive">가장 비싸게 사 줌</small>':''}</td><td>${cell(sell,'sell')}</td><td>${cell(buy,'buy')}</td><td>${h?.average!=null?n(h.average):'—'}${h?.all_qualities?'<small>모든 품질 합계</small>':''}</td><td>${h?n(h.per_day,1)+'개':'—'}</td><td>${h?`${n(h.last)}<small>${n(h.last_count)}개 · ${lookupAge(h.last_day)}</small>`:'—'}</td></tr>`),'lookup')
   +`<p class="help">${d.public_loading?'공개 서버에 묻는 중… ':d.public_error?'공개 서버 조회 실패: '+esc(d.public_error)+' · ':d.public_fetched?`공개 서버 값은 ${lookupAge(d.public_fetched)}에 받음 · `:''}실시간 공유·내가 연 시장 값은 최근 24시간 안에 들은 주문입니다. 그사이 팔렸거나 새 매물이 올라왔을 수 있으니 사고팔기 전에는 게임에서 한 번 확인하세요. 7일 평균·판매량은 공개 서버의 하루 단위 거래 이력입니다.</p>`)}
+// What one unit costs, from each city's newest record: an instant buy pays the cheapest sell order and no fee;
+// a buy order goes one silver over the dearest bid and pays the setup fee on top. The cheapest city counts only
+// records under a day old when any exist, so a stale low price never wins over a current one. Costs are whole silver.
+// With any quality, a bid of another quality does not compete with mine, so buy orders count only when they are of the
+// quality the cheapest instant buy is of (quality says which).
+function lookupCosts(rows,fee,anyQuality){
+ const cities=rows.map(({c,sell,buy})=>({city:c.city,instant:sell?{...sell,unit:sell.price}:null,order:buy?{...buy,bid:buy.price+1,unit:Math.round((buy.price+1)*(1+fee))}:null}));
+ const best=side=>{const has=cities.filter(r=>r[side]),fresh=has.filter(r=>!r[side].old);return (fresh.length?fresh:has).reduce((a,r)=>!a||r[side].unit<a[side].unit?r:a,null)};
+ const instant=best('instant'),quality=anyQuality?instant?.instant.quality??null:null;
+ if(quality!=null)for(const r of cities)if(r.order&&r.order.quality!==quality)r.order=null;
+ return {cities,instant,order:best('order'),quality};
+}
+function renderLookupCost(rows){
+ const box=$('lookup-cost');box.hidden=!rows;if(!rows)return;
+ const st=state.settings,fee=st.setup_fee,units=Math.max(1,Math.min(100000,Math.floor(Number($('lookup-cost-units').value))||1));
+ const anyQuality=!Number(lookupView.data.quality),k=lookupCosts(rows,fee,anyQuality),city=c=>esc(state.cities[c]||c),src={me:'내가 연 시장',stream:'실시간 공유',public:'공개 서버'};
+ const when=q=>`<small class="lk-src ${q.source}" title="${esc(date(q.seen))}">${src[q.source]} · ${lookupAge(q.seen)}${q.old?' · 오래된 값':''}</small>`;
+ const card=(title,r,side,how)=>{const q=r?.[side];return `<div class="lk-cost-card ${side}"><span class="lk-cost-title">${title}</span>${q?`<b class="lk-price ${side==='instant'?'sell':'buy'} ${q.old?'lk-old':''}">${n(q.unit)}</b><small>개당 · ${city(r.city)}${q.quality&&anyQuality?' · '+qualityLabel(q.quality):''}</small>${units>1?`<span class="lk-cost-total">${n(units)}개 ${n(q.unit*units)}</span>`:''}<small>${how(q)}</small>${when(q)}`:`<small>${side==='order'&&k.quality!=null?`${qualityLabel(k.quality)} 매수 주문 기록 없음`:'어느 도시에도 기록 없음'}</small>`}</div>`};
+ const order=card('매수 걸어 사기',k.order,'order',q=>`최고 매수가 ${n(q.price)}보다 1 높게 ${n(q.bid)}에 걸기 + 주문 수수료 ${n(fee*100,1)}%`);
+ const instant=card('즉구로 사기',k.instant,'instant',q=>`최저 매도가 그대로 · 수수료 없음${q.amount!=null&&units>q.amount?` · <span class="warn">이 값 물량은 ${n(q.amount)}개뿐, 더 사면 더 비쌈</span>`:''}`);
+ const gap=k.order&&k.instant?k.instant.instant.unit-k.order.order.unit:null;
+ const diff=gap==null?'':`<p class="lk-cost-gap">${gap>0?`매수 걸면 개당 <b>${n(gap)}</b> 싸게 삽니다${units>1?` (${n(units)}개 ${n(gap*units)})`:''}. 대신 다른 사람이 팔아 줄 때까지 기다려야 하고, 다 체결된다는 보장은 없습니다.`:(gap<0?`지금은 즉구가 개당 ${n(-gap)} 더 쌉니다`:'지금은 둘이 같습니다')+'. 매수를 걸고 기다릴 이유가 없습니다.'}</p>`;
+ const cell=q=>q?`${n(q.unit)}${q.old?'<small>오래된 값</small>':''}`:'—';
+ const per=`<details class="more-help"><summary>도시별 원가 보기</summary>${table(['도시','매수 걸어 사기 (개당)','즉구 (개당)'],k.cities.map(r=>`<tr><td>${city(r.city)}</td><td>${cell(r.order)}</td><td>${cell(r.instant)}</td></tr>`),'lookup-cost')}</details>`;
+ updateHtml('lookup-cost-result',`<div class="lk-cost-cards">${order}${instant}</div>${diff}${per}<p class="help">${k.quality!=null?`품질을 '아무 품질'로 두면 가장 싸게 즉구할 수 있는 ${qualityLabel(k.quality)} 기준으로 두 가지를 비교합니다. 매수 주문은 같은 품질끼리만 경쟁하기 때문입니다. `:''}각 도시의 가장 최근 기록으로 계산합니다. 하루 안의 기록이 있으면 그중 가장 싼 도시를, 없으면 오래된 기록 중 가장 싼 도시를 보여 줍니다. 운송비는 넣지 않았습니다.${st.fees_confirmed?'':' 주문 수수료는 설정에서 아직 확인하지 않은 값입니다.'}</p>`);
+}
+$('lookup-cost-units').addEventListener('input',()=>{storage.set('lookupCostUnits',$('lookup-cost-units').value);const d=lookupView.data;if(d&&d.item===lookupId()&&String(d.quality)===$('lookup-quality').value)renderLookup()});
+$('lookup-cost-units').value=storage.get('lookupCostUnits','1');
 $('lookup-form').onsubmit=e=>{e.preventDefault();lookupSearch()};
 $('lookup-q').oninput=()=>{clearTimeout(lookupView.searchTimer);lookupView.searchTimer=setTimeout(lookupSearch,250)};
 $('lookup-tier').onchange=()=>{fillEnchants();remember();loadLookup()};

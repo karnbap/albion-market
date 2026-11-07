@@ -306,3 +306,10 @@ header .crest{width:58px;height:69px;filter:drop-shadow(0 2px 2px rgba(0,0,0,.6)
 .chat-status{display:block;color:var(--muted);font-size:12px;margin-top:4px}.chat-empty{margin:auto;text-align:center}
 .chat-input{display:flex;gap:10px;align-items:stretch;margin-top:12px}.chat-input textarea{flex:1;min-width:0;resize:vertical;font:inherit;color:var(--text);background:#122027;border:1px solid var(--line);border-radius:5px;padding:10px}
 @media(max-width:760px){.chat-msg{max-width:100%}}
+/* Cost box in the item lookup: buy order beside instant buy. */
+.lk-cost{margin:0 0 14px;padding:14px 18px;border:1px solid var(--line);border-radius:10px;background:rgba(0,0,0,.18)}
+.lk-cost-head{display:flex;justify-content:space-between;align-items:end;gap:12px;flex-wrap:wrap}.lk-cost-head h3{margin:0;font-size:15px;color:var(--gold)}.lk-cost-head label{width:120px}.lk-cost-head input{padding:6px 10px}
+.lk-cost-cards{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+.lk-cost-card{padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}.lk-cost-card.order{border-color:rgba(111,214,163,.45)}.lk-cost-card.instant{border-color:rgba(232,196,110,.45)}
+.lk-cost-title{display:block;font-size:12px;color:var(--muted)}.lk-cost-total{display:block;font-size:13px;margin-top:2px}.lk-cost-gap{margin:10px 0 0;font-size:13px}.lk-cost .more-help{margin-top:8px}
+@media(max-width:760px){.lk-cost-cards{grid-template-columns:1fr}}
