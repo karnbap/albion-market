@@ -14,6 +14,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from auto_update import Runtime, find_node
+import travel
 from market import BUILD
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,10 @@ class AutomaticUpdateTests(unittest.TestCase):
         shutil.copy2(ROOT/'market.py', self.root/'market.py')
         shutil.copy2(ROOT/'config.json', self.root/'config.json')
         shutil.copytree(ROOT/'web', self.root/'web')
+        # A runtime has auto_update on, so it would fetch the teleport item data; keep tests off the network.
+        downloads = patch.object(travel.Catalog, 'download', lambda catalog, path: setattr(catalog, 'loading', False))
+        downloads.start()
+        self.addCleanup(downloads.stop)
         self.runtime = Runtime(self.root, self.root)
 
     def tearDown(self):

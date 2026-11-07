@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import lookup
+import travel
 
 ASSETS = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css',
           '/app-v2.js': 'app-v2.js', '/v2.css': 'v2.css'}
@@ -195,6 +196,8 @@ def run(source_root, data_root, port=None):
     runtime = Runtime(source_root, data_root)
     # The any-item lookup listens to the public order stream; one listener outlives code revisions.
     lookup.start_stream(data_root, runtime.store.cfg.get('server', 'europe'))
+    # Item weights for the teleport cost, fetched in the background (state() keeps trying after a failure).
+    travel.catalog.ensure(data_root, download=True)
     server = ThreadingHTTPServer(('127.0.0.1', port or runtime.store.cfg['port']), runtime.handle)
     server.daemon_threads = True
     threading.Thread(target=runtime.watch, daemon=True).start()
