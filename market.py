@@ -27,7 +27,9 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import chat
+import gamedata
 import lookup
+import travel
 
 ROOT = Path(__file__).resolve().parent
 UTC = timezone.utc
@@ -50,10 +52,13 @@ DEPTH_DEFAULTS = {"small_quantity_max": 9, "large_quantity_min": 100, "wall_quan
 # the item's market-wide daily sales, picks that add stock buy less.
 # cycle_share / weekday_cycles: the trading plan's part of a market's daily sales and weekday turns.
 SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_cities": ["3005", "5003"], "inventory_heavy_days": 3,
-                    "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "buy_order_targets": {}, "sell_targets": {}}
+                    "cycle_share": 0.2, "weekday_cycles": 2, "buy_targets": {}, "buy_order_targets": {}, "sell_targets": {},
+                    "teleport_multiplier": 1.156, "teleport_confirmed": False}
+# teleport_multiplier: the server-wide factor of the teleport formula (travel.py). 1.156 is the example of the article
+# the formula comes from; the player checks it against the in-game travel planner and confirms it.
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261107.1"
+BUILD = "20261107.2"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -382,7 +387,10 @@ class Store:
             cfg["transport_per_unit"] = float(cfg["transport_per_unit"])
             if not 0 < cfg["near_high_fraction"] <= 1 or not 1 <= cfg["fresh_minutes"] <= 60 or cfg["transport_per_unit"] < 0:
                 raise ValueError("Invalid freshness / high-price threshold / transport cost")
-            for key in ("fees_confirmed", "transport_confirmed"):
+            cfg["teleport_multiplier"] = float(cfg["teleport_multiplier"])
+            if not math.isfinite(cfg["teleport_multiplier"]) or not 0 < cfg["teleport_multiplier"] <= 10:
+                raise ValueError("teleport_multiplier must be above 0 and at most 10")
+            for key in ("fees_confirmed", "transport_confirmed", "teleport_confirmed"):
                 if not isinstance(cfg[key], bool):
                     raise ValueError(key + " must be boolean")
             for key in ("small_quantity_max", "large_quantity_min", "wall_quantity_min"):
@@ -713,7 +721,7 @@ class Store:
         cfg = self.cfg
         last = self.db.execute("SELECT MAX(id) FROM packets").fetchone()[0]
         key = (last, self.clock().replace(second=0, microsecond=0), json.dumps(cfg["excluded_cities"]),
-               cfg["sales_tax"], cfg["setup_fee"], cfg["transport_per_unit"], cfg["cycle_share"])
+               cfg["sales_tax"], cfg["setup_fee"], cfg["transport_per_unit"], cfg["teleport_multiplier"], bool(gamedata.catalog.items), cfg["cycle_share"])
         if getattr(self, "_plan_key", None) == key:
             return self._plan_inputs
         zone = ZoneInfo(cfg["timezone"])
@@ -747,7 +755,7 @@ class Store:
                 base = buy[0] * (1 + fee_in)
                 legs, left = [], limit
                 for city, sell, room in outlets:
-                    cost = base + (cfg["transport_per_unit"] if city != buy_city else 0)
+                    cost = base + self.carry(item, buy_city, city)
                     legs.append({"sell_city": city, "sell": sell[0], "sell_basis": sell[1], "cost": cost, "net": sell[0] * keep,
                                  "margin": sell[0] * keep - cost, "units": room, "share_measured": measured.get((item, city)) is not None})
                 legs = sorted((leg for leg in legs if leg["margin"] > 0), key=lambda leg: -leg["margin"])
@@ -1344,7 +1352,7 @@ class Store:
                     sell_now, sell_now_amount = levels[0]["price"], levels[0]["amount"]
             net = sell_now * (1 - self.cfg["sales_tax"]) if sell_now is not None else None
             best = best_listing.get(item)
-            listed_net = best["net"] - (self.cfg["transport_per_unit"] if city not in (best["city"], CARRIED) else 0) if best else None
+            listed_net = best["net"] - self.carry(item, city, best["city"]) if best else None
             rows.append({"city": city, "item": item, **cell, "total": total, "cost": cost,
                          "list_city": best and best["city"], "list_net": listed_net,
                          "list_value": total * listed_net if listed_net is not None else None,
@@ -1857,6 +1865,22 @@ class Store:
     def plan_items(self):
         return [i for i in self.cfg["items"] if i not in self.cfg["trial_items"]]
 
+    def carry(self, item, source, dest):
+        """Silver per unit to move an item from one city to another: the teleport cost from the item's weight and
+        the route (travel.py), plus the transport_per_unit setting on top. Units carried or already in the
+        destination cost nothing. An item or route the teleport data does not know (Caerleon) costs the setting alone."""
+        if source == dest or CARRIED in (source, dest):
+            return 0
+        teleport = travel.unit_cost(item, source, dest, self.cfg["teleport_multiplier"])
+        return self.cfg["transport_per_unit"] + (teleport or 0)
+
+    def transport_confirmed(self):
+        return self.cfg["transport_confirmed"] and self.cfg["teleport_confirmed"] and gamedata.catalog.items is not None
+
+    def worst_carry(self, item, dest):
+        """The dearest move into dest from any trading city, for a target price that must hold wherever I buy."""
+        return max((self.carry(item, c, dest) for c in self.trade_cities(item)), default=0)
+
     def trade_cities(self, item=None):
         """Cities trading analysis may buy in or sell to; the rest stay visible as prices only.
         With an item, its item_cities come back in even when excluded_cities drops them."""
@@ -1866,7 +1890,7 @@ class Store:
     def route_scenarios(self, item, source, dest, books, cache):
         cfg = self.cfg
         src, dst = books[source], books[dest]
-        transport = cfg["transport_per_unit"] if source != dest else 0
+        transport = self.carry(item, source, dest)
         setup = cfg["setup_fee"]
         # (mode, entry, exit, buy fee, extra sell fee, quotes actually used)
         scenarios = []
@@ -1919,7 +1943,7 @@ class Store:
                 reasons.append("인근 가격대의 의미 있는 주문 물량 부족")
             if not cfg["fees_confirmed"]:
                 reasons.append(FEES_UNCONFIRMED)
-            if source != dest and not cfg["transport_confirmed"]:
+            if source != dest and not self.transport_confirmed():
                 reasons.append(TRANSPORT_UNCONFIRMED)
             if h["coverage"] < 0.8:
                 reasons.append("7일 판매 이력 부족")
@@ -2034,7 +2058,7 @@ class Store:
             cities = self.trade_cities(item)
             lists = {(item, c): books[item][c]["sell"] for c in cities}
             sell_city, sell, sell_average = self.resale_outlet(item, books)
-            suggested = math.floor(sell * keep / (1 + cfg["minimum_margin"]) - cfg["transport_per_unit"]) if sell else None
+            suggested = math.floor(sell * keep / (1 + cfg["minimum_margin"]) - self.worst_carry(item, sell_city)) if sell else None
             target = cfg["buy_targets"].get(item) or suggested
             rows = []
             for c in cities:
@@ -2047,8 +2071,7 @@ class Store:
                                cost=sum(l["price"] * l["amount"] for l in under))
                     if row["units"]:
                         row["average"] = row["cost"] / row["units"]
-                        carry = cfg["transport_per_unit"] if c != sell_city else 0
-                        row["profit"] = row["units"] * (sell * keep - carry) - row["cost"]
+                        row["profit"] = row["units"] * (sell * keep - self.carry(item, c, sell_city)) - row["cost"]
                 rows.append(row)
             units = sum(r["units"] for r in rows)
             out.append({"item": item, "target": target, "chosen": cfg["buy_targets"].get(item), "suggested": suggested,
@@ -2069,7 +2092,7 @@ class Store:
         measured = {(s["item"], s["city"]): s["instant_buy_share"] for s in self.market_studies(cache)}
         for item in cfg["items"]:
             sell_city, sell, sell_average = self.resale_outlet(item, books)
-            suggested = math.floor((sell * keep / (1 + cfg["minimum_margin"]) - cfg["transport_per_unit"]) / (1 + cfg["setup_fee"])) if sell else None
+            suggested = math.floor((sell * keep / (1 + cfg["minimum_margin"]) - self.worst_carry(item, sell_city)) / (1 + cfg["setup_fee"])) if sell else None
             target = cfg["buy_order_targets"].get(item) or suggested
             rows = []
             for c in self.trade_cities(item):
@@ -2091,8 +2114,7 @@ class Store:
                         row["units"] = int(max(0, row["per_day"] * WATCH_SELL_DAYS - row["ahead"]) * cfg["cycle_share"])
                     if row["units"]:
                         row["cost"] = row["units"] * row["price"] * (1 + cfg["setup_fee"])
-                        carry = cfg["transport_per_unit"] if c != sell_city else 0
-                        row["profit"] = row["units"] * (sell * keep - carry) - row["cost"] if sell else None
+                        row["profit"] = row["units"] * (sell * keep - self.carry(item, c, sell_city)) - row["cost"] if sell else None
                 rows.append(row)
             units = sum(r["units"] for r in rows)
             fresh = [r for r in rows if r["fresh"]]
@@ -2276,7 +2298,7 @@ class Store:
         listing and order trades are capped by one day of the slowest recent sales."""
         cfg = self.cfg
         item, source, dest, mode = c["item"], c["buy_city"], c["sell_city"], c["mode"]
-        transport = cfg["transport_per_unit"] if source != dest else 0
+        transport = self.carry(item, source, dest)
         asks = [[l["price"], l["amount"]] for l in books[item][source]["sell"]["fresh_levels"]]
         sell_guide = self.volume_guide(cache, item, dest)
         units = cost = revenue = 0
@@ -2479,6 +2501,9 @@ class Store:
                 self.db.execute("SELECT created,payload FROM pick_log ORDER BY id DESC LIMIT ?", (limit,))]
 
     def state(self, item=None, city=None):
+        # The live receiver (auto_update on) fetches the game item data when it is missing; tests and copies only
+        # read a file already there.
+        gamedata.catalog.ensure(self.root, download=getattr(self, "auto_update", {}).get("enabled", False))
         with self.lock:
             with self.db:
                 self.read_client_log()
@@ -2532,7 +2557,7 @@ class Store:
                        *((b["item"], b["city"]) for b in (*buyouts, *(past_buyouts or {}).get("rows", [])))}}
             last = self.db.execute("SELECT received,topic FROM packets ORDER BY id DESC LIMIT 1").fetchone()
             count = self.db.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
-            return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "server": "Europe (게임도 유럽 서버인지 확인)",
+            return {"build": BUILD, "personal_sales": sales, "personal_mails": self.personal_mails(), "capture": capture_status(self.root), "game_watch": watch_status(self.root), "ui_revision": getattr(self, "ui_revision", None), "auto_update": getattr(self, "auto_update", {"enabled": False}), "generated_at": self.clock().isoformat(), "travel": {"ready": gamedata.catalog.items is not None, "loading": gamedata.catalog.loading, "error": gamedata.catalog.error}, "server": "Europe (게임도 유럽 서버인지 확인)",
                 "timezone": self.cfg["timezone"], "items": {i: name + (" · 테스트·보류" if i in self.cfg["trial_items"] else "") for i, name in self.cfg["items"].items()},
                 "trial_items": self.cfg["trial_items"], "item_cities": self.cfg["item_cities"], "cities": CITIES,
                 "selected_item": item, "selected_city": city, "books": books,
@@ -2670,7 +2695,7 @@ class Store:
         rows = asks or [{"city": sell["city"], "price": sell["price"], "amount": None, "seen": sell["seen"], "source": "public"}]
 
         def carried(row):
-            return row["price"] + (cfg["transport_per_unit"] if row["city"] != listing["city"] else 0)
+            return row["price"] + self.carry(view["item"], row["city"], listing["city"])
 
         def buy(limit, worth=net):
             units, spent, oldest, sources, bought = 0, 0, None, defaultdict(int), defaultdict(int)
@@ -2687,7 +2712,7 @@ class Store:
             return {"units": units, "invested": spent, "profit": units * worth - spent, "roi": (units * worth - spent) / spent if spent else None, "oldest": oldest, "sources": dict(sources), "cities": dict(bought)}
 
         def order_unit(fill):
-            return fill["price"] * (1 + cfg["setup_fee"]) + (cfg["transport_per_unit"] if fill["city"] != listing["city"] else 0)
+            return fill["price"] * (1 + cfg["setup_fee"]) + self.carry(view["item"], fill["city"], listing["city"])
 
         def place(limit, worth=net):
             units, spent, oldest, bought = 0, 0, None, defaultdict(int)
@@ -2939,7 +2964,14 @@ class Store:
                                   "last": merged[last][1] / merged[last][0] if merged[last][0] else None,
                                   "last_count": merged[last][0], "last_day": utc(last), "all_qualities": bool(quality) and not by_quality.get(quality)}
         lookup.catalog.ensure(self.root)
-        return {"item": item, "quality": quality, "name": lookup.catalog.name(item), "cities": list(rows.values()),
+        # Per unit from each city to each other one: teleport cost plus the transport_per_unit setting; None where the
+        # travel planner has no route (the screen then adds the setting alone, as carry() does). The whole map is None
+        # when the item's weight is not known yet.
+        weights, extra, mult = gamedata.catalog.get(item), self.cfg["transport_per_unit"], self.cfg["teleport_multiplier"]
+        carry = {a: {b: None if (t := travel.unit_cost(item, a, b, mult)) is None else t + extra for b in cities if b != a} for a in cities} if weights else None
+        moving = {"weight": weights["w"], "factor": weights["f"], "multiplier": mult, "extra": extra, "confirmed": self.transport_confirmed()} if weights else \
+            {"loading": gamedata.catalog.loading, "error": gamedata.catalog.error}
+        return {"item": item, "quality": quality, "name": lookup.catalog.name(item), "cities": list(rows.values()), "carry": carry, "travel": moving,
                 "public_loading": loading, "public_error": (public or {}).get("error", ""),
                 "public_fetched": datetime.fromtimestamp(public["fetched"], UTC).isoformat() if public else None,
                 "stream": stream}
