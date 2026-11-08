@@ -80,7 +80,7 @@ async function refresh(){
    let warning=null;
    if(capture===false&&!watch)warning=['시장 수집기가 실행 중이 아닙니다.','이 Windows 컴퓨터에서 알비온 게임을 실행하면 수집기가 자동으로 켜집니다. 휴대폰·아이패드 자료는 자동 수집되지 않습니다.'];
    else if(capture===false&&!watch.active)warning=['자동 감시가 꺼져 있습니다.','게임을 켤 때 자동으로 수집하려면 이 폴더의 enable-game-watch.ps1을 한 번 실행해 주세요. 지금은 지난 자료만 표시합니다. 휴대폰·아이패드 자료는 자동 수집되지 않습니다.'];
-   else if(capture===false&&watch.game_running)warning=['게임은 켜져 있지만 지금은 수집하지 않습니다.',`자동 감시 상태: ${watch.status||'확인 중'}. 잠시 후 자동으로 다시 시도합니다. 계속되면 data 폴더의 game-watch.log를 확인해 주세요.`];
+   else if(capture===false&&watch.game_running)warning=['게임은 켜져 있지만 지금은 수집하지 않습니다.',`자동 감시 상태: ${watch.status||'확인 중'}. 자동으로 다시 시도합니다(처음 10분은 1분마다, 그 뒤 5분마다).${/실패|재시도/.test(watch.status||'')?' PC를 켠 직후에는 Windows 보안(스마트 앱 컨트롤)이 수집기를 몇 분 동안 막기도 하는데, 보통 저절로 풀립니다.':''} 계속되면 data 폴더의 game-watch.log를 확인해 주세요.`];
    $('capture-warning').hidden=!warning;if(warning){$('capture-title').textContent=warning[0];$('capture-detail').textContent=warning[1]}
    $('connection').textContent=capture===false?(watch?.active&&!watch.game_running?'자동 감시 켜짐 · 게임을 켜면 수집 시작':'수집기 꺼짐 · 지난 자료만 표시'):!state.packets?'저장 프로그램 연결됨 · 첫 자료 대기':packetAge<=state.settings.fresh_minutes?'저장 프로그램 연결됨 · 최근 자료 수신':`저장 프로그램 연결됨 · ${n(packetAge)}분간 새 자료 없음`;
    $('last').textContent=`마지막 자료 ${date(state.last_packet?.received)} · ${n(state.packets)}회 수신`;
