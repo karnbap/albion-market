@@ -16,6 +16,8 @@ import dashboard_window
 ROOT = Path(__file__).resolve().parent
 GAME = 'albion-online.exe'
 CAPTURE_NAMES = ('albiondata-client-fork.exe', 'albiondata-client.exe')
+# Failed capture starts retried every minute this many times (about ten minutes), then every five minutes.
+FAST_RETRIES = 10
 
 
 class WindowsPlatform:
@@ -227,6 +229,9 @@ class Controller:
             if capture is True:
                 self.failures = 0
                 return self.check_receiver(now)
+            # The window does not wait for the capture: Windows Smart App Control has blocked the collector
+            # for minutes after a PC restart (2026-11-08), and the window then shows why nothing is collected.
+            self.open_window_once()
             if capture is None:
                 return self.status('수집기 상태 확인 불가 · 중복 실행 보류',True,None)
             if names & set(CAPTURE_NAMES):
@@ -242,7 +247,12 @@ class Controller:
             except Exception:
                 logging.exception('Automatic capture startup failed')
                 self.failures += 1
-                self.next_start = self.clock()+min(300,30*2**min(self.failures-1,4))
+                # 30 s, then every minute for about ten minutes: a block that lifts on its own (about 8 min after
+                # a restart, 2026-11-08) is picked up within a minute. A block that lasts gets a try, and a Windows
+                # "blocked" notice, only every five minutes.
+                wait = 30 if self.failures == 1 else 60 if self.failures <= FAST_RETRIES else 300
+                self.next_start = self.clock()+wait
+                self.open_window_once()
                 return self.status('수집기 시작 실패 · 잠시 후 재시도',True,False)
         self.receiver_misses = 0
         if self.absent_since is None:
@@ -270,13 +280,17 @@ class Controller:
             logging.exception('Automatic app stop failed')
         return self.status('게임 종료 · 분석 프로그램 종료 확인 필요',False,capture)
 
+    def open_window_once(self):
+        # Once per game session; closing the window keeps it closed until the next launch.
+        # Not before the receiver answers: the window would show a dead page.
+        if not self.window_opened and self.platform.receiver_ready():
+            self.window_opened = True
+            self.platform.open_dashboard()
+
     def check_receiver(self, now):
         if self.platform.receiver_ready():
             self.receiver_misses = 0
-            if not self.window_opened:
-                # Once per game session; closing the window keeps it closed until the next launch.
-                self.window_opened = True
-                self.platform.open_dashboard()
+            self.open_window_once()
             return self.status('게임 실행 중 · 자동 수집 중',True,True)
         # Three misses (~9 s) so a briefly busy receiver is never started twice.
         self.receiver_misses += 1

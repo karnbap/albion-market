@@ -108,7 +108,8 @@ class GameWatchTests(unittest.TestCase):
         for _ in range(5): self.step(3)
         self.assertEqual(self.platform.receiver_starts,1)
         self.assertTrue(self.platform.receiver)
-        self.assertEqual(self.platform.windows,1)
+        # One window per game session: the first opened at once (the receiver was up), the second after its restart.
+        self.assertEqual(self.platform.windows,2)
 
     def test_manual_stop_session_does_not_close_app_later(self):
         self.platform.names={GAME};self.step()
@@ -138,6 +139,34 @@ class GameWatchTests(unittest.TestCase):
         self.assertEqual(self.platform.starts,2)
         self.step(59)
         self.assertEqual(self.platform.starts,2)
+
+    def test_failed_starts_retry_at_least_every_minute(self):
+        # A Smart App Control block after a PC restart lifted on its own after minutes; waits must not grow past a minute.
+        self.platform.names={GAME};self.platform.success=False
+        for wait in (0,30,*[60]*9):
+            with self.assertLogs(level='ERROR'): self.step(wait)
+        self.assertEqual(self.platform.starts,11)
+        # After about ten minutes a lasting block is tried only every five minutes.
+        self.step(60);self.step(239)
+        self.assertEqual(self.platform.starts,11)
+        self.platform.success=True;self.step(1)
+        self.assertEqual(self.platform.starts,12)
+        self.assertTrue(self.platform.running)
+
+    def test_window_opens_while_capture_is_blocked(self):
+        self.platform.names={GAME};self.platform.success=False;self.platform.receiver=False
+        with self.assertLogs(level='ERROR'): self.step()
+        # No receiver yet: the window would show a dead page.
+        self.assertEqual(self.platform.windows,0)
+        self.platform.receiver=True;self.step(3)
+        self.assertEqual(self.platform.windows,1)
+        self.assertEqual(json.loads((self.root/'data/game-watch-state.json').read_text(encoding='utf-8'))['status'],'수집기 재시도 대기')
+        for _ in range(5): self.step(3)
+        with self.assertLogs(level='ERROR'): self.step(30)
+        self.platform.success=True;self.step(60)
+        # Once per game session, also after the capture finally starts.
+        self.assertTrue(self.platform.running)
+        self.assertEqual(self.platform.windows,1)
 
     def test_new_game_session_resets_old_start_failure_backoff(self):
         self.platform.names={GAME};self.platform.success=False
