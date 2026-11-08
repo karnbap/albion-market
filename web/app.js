@@ -60,7 +60,7 @@ async function refresh(){
   // dropdown or reset a half-filled form. Leaving the field refreshes again.
   if(ready&&editing())return;
   if(ready&&state?.ui_revision&&next.ui_revision&&state.ui_revision!==next.ui_revision){rememberView();if(draft)storage.set('settingsDraft',readDraft());window.location.reload();return}
-  const legacy=next.build!=='20261107.3';
+  const legacy=next.build!=='20261108.1';
   $('upgrade').hidden=!legacy;
   for(const input of $('settings').querySelectorAll('input,button'))input.disabled=legacy;
   if(legacy)$('saved').textContent='업데이트 적용 후 자동 저장을 사용할 수 있습니다.';
@@ -715,6 +715,63 @@ document.addEventListener('focusout',()=>setTimeout(()=>{if(ready&&!editing())re
 
 // Claude chat tab. The answer runs on the server, so this only polls it; a reload picks it back up.
 const chatView={id:storage.get('chatConversation',null),data:null,timer:null,seen:''};
+// Roads of Avalon: the whole list (about 400 roads) comes once and is filtered here, so typing answers at once.
+// Counts are spawn spots in the game files (resource nodes plus resource mobs), not what is still there now.
+const avalonView={roads:null,timer:null};
+const AVA={res:{HIDE:'가죽',ORE:'광석',FIBER:'섬유',WOOD:'나무',ROCK:'돌'},zone:{blue:'블루존',yellow:'옐로존',red:'레드존',black:'블랙존'},
+ type:{TUNNEL_ROYAL:'입구 길',TUNNEL_ROYAL_RED:'레드 입구 길',TUNNEL_BLACK_LOW:'블랙 입구 길',TUNNEL_BLACK_MEDIUM:'블랙 입구 길',TUNNEL_BLACK_HIGH:'블랙 입구 길',
+  TUNNEL_LOW:'안쪽 길',TUNNEL_MEDIUM:'안쪽 길',TUNNEL_HIGH:'안쪽 길',TUNNEL_DEEP:'깊은 길',TUNNEL_DEEP_RAID:'레이드 길',TUNNEL_HIDEOUT:'은신처 길',TUNNEL_HIDEOUT_DEEP:'깊은 은신처 길'}};
+const avalonSaved=storage.get('avalonFilter',{});
+if(avalonSaved.res!==undefined)$('avalon-res').value=avalonSaved.res;
+$('avalon-tier').value=String(avalonSaved.tier||5);$('avalon-exit').checked=!!avalonSaved.exit;
+async function loadAvalon(){
+ clearTimeout(avalonView.timer);
+ try{const r=await fetch('/api/avalon'),data=await r.json();if(!r.ok)throw Error(data.error||r.status);avalonView.data=data;if(data.ready)avalonView.roads=data.roads;
+  if(data.loading&&!document.querySelector('.tab-panel[data-tab=avalon]').hidden)avalonView.timer=setTimeout(loadAvalon,4000)}
+ catch(e){avalonView.data={error:e.message}}
+ renderAvalon();
+}
+// Gatherable amount of one resource up to the chosen tier.
+const avalonAmount=(r,res,tier)=>Object.entries(r.resources[res]||{}).reduce((sum,[t,c])=>sum+(Number(t)<=tier?c:0),0);
+const avalonAreas=r=>r.areas.map(a=>`${AVA.res[a.main]} ${a.size==='large'?'대형':'소형'}`).join(', ')||'자원 구역 없음';
+function renderAvalon(){
+ const d=avalonView.data||{},roads=avalonView.roads;
+ updateHtml('avalon-status',roads?`${n(roads.length)}개 길`:d.loading?'게임 파일에서 받는 중…':d.error?`<span class="warn">못 받음: ${esc(d.error)}</span>`:'자동 반영이 꺼져 있으면 받지 않습니다');
+ if(!roads){updateHtml('avalon-hits','');updateHtml('avalon-view',d.loading?'<p class="help">처음 한 번 게임 파일에서 아발론 길 자료를 받습니다(1분쯤). 받은 뒤에는 바로 찾습니다.</p>':'');return}
+ const q=$('avalon-q').value.trim().toLowerCase().replace(/[\s-]/g,''),res=$('avalon-res').value,tier=Number($('avalon-tier').value),exit=$('avalon-exit').checked;
+ storage.set('avalonFilter',{res,tier,exit});
+ if(!q&&!res&&!exit){updateHtml('avalon-hits','');updateHtml('avalon-view','<p class="help">이름 일부를 적거나 찾는 자원을 고르세요. 찾는 자원을 고르면 내 채집 티어까지 캘 수 있는 양이 많은 길부터 나옵니다.</p>');return}
+ const named=roads.filter(r=>!q||r.name.toLowerCase().replace(/-/g,'').includes(q));
+ let list=named.filter(r=>(!exit||r.reach.includes('blue'))&&(!res||avalonAmount(r,res,tier)>0));
+ // A name typed at a portal must still be found when a filter left on from earlier would hide it.
+ const unfiltered=q&&!list.length&&named.length;
+ if(unfiltered)list=named;
+ if(res)list=[...list].sort((a,b)=>avalonAmount(b,res,tier)-avalonAmount(a,res,tier)||a.name.localeCompare(b.name));
+ if(!list.some(r=>r.id===avalonView.pick))avalonView.pick=list[0]?.id;
+ const shown=list.slice(0,40);
+ const why=unfiltered?`<p class="warn">${[res?`${AVA.res[res]} T${tier}까지`:'',exit?'블루·옐로존 출구':''].filter(Boolean).join(', ')} 조건에 맞는 길은 없어서, 이름이 맞는 길을 보여 줍니다.</p>`:'';
+ updateHtml('avalon-hits',why+(shown.map(r=>`<button type="button" class="${r.id===avalonView.pick?'':'secondary'}" data-avalon="${esc(r.id)}">${esc(r.name)}<small>T${r.tier} · ${esc(AVA.type[r.type]||r.type)}${r.reach.includes('blue')?' · 블루 출구 가능':''} · ${esc(avalonAreas(r))}${res?` · ${AVA.res[res]} T${tier}까지 ${n(avalonAmount(r,res,tier))}`:''}</small></button>`).join('')||(q?'<p class="help">이 이름이 들어간 길이 없습니다. 철자 일부만 적어 보세요.</p>':'<p class="help">조건에 맞는 길이 없습니다. 찾는 자원이나 티어를 바꿔 보세요.</p>'))+(list.length>shown.length?`<small class="help">${n(list.length-shown.length)}개 더 있음 · 더 적어서 좁히세요</small>`:''));
+ const r=list.find(x=>x.id===avalonView.pick);
+ updateHtml('avalon-view',r?avalonCard(r,res,tier):'');
+}
+function avalonCard(r,res,tier){
+ const tiers=[...new Set(Object.values(r.resources).flatMap(t=>Object.keys(t)))].map(Number).sort((a,b)=>a-b);
+ const exitText=r.reach.length?`<b class="positive">${r.reach.map(z=>AVA.zone[z]).join('·')} 출구가 열릴 수 있음</b> <small>포털 일부가 무작위로 바깥과 이어지고 12~24시간 뒤 닫힘</small>`:`<b class="warn">바깥 출구 없음</b> <small>다른 아발론 길로만 이어집니다. 돌아갈 길(들어온 포털)을 꼭 기억하세요</small>`;
+ const rows=Object.keys(AVA.res).filter(k=>r.resources[k]).map(k=>{const areas=r.areas.filter(a=>a.main===k),big=areas.filter(a=>a.size==='large').length,small=areas.length-big;
+  return `<tr class="${k===res?'hit':''}"><td>${AVA.res[k]}</td>${tiers.map(t=>{const c=r.resources[k][t];return `<td class="${c&&t<=tier?'':'muted'}">${c?n(c):'—'}</td>`}).join('')}<td>${n(avalonAmount(r,k,tier))}</td><td>${areas.length?[big?`대형 ${big}`:'',small?`소형 ${small}`:''].filter(Boolean).join(' · '):'<small>다른 자원 구역에 조금</small>'}</td></tr>`});
+ const c=r.chests,g=r.dungeons;
+ return `<div class="avalon-card"><h3>${esc(r.name)} <small>T${r.tier} · ${esc(AVA.type[r.type]||r.type)}</small></h3>
+ <p>${exitText}</p>
+ ${rows.length?table(['자원',...tiers.map(t=>`T${t}`),`T${tier}까지`,'구역 (그 자원이 주인 곳)'],rows,'avalon-res'):'<p class="help">채집 자원이 없는 길입니다.</p>'}
+ <p class="avalon-extra">상자 초록 ${n(c.green)} · 파랑 ${n(c.blue)} · 황금 ${n(c.gold)} &nbsp; 던전 솔로 ${n(g.solo)} · 그룹 ${n(g.group)}${g.elite?` · 엘리트 ${n(g.elite)}`:''}</p>
+ <p class="help">자원 수는 게임 파일에 있는 채집 지점과 자원 몬스터 자리를 합친 수입니다. 이미 누가 캤는지, 지금 몬스터가 살아 있는지는 모릅니다. 대형 구역은 소형보다 넓고(160×160 대 80×80) 자원이 2~4배입니다. 상자 등급(평범·희귀 등)은 나타날 때 정해집니다. 길 이름 끝글자로 자원을 짐작하는 규칙(-tum 가죽 등)은 실제 자료와 맞지 않아 쓰지 않았습니다.</p></div>`;
+}
+$('avalon-form').addEventListener('input',renderAvalon);
+$('avalon-form').addEventListener('submit',e=>e.preventDefault());
+$('avalon-q').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();const b=document.querySelector('#avalon-hits [data-avalon]');if(b){avalonView.pick=b.dataset.avalon;renderAvalon()}}});
+$('avalon-hits').addEventListener('click',e=>{const b=e.target.closest('[data-avalon]');if(b){avalonView.pick=b.dataset.avalon;renderAvalon()}});
+document.querySelector('.tabs').addEventListener('click',e=>{if(e.target.closest('[data-tab=avalon]')){loadAvalon();setTimeout(()=>$('avalon-q').focus(),0)}});
+if(storage.get('tab','now')==='avalon')loadAvalon();
 const chatOpen=()=>!document.querySelector('.tab-panel[data-tab=chat]').hidden;
 function chatInline(text){return text.replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')}
 // Input is escaped first, so the markup added here is the only markup in the result.
