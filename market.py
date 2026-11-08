@@ -26,6 +26,7 @@ from statistics import median
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+import avalon
 import chat
 import gamedata
 import lookup
@@ -61,7 +62,7 @@ SETTING_DEFAULTS = {**DEPTH_DEFAULTS, "trade_budget": 10_000_000, "excluded_citi
 # 1 is the wiki's formula as it stands.
 # Plans that leave units to sell later; an instant round trip sells what it buys at once.
 STOCKING_KINDS = ("instant_list", "best", "buyout")
-BUILD = "20261107.3"
+BUILD = "20261108.1"
 # Holdings rows for what the player carries (the inventory) use this key in place of a city.
 CARRIED = "carried"
 # Bank clusters seen joined to their city on 2026-10-27 (recordings and the zone log: 0007 <-> 0006,
@@ -3015,6 +3016,13 @@ class Store:
                 best = {"city": city, "unit": unit, **q}
         return best
 
+    def avalon_roads(self):
+        """Every Road of Avalon for the Avalon tab (avalon.py). The first call builds the list from the game files
+        in the background (only with automatic updates on, like the item data); until then roads is empty."""
+        avalon.roads.ensure(self.root, download=getattr(self, "auto_update", {}).get("enabled", False))
+        return {"ready": avalon.roads.roads is not None, "loading": avalon.roads.loading, "error": avalon.roads.error,
+                "roads": avalon.roads.roads or []}
+
     def craft_cost(self, item, quality):
         """What an item at an enchantment and quality costs made from its .0 bought on the market, beside buying it made.
         Every starting quality up to the target is tried: buy the .0 at it, reroll it at the repair station while it is
@@ -3186,6 +3194,8 @@ def handler_class(store, token):
                     return self.respond(store.craft_cost(params.get("id", [""])[0], int(params.get("quality", ["1"])[0])))
                 except ValueError as exc:
                     return self.respond({"error": str(exc)}, 400)
+            if parts.path == "/api/avalon":
+                return self.respond(store.avalon_roads())
             if parts.path == "/api/chat":
                 return self.respond(chat.ChatRoom(store.root, self.server.server_port).conversations())
             if parts.path == "/api/chat/conversation":
